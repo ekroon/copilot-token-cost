@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Go binary
+go/copilot-token-cost
+
+# Node
+node/node_modules/
+
+# SQLite database
+copilot-tokens.db
+copilot-tokens.db-wal
+copilot-tokens.db-shm
+
+# OS
+.DS_Store
