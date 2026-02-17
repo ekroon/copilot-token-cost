@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+
+      - name: Embed pricing data
+        run: |
+          cd go
+          printf 'package main\n\nvar embeddedPricingJSON = `' > pricing_data.go
+          cat ../pricing.json >> pricing_data.go
+          printf '`\n' >> pricing_data.go
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          cd go
+          output="copilot-token-cost-${GOOS}-${GOARCH}"
+          go build -trimpath -ldflags="-s -w" -o "../${output}" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: copilot-token-cost-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: copilot-token-cost-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  create-release:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x artifacts/copilot-token-cost-*
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            --repo "${{ github.repository }}" \
+            artifacts/copilot-token-cost-*

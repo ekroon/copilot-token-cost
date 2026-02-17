@@ -1,0 +1,58 @@
+name: Check Pricing Updates
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  create-pricing-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get current pricing period date
+        id: current
+        run: |
+          date=$(python3 -c "import json; d=json.load(open('pricing.json')); print(d['pricing_periods'][0]['effective_from'])")
+          echo "date=$date" >> "$GITHUB_OUTPUT"
+
+      - name: Create pricing update issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Check for Copilot pricing updates (current: ${{ steps.current.outputs.date }})" \
+            --assignee "copilot" \
+            --label "pricing" \
+            --body "## Task
+
+          Check if GitHub Copilot model pricing or premium request multipliers have changed since **${{ steps.current.outputs.date }}**.
+
+          ## What to check
+
+          1. **Premium request multipliers**: https://docs.github.com/en/copilot/reference/ai-models/supported-models
+          2. **Anthropic pricing**: https://www.anthropic.com/pricing
+          3. **OpenAI pricing**: https://openai.com/api/pricing/
+          4. **Google pricing**: https://ai.google.dev/pricing
+
+          ## What to do
+
+          - If any pricing has changed, add a new period to the top of \`pricing.json\` following the format described in \`.github/copilot-instructions.md\`
+          - If no changes are found, close this issue with a comment saying pricing is up to date
+          - Make sure all model entries are present in the new period (copy from previous, then apply changes)
+
+          ## Current latest period
+
+          \`\`\`
+          effective_from: ${{ steps.current.outputs.date }}
+          \`\`\`"
+
+      - name: Ensure pricing label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create pricing --description "Pricing data updates" --color "0075ca" 2>/dev/null || true
