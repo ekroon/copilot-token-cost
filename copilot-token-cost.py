@@ -37,19 +37,33 @@ def load_pricing(script_dir: Path) -> dict:
 
 
 _pricing_data = load_pricing(Path(__file__).resolve().parent)
-MODEL_PRICING = _pricing_data['model_pricing']
-PREMIUM_MULTIPLIER = _pricing_data['premium_multiplier']
-PREMIUM_REQUEST_COST = _pricing_data['premium_request_cost']
+PRICING_PERIODS = _pricing_data['pricing_periods']
 
 
-def get_premium_multiplier(model_name: str) -> int:
+def _get_period(timestamp: str = None) -> dict:
+    """Find the pricing period for the given timestamp (or date string). Falls back to latest/oldest."""
+    if timestamp is None:
+        return PRICING_PERIODS[0]
+    date_str = timestamp[:10]
+    for period in PRICING_PERIODS:
+        if date_str >= period['effective_from']:
+            return period
+    return PRICING_PERIODS[-1]
+
+
+def get_premium_request_cost(timestamp: str = None) -> float:
+    return _get_period(timestamp)['premium_request_cost']
+
+
+def get_premium_multiplier(model_name: str, timestamp: str = None) -> float:
     normalized = normalize_model(model_name)
-    if normalized in PREMIUM_MULTIPLIER:
-        return PREMIUM_MULTIPLIER[normalized]
-    for key in PREMIUM_MULTIPLIER:
+    mult = _get_period(timestamp)['premium_multiplier']
+    if normalized in mult:
+        return mult[normalized]
+    for key in mult:
         if normalized.startswith(key) or key.startswith(normalized):
-            return PREMIUM_MULTIPLIER[key]
-    return 1  # default: assume 1 premium request
+            return mult[key]
+    return 1
 
 
 def normalize_model(model_name: str) -> str:
@@ -64,13 +78,14 @@ def normalize_model(model_name: str) -> str:
     return model_name
 
 
-def get_pricing(model_name: str) -> dict:
+def get_pricing(model_name: str, timestamp: str = None) -> dict:
     normalized = normalize_model(model_name)
-    if normalized in MODEL_PRICING:
-        return MODEL_PRICING[normalized]
-    for key in MODEL_PRICING:
+    mp = _get_period(timestamp)['model_pricing']
+    if normalized in mp:
+        return mp[normalized]
+    for key in mp:
         if normalized.startswith(key) or key.startswith(normalized):
-            return MODEL_PRICING[key]
+            return mp[key]
     return None
 
 
@@ -213,9 +228,9 @@ def sync_logs_to_db(conn, logs_dir: Path, session_dir: Path, force: bool = False
 
 # ─── Cost helpers ────────────────────────────────────────────────────────────
 
-def calc_cost(model: str, stats: dict) -> float:
+def calc_cost(model: str, stats: dict, timestamp: str = None) -> float:
     """Actual cost: cached tokens at discounted rate."""
-    pricing = get_pricing(model)
+    pricing = get_pricing(model, timestamp)
     if not pricing:
         return 0.0
     net_input = max(0, stats['prompt_tokens'] - stats['cache_read_tokens'] - stats['cache_creation_tokens'])
@@ -227,14 +242,27 @@ def calc_cost(model: str, stats: dict) -> float:
     )
 
 
-def calc_cost_nocache(model: str, stats: dict) -> float:
+def calc_cost_nocache(model: str, stats: dict, timestamp: str = None) -> float:
     """Hypothetical cost: all input tokens at full rate (no cache discount)."""
-    pricing = get_pricing(model)
+    pricing = get_pricing(model, timestamp)
     if not pricing:
         return 0.0
     return (
         (stats['prompt_tokens'] / 1_000_000) * pricing['input']
         + (stats['completion_tokens'] / 1_000_000) * pricing['output']
+    )
+
+
+def _sum_daily_cost(model, daily_stats, cost_fn):
+    """Aggregate a cost function for a model across daily stats."""
+    return sum(cost_fn(model, daily_stats[day][model], day) for day in daily_stats if model in daily_stats[day])
+
+
+def _sum_daily_prem_cost(model, daily_stats):
+    """Aggregate premium request cost for a model across daily stats."""
+    return sum(
+        daily_stats[day][model]['premium_requests'] * get_premium_request_cost(day)
+        for day in daily_stats if model in daily_stats[day]
     )
 
 
@@ -427,13 +455,19 @@ def main():
 
     # ─── Query aggregated stats from DB ──────────────────────────────────
     model_stats = db.query_model_stats(conn, date_from, date_to)
-    for model, s in model_stats.items():
-        s['premium_requests'] = s.pop('user_turns') * get_premium_multiplier(model)
 
     daily_stats = db.query_daily_stats(conn, date_from, date_to)
-    for day in daily_stats.values():
-        for model, s in day.items():
-            s['premium_requests'] = s.pop('user_turns') * get_premium_multiplier(model)
+    for day, day_models in daily_stats.items():
+        for model, s in day_models.items():
+            s['premium_requests'] = s.pop('user_turns') * get_premium_multiplier(model, day)
+
+    # Compute model-level premium_requests from daily (multiplier varies by day)
+    for model, s in model_stats.items():
+        s.pop('user_turns')
+        s['premium_requests'] = sum(
+            daily_stats[day][model]['premium_requests']
+            for day in daily_stats if model in daily_stats[day]
+        )
 
     project_stats_raw = db.query_project_stats(conn, date_from, date_to)
     project_stats = {}
@@ -467,15 +501,15 @@ def main():
             'period': period_label, 'date_range': date_range, 'log_files': log_file_count,
             'api_calls': total_records, 'models': {}, 'daily': {}, 'projects': {},
             'total_cost': 0.0, 'total_cost_without_cache': 0.0,
-            'total_premium_request_cost': round(sum(s['premium_requests'] for s in model_stats.values()) * PREMIUM_REQUEST_COST, 4),
+            'total_premium_request_cost': round(sum(_sum_daily_prem_cost(m, daily_stats) for m in model_stats), 4),
         }
         for model, stats in sorted(model_stats.items()):
-            cost = calc_cost(model, stats)
-            cost_nc = calc_cost_nocache(model, stats)
+            cost = _sum_daily_cost(model, daily_stats, calc_cost)
+            cost_nc = _sum_daily_cost(model, daily_stats, calc_cost_nocache)
             output['models'][model] = {
                 **stats, 'input_uncached_tokens': uncached_input(stats),
                 'cost': round(cost, 4), 'cost_without_cache': round(cost_nc, 4),
-                'premium_request_cost': round(stats['premium_requests'] * PREMIUM_REQUEST_COST, 4),
+                'premium_request_cost': round(_sum_daily_prem_cost(model, daily_stats), 4),
             }
             output['total_cost'] += cost
             output['total_cost_without_cache'] += cost_nc
@@ -483,7 +517,7 @@ def main():
             day_total = day_total_nc = 0.0
             output['daily'][day] = {}
             for model, stats in daily_stats[day].items():
-                cost, cost_nc = calc_cost(model, stats), calc_cost_nocache(model, stats)
+                cost, cost_nc = calc_cost(model, stats, day), calc_cost_nocache(model, stats, day)
                 output['daily'][day][model] = {
                     **stats, 'input_uncached_tokens': uncached_input(stats),
                     'cost': round(cost, 4), 'cost_without_cache': round(cost_nc, 4),
@@ -509,8 +543,8 @@ def main():
             model = normalize_model(r['model'])
             rs = {'prompt_tokens': r['prompt_tokens'], 'completion_tokens': r['completion_tokens'],
                   'cache_creation_tokens': r['cache_creation_tokens'], 'cache_read_tokens': r['cache_read_tokens']}
-            proj_costs[proj]['cost'] += calc_cost(model, rs)
-            proj_costs[proj]['cost_without_cache'] += calc_cost_nocache(model, rs)
+            proj_costs[proj]['cost'] += calc_cost(model, rs, r.get('timestamp'))
+            proj_costs[proj]['cost_without_cache'] += calc_cost_nocache(model, rs, r.get('timestamp'))
         for proj in output['projects']:
             output['projects'][proj]['cost'] = round(proj_costs[proj]['cost'], 4)
             output['projects'][proj]['cost_without_cache'] = round(proj_costs[proj]['cost_without_cache'], 4)
@@ -539,10 +573,10 @@ def main():
     model_rows = []
     t_cost = t_nc = t_prem_cost = 0.0
     t_unc = t_cached = t_cw = t_out = t_calls = t_prompt = t_premium = 0
-    for model in sorted(model_stats.keys(), key=lambda m: calc_cost_nocache(m, model_stats[m]), reverse=True):
+    for model in sorted(model_stats.keys(), key=lambda m: _sum_daily_cost(m, daily_stats, calc_cost_nocache), reverse=True):
         s = model_stats[model]
-        cost = calc_cost(model, s)
-        cost_nc = calc_cost_nocache(model, s)
+        cost = _sum_daily_cost(model, daily_stats, calc_cost)
+        cost_nc = _sum_daily_cost(model, daily_stats, calc_cost_nocache)
         unc = uncached_input(s)
         t_cost += cost; t_nc += cost_nc
         t_unc += unc; t_cached += s['cache_read_tokens']; t_cw += s['cache_creation_tokens']
@@ -551,7 +585,7 @@ def main():
         p = get_pricing(model)
         mult = get_premium_multiplier(model)
         premium_str = f"{s['premium_requests']:,}" if mult > 0 else "-"
-        prem_cost = s['premium_requests'] * PREMIUM_REQUEST_COST
+        prem_cost = _sum_daily_prem_cost(model, daily_stats)
         t_prem_cost += prem_cost
         model_rows.append([
             model, f"{s['api_calls']:,}", premium_str,
@@ -584,13 +618,13 @@ def main():
         mult = get_premium_multiplier(model)
         if mult == 0:
             continue
-        cost = calc_cost(model, s)
+        cost = _sum_daily_cost(model, daily_stats, calc_cost)
         if s['premium_requests'] > 0:
             # Only include models where we actually tracked premium requests
             prem_total_cost += cost
             prem_total_reqs += s['premium_requests']
             cost_per = cost / s['premium_requests']
-            prem_cost = s['premium_requests'] * PREMIUM_REQUEST_COST
+            prem_cost = _sum_daily_prem_cost(model, daily_stats)
             discount = f"{(1 - prem_cost / cost) * 100:.0f}%" if cost > 0 else "-"
             prem_rows.append([
                 model, f"{mult}×", f"{s['premium_requests']:,}",
@@ -603,7 +637,7 @@ def main():
             ])
     if prem_rows:
         avg_cost = prem_total_cost / prem_total_reqs if prem_total_reqs > 0 else 0
-        total_prem_cost = prem_total_reqs * PREMIUM_REQUEST_COST
+        total_prem_cost = sum(_sum_daily_prem_cost(m, daily_stats) for m in model_stats)
         total_discount = f"{(1 - total_prem_cost / prem_total_cost) * 100:.0f}%" if prem_total_cost > 0 else "-"
         prem_footer = ["TOTAL", "", f"{prem_total_reqs:,}", fmt_cost(prem_total_cost), fmt_cost(avg_cost), fmt_cost(total_prem_cost), total_discount]
         notes = ["ℹ️  Models with 0× multiplier (free tier) are excluded"]
@@ -624,10 +658,10 @@ def main():
         d_unc = sum(uncached_input(s) for s in daily_stats[day].values())
         d_cached = sum(s['cache_read_tokens'] for s in daily_stats[day].values())
         d_out = sum(s['completion_tokens'] for s in daily_stats[day].values())
-        d_cost = sum(calc_cost(m, s) for m, s in daily_stats[day].items())
-        d_nc = sum(calc_cost_nocache(m, s) for m, s in daily_stats[day].items())
+        d_cost = sum(calc_cost(m, s, day) for m, s in daily_stats[day].items())
+        d_nc = sum(calc_cost_nocache(m, s, day) for m, s in daily_stats[day].items())
         d_total = d_unc + d_cached
-        d_prem_cost = d_premium * PREMIUM_REQUEST_COST
+        d_prem_cost = sum(s['premium_requests'] * get_premium_request_cost(day) for s in daily_stats[day].values())
         d_discount = f"{(1 - d_prem_cost / d_cost) * 100:.0f}%" if d_cost > 0 else "-"
         daily_rows.append([
             day, f"{d_calls:,}", f"{d_premium:,}",
@@ -648,8 +682,8 @@ def main():
         model = normalize_model(r['model'])
         rs = {'prompt_tokens': r['prompt_tokens'], 'completion_tokens': r['completion_tokens'],
               'cache_creation_tokens': r['cache_creation_tokens'], 'cache_read_tokens': r['cache_read_tokens']}
-        proj_costs[proj]['cost'] += calc_cost(model, rs)
-        proj_costs[proj]['cost_nc'] += calc_cost_nocache(model, rs)
+        proj_costs[proj]['cost'] += calc_cost(model, rs, r.get('timestamp'))
+        proj_costs[proj]['cost_nc'] += calc_cost_nocache(model, rs, r.get('timestamp'))
 
     proj_headers = ["Project", "Calls", "Premium", "Input", "Cached", "Output", "Hit%", "Cost", "No-Cache"]
     proj_rows = []

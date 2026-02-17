@@ -29,38 +29,42 @@ type Pricing struct {
 	CacheWrite float64 `json:"cache_write"`
 }
 
-type pricingFile struct {
+type PricingPeriod struct {
+	EffectiveFrom      string             `json:"effective_from"`
 	PremiumRequestCost float64            `json:"premium_request_cost"`
 	ModelPricing       map[string]Pricing `json:"model_pricing"`
-	PremiumMultiplier  map[string]int     `json:"premium_multiplier"`
+	PremiumMultiplier  map[string]float64 `json:"premium_multiplier"`
 }
 
-var (
-	modelPricing       map[string]Pricing
-	premiumMultiplier  map[string]int
-	premiumRequestCost float64
-)
+type pricingFile struct {
+	PricingPeriods []PricingPeriod `json:"pricing_periods"`
+}
+
+var pricingPeriods []PricingPeriod
 
 func loadPricing() {
 	exe, _ := os.Executable()
 	exeDir := filepath.Dir(exe)
 
 	candidates := []string{
-		filepath.Join(exeDir, "pricing.json"),
-		filepath.Join(exeDir, "..", "pricing.json"),
 		filepath.Join(".", "pricing.json"),
 		filepath.Join("..", "pricing.json"),
+		filepath.Join(exeDir, "pricing.json"),
+		filepath.Join(exeDir, "..", "pricing.json"),
 	}
 
 	var data []byte
-	var err error
 	for _, path := range candidates {
-		data, err = os.ReadFile(path)
-		if err == nil {
+		if d, err := os.ReadFile(path); err == nil {
+			data = d
 			break
 		}
 	}
-	if data == nil {
+	// Fall back to build-time embedded pricing (set by release workflow)
+	if data == nil && embeddedPricingJSON != "" {
+		data = []byte(embeddedPricingJSON)
+	}
+	if len(data) == 0 {
 		fmt.Fprintf(os.Stderr, "Error: pricing.json not found\n")
 		os.Exit(1)
 	}
@@ -71,9 +75,27 @@ func loadPricing() {
 		os.Exit(1)
 	}
 
-	modelPricing = pf.ModelPricing
-	premiumMultiplier = pf.PremiumMultiplier
-	premiumRequestCost = pf.PremiumRequestCost
+	pricingPeriods = pf.PricingPeriods
+}
+
+func getPeriod(timestamp string) *PricingPeriod {
+	if timestamp == "" || len(pricingPeriods) == 0 {
+		return &pricingPeriods[0]
+	}
+	dateStr := timestamp
+	if len(dateStr) > 10 {
+		dateStr = dateStr[:10]
+	}
+	for i := range pricingPeriods {
+		if dateStr >= pricingPeriods[i].EffectiveFrom {
+			return &pricingPeriods[i]
+		}
+	}
+	return &pricingPeriods[len(pricingPeriods)-1]
+}
+
+func getPremiumRequestCost(timestamp string) float64 {
+	return getPeriod(timestamp).PremiumRequestCost
 }
 
 var (
@@ -105,12 +127,13 @@ func normalizeModel(name string) string {
 	return name
 }
 
-func getPricing(model string) *Pricing {
+func getPricing(model string, timestamp string) *Pricing {
 	n := normalizeModel(model)
-	if p, ok := modelPricing[n]; ok {
+	mp := getPeriod(timestamp).ModelPricing
+	if p, ok := mp[n]; ok {
 		return &p
 	}
-	for key, p := range modelPricing {
+	for key, p := range mp {
 		if strings.HasPrefix(n, key) || strings.HasPrefix(key, n) {
 			cp := p
 			return &cp
@@ -119,12 +142,13 @@ func getPricing(model string) *Pricing {
 	return nil
 }
 
-func getPremiumMultiplier(model string) int {
+func getPremiumMultiplier(model string, timestamp string) float64 {
 	n := normalizeModel(model)
-	if m, ok := premiumMultiplier[n]; ok {
+	mult := getPeriod(timestamp).PremiumMultiplier
+	if m, ok := mult[n]; ok {
 		return m
 	}
-	for key, m := range premiumMultiplier {
+	for key, m := range mult {
 		if strings.HasPrefix(n, key) || strings.HasPrefix(key, n) {
 			return m
 		}
@@ -152,7 +176,7 @@ type Stats struct {
 	CompletionTokens    int `json:"completion_tokens"`
 	CacheCreationTokens int `json:"cache_creation_tokens"`
 	CacheReadTokens     int `json:"cache_read_tokens"`
-	PremiumRequests     int `json:"premium_requests"`
+	PremiumRequests     float64 `json:"premium_requests"`
 }
 
 func newStats() *Stats { return &Stats{} }
@@ -164,7 +188,7 @@ func (s *Stats) add(r Record, model string) {
 	s.CacheCreationTokens += r.CacheCreationTokens
 	s.CacheReadTokens += r.CacheReadTokens
 	if r.IsUserTurn {
-		s.PremiumRequests += getPremiumMultiplier(model)
+		s.PremiumRequests += getPremiumMultiplier(model, r.Timestamp)
 	}
 }
 
@@ -758,8 +782,8 @@ func projectName(cwd string) string {
 
 // ─── Cost helpers ───────────────────────────────────────────────────────────
 
-func calcCost(model string, s *Stats) float64 {
-	p := getPricing(model)
+func calcCost(model string, s *Stats, timestamp string) float64 {
+	p := getPricing(model, timestamp)
 	if p == nil {
 		return 0.0
 	}
@@ -773,13 +797,44 @@ func calcCost(model string, s *Stats) float64 {
 		float64(s.CacheCreationTokens)/1e6*p.CacheWrite
 }
 
-func calcCostNocache(model string, s *Stats) float64 {
-	p := getPricing(model)
+func calcCostNocache(model string, s *Stats, timestamp string) float64 {
+	p := getPricing(model, timestamp)
 	if p == nil {
 		return 0.0
 	}
 	return float64(s.PromptTokens)/1e6*p.Input +
 		float64(s.CompletionTokens)/1e6*p.Output
+}
+
+func sumDailyCost(model string, dailyStats map[string]map[string]*Stats, costFn func(string, *Stats, string) float64) float64 {
+	var total float64
+	for day, models := range dailyStats {
+		if s, ok := models[model]; ok {
+			total += costFn(model, s, day)
+		}
+	}
+	return total
+}
+
+func sumDailyPremCost(model string, dailyStats map[string]map[string]*Stats) float64 {
+	var total float64
+	for day, models := range dailyStats {
+		if s, ok := models[model]; ok {
+			total += s.PremiumRequests * getPremiumRequestCost(day)
+		}
+	}
+	return total
+}
+
+func sumDailyPremCostAll(dailyStats map[string]map[string]*Stats) float64 {
+	var total float64
+	for day, models := range dailyStats {
+		prc := getPremiumRequestCost(day)
+		for _, s := range models {
+			total += s.PremiumRequests * prc
+		}
+	}
+	return total
 }
 
 func uncachedInput(s *Stats) int {
@@ -1163,19 +1218,6 @@ func main() {
 	}
 
 	// ─── Query aggregated stats from DB ────────────────────────────────
-	dbModelStats := queryModelStats(database, dateFromQuery, dateToQuery)
-	modelStats := make(map[string]*Stats)
-	for model, dbs := range dbModelStats {
-		modelStats[model] = &Stats{
-			APICalls:            dbs.APICalls,
-			PromptTokens:        dbs.PromptTokens,
-			CompletionTokens:    dbs.CompletionTokens,
-			CacheCreationTokens: dbs.CacheCreationTokens,
-			CacheReadTokens:     dbs.CacheReadTokens,
-			PremiumRequests:     dbs.UserTurns * getPremiumMultiplier(model),
-		}
-	}
-
 	dbDailyStats := queryDailyStats(database, dateFromQuery, dateToQuery)
 	dailyStats := make(map[string]map[string]*Stats)
 	for day, models := range dbDailyStats {
@@ -1187,8 +1229,28 @@ func main() {
 				CompletionTokens:    dbs.CompletionTokens,
 				CacheCreationTokens: dbs.CacheCreationTokens,
 				CacheReadTokens:     dbs.CacheReadTokens,
-				PremiumRequests:     dbs.UserTurns * getPremiumMultiplier(model),
+				PremiumRequests:     float64(dbs.UserTurns) * getPremiumMultiplier(model, day),
 			}
+		}
+	}
+
+	// Compute model-level premium_requests from daily (multiplier varies by day)
+	dbModelStatsMap := queryModelStats(database, dateFromQuery, dateToQuery)
+	modelStats := make(map[string]*Stats)
+	for model, dbs := range dbModelStatsMap {
+		var premReqs float64
+		for _, models := range dailyStats {
+			if s, ok := models[model]; ok {
+				premReqs += s.PremiumRequests
+			}
+		}
+		modelStats[model] = &Stats{
+			APICalls:            dbs.APICalls,
+			PromptTokens:        dbs.PromptTokens,
+			CompletionTokens:    dbs.CompletionTokens,
+			CacheCreationTokens: dbs.CacheCreationTokens,
+			CacheReadTokens:     dbs.CacheReadTokens,
+			PremiumRequests:     premReqs,
 		}
 	}
 
@@ -1205,7 +1267,7 @@ func main() {
 			CompletionTokens:    dbs.CompletionTokens,
 			CacheCreationTokens: dbs.CacheCreationTokens,
 			CacheReadTokens:     dbs.CacheReadTokens,
-			PremiumRequests:     dbs.UserTurns, // already aggregated across models
+			PremiumRequests:     float64(dbs.UserTurns), // already aggregated across models
 		}
 		if existing, ok := projectStats[proj]; ok {
 			existing.APICalls += s.APICalls
@@ -1241,7 +1303,7 @@ func main() {
 			CompletionTokens    int     `json:"completion_tokens"`
 			CacheCreationTokens int     `json:"cache_creation_tokens"`
 			CacheReadTokens     int     `json:"cache_read_tokens"`
-			PremiumRequests     int     `json:"premium_requests"`
+			PremiumRequests     float64 `json:"premium_requests"`
 			PremiumRequestCost  float64 `json:"premium_request_cost"`
 			InputUncached       int     `json:"input_uncached_tokens"`
 			Cost                float64 `json:"cost"`
@@ -1285,19 +1347,20 @@ func main() {
 		models := sortedKeys(modelStats)
 		for _, model := range models {
 			s := modelStats[model]
-			cost := calcCost(model, s)
-			costNC := calcCostNocache(model, s)
+			cost := sumDailyCost(model, dailyStats, calcCost)
+			costNC := sumDailyCost(model, dailyStats, calcCostNocache)
+			premCost := sumDailyPremCost(model, dailyStats)
 			out.TotalCost += cost
 			out.TotalCostNoCache += costNC
 			out.Models[model] = jsonStats{
 				APICalls: s.APICalls, PromptTokens: s.PromptTokens,
 				CompletionTokens: s.CompletionTokens, CacheCreationTokens: s.CacheCreationTokens,
 				CacheReadTokens: s.CacheReadTokens, PremiumRequests: s.PremiumRequests,
-				PremiumRequestCost: roundN(float64(s.PremiumRequests)*premiumRequestCost, 4),
+				PremiumRequestCost: roundN(premCost, 4),
 				InputUncached: uncachedInput(s),
 				Cost: roundN(cost, 4), CostWithoutCache: roundN(costNC, 4),
 			}
-			out.TotalPremiumRequestCost += float64(s.PremiumRequests) * premiumRequestCost
+			out.TotalPremiumRequestCost += premCost
 		}
 
 		// Daily
@@ -1306,15 +1369,15 @@ func main() {
 			dayMap := make(map[string]interface{})
 			var dayTotal, dayTotalNC float64
 			for model, s := range dailyStats[day] {
-				cost := calcCost(model, s)
-				costNC := calcCostNocache(model, s)
+				cost := calcCost(model, s, day)
+				costNC := calcCostNocache(model, s, day)
 				dayTotal += cost
 				dayTotalNC += costNC
 				dayMap[model] = jsonStats{
 					APICalls: s.APICalls, PromptTokens: s.PromptTokens,
 					CompletionTokens: s.CompletionTokens, CacheCreationTokens: s.CacheCreationTokens,
 					CacheReadTokens: s.CacheReadTokens, PremiumRequests: s.PremiumRequests,
-					PremiumRequestCost: roundN(float64(s.PremiumRequests)*premiumRequestCost, 4),
+					PremiumRequestCost: roundN(s.PremiumRequests*getPremiumRequestCost(day), 4),
 					InputUncached: uncachedInput(s),
 					Cost: roundN(cost, 4), CostWithoutCache: roundN(costNC, 4),
 				}
@@ -1341,8 +1404,8 @@ func main() {
 				CacheCreationTokens: r.CacheCreationTokens, CacheReadTokens: r.CacheReadTokens,
 			}
 			c := projCosts[proj]
-			c[0] += calcCost(model, rs)
-			c[1] += calcCostNocache(model, rs)
+			c[0] += calcCost(model, rs, r.Timestamp)
+			c[1] += calcCostNocache(model, rs, r.Timestamp)
 			projCosts[proj] = c
 		}
 		for proj, s := range projectStats {
@@ -1351,7 +1414,7 @@ func main() {
 				APICalls: s.APICalls, PromptTokens: s.PromptTokens,
 				CompletionTokens: s.CompletionTokens, CacheCreationTokens: s.CacheCreationTokens,
 				CacheReadTokens: s.CacheReadTokens, PremiumRequests: s.PremiumRequests,
-				PremiumRequestCost: roundN(float64(s.PremiumRequests)*premiumRequestCost, 4),
+				PremiumRequestCost: roundN(s.PremiumRequests*getPremiumRequestCost(""), 4),
 				InputUncached: uncachedInput(s),
 				Cost: roundN(pc[0], 4), CostWithoutCache: roundN(pc[1], 4),
 			}
@@ -1377,7 +1440,7 @@ func main() {
 	fmt.Printf("║%s%s%s║\n", strings.Repeat(" ", titlePadL), title, strings.Repeat(" ", titlePadR))
 	fmt.Printf("╚%s╝\n", strings.Repeat("═", titleWidth))
 
-	totalPremium := 0
+	totalPremium := 0.0
 	for _, s := range modelStats {
 		totalPremium += s.PremiumRequests
 	}
@@ -1386,23 +1449,24 @@ func main() {
 		dateSuffix = " (" + dateRange + ")"
 	}
 	fmt.Printf("  Period: %s%s  │  Log files: %d  │  API calls: %s  │  Premium requests: %s\n",
-		periodLabel, dateSuffix, logFileCount, commaInt(totalRecords), commaInt(totalPremium))
+		periodLabel, dateSuffix, logFileCount, commaInt(totalRecords), commaFloat(totalPremium, 0))
 	fmt.Println()
 
 	// ── Per-model table ─────────────────────────────────────────────────
 	modelHeaders := []string{"Model", "Calls", "Premium", "Prem Cost", "Input", "Cached", "Cache Write", "Output", "Hit%", "Cost", "No-Cache"}
 	var modelRows [][]string
 	var tCost, tNC, tPremCost float64
-	var tUnc, tCached, tCW, tOut, tCalls, tPrompt, tPremium int
+	var tUnc, tCached, tCW, tOut, tCalls, tPrompt int
+	var tPremium float64
 
 	sortedModels := sortedKeysByFunc(modelStats, func(m string) float64 {
-		return -calcCostNocache(m, modelStats[m])
+		return -sumDailyCost(m, dailyStats, calcCostNocache)
 	})
 
 	for _, model := range sortedModels {
 		s := modelStats[model]
-		cost := calcCost(model, s)
-		costNC := calcCostNocache(model, s)
+		cost := sumDailyCost(model, dailyStats, calcCost)
+		costNC := sumDailyCost(model, dailyStats, calcCostNocache)
 		unc := uncachedInput(s)
 		tCost += cost
 		tNC += costNC
@@ -1414,10 +1478,10 @@ func main() {
 		tPrompt += s.PromptTokens
 		tPremium += s.PremiumRequests
 
-		p := getPricing(model)
-		mult := getPremiumMultiplier(model)
-		premiumStr := commaInt(s.PremiumRequests)
-		premCost := float64(s.PremiumRequests) * premiumRequestCost
+		p := getPricing(model, "")
+		mult := getPremiumMultiplier(model, "")
+		premiumStr := commaFloat(s.PremiumRequests, 0)
+		premCost := sumDailyPremCost(model, dailyStats)
 		tPremCost += premCost
 		premCostStr := fmtCost(premCost)
 		if mult == 0 {
@@ -1437,7 +1501,7 @@ func main() {
 		})
 	}
 	modelFooter := []string{
-		"TOTAL", commaInt(tCalls), commaInt(tPremium), fmtCost(tPremCost),
+		"TOTAL", commaInt(tCalls), commaFloat(tPremium, 0), fmtCost(tPremCost),
 		fmtTokens(tUnc), fmtTokens(tCached),
 		fmtTokens(tCW), fmtTokens(tOut),
 		cacheHitPct(tPrompt, tCached),
@@ -1455,35 +1519,37 @@ func main() {
 	premHeaders := []string{"Model", "Multiplier", "Premiums", "API Cost", "$/Premium", "Prem Cost", "Discount"}
 	var premRows [][]string
 	var premTotalCost float64
-	var premTotalReqs int
+	var premTotalReqs float64
 
 	sortedPremModels := sortedKeysByFunc(modelStats, func(m string) float64 {
-		return -float64(modelStats[m].PremiumRequests)
+		return -modelStats[m].PremiumRequests
 	})
 
 	for _, model := range sortedPremModels {
 		s := modelStats[model]
-		mult := getPremiumMultiplier(model)
+		mult := getPremiumMultiplier(model, "")
 		if mult == 0 {
 			continue
 		}
-		cost := calcCost(model, s)
+		cost := sumDailyCost(model, dailyStats, calcCost)
 		if s.PremiumRequests > 0 {
 			premTotalCost += cost
 			premTotalReqs += s.PremiumRequests
-			costPer := cost / float64(s.PremiumRequests)
-			premCost := float64(s.PremiumRequests) * premiumRequestCost
+			costPer := cost / s.PremiumRequests
+			premCost := sumDailyPremCost(model, dailyStats)
 			discount := "-"
 			if cost > 0 {
 				discount = fmt.Sprintf("%.0f%%", (1-premCost/cost)*100)
 			}
+			multStr := fmt.Sprintf("%.2g×", mult)
 			premRows = append(premRows, []string{
-				model, fmt.Sprintf("%d×", mult), commaInt(s.PremiumRequests),
+				model, multStr, commaFloat(s.PremiumRequests, 0),
 				fmtCost(cost), fmtCost(costPer), fmtCost(premCost), discount,
 			})
 		} else {
+			multStr := fmt.Sprintf("%.2g×", mult)
 			premRows = append(premRows, []string{
-				model, fmt.Sprintf("%d×", mult), "-",
+				model, multStr, "-",
 				fmtCost(cost), "N/A", "-", "-",
 			})
 		}
@@ -1492,14 +1558,14 @@ func main() {
 	if len(premRows) > 0 {
 		avgCost := 0.0
 		if premTotalReqs > 0 {
-			avgCost = premTotalCost / float64(premTotalReqs)
+			avgCost = premTotalCost / premTotalReqs
 		}
-		totalPremCost := float64(premTotalReqs) * premiumRequestCost
+		totalPremCost := sumDailyPremCostAll(dailyStats)
 		totalDiscount := "-"
 		if premTotalCost > 0 {
 			totalDiscount = fmt.Sprintf("%.0f%%", (1-totalPremCost/premTotalCost)*100)
 		}
-		premFooter := []string{"TOTAL", "", commaInt(premTotalReqs), fmtCost(premTotalCost), fmtCost(avgCost), fmtCost(totalPremCost), totalDiscount}
+		premFooter := []string{"TOTAL", "", commaFloat(premTotalReqs, 0), fmtCost(premTotalCost), fmtCost(avgCost), fmtCost(totalPremCost), totalDiscount}
 		premNotes := []string{"ℹ️  Models with 0× multiplier (free tier) are excluded"}
 		missingCost := tCost - premTotalCost
 		if missingCost > 0.001 {
@@ -1514,25 +1580,25 @@ func main() {
 	var dailyRows [][]string
 	dailyDays := sortedKeysStr(dailyStats)
 	for _, day := range dailyDays {
-		var dCalls, dPremium, dUnc, dCached, dOut int
-		var dCost, dNC float64
+		var dCalls, dUnc, dCached, dOut int
+		var dPremium, dCost, dNC float64
 		for model, s := range dailyStats[day] {
 			dCalls += s.APICalls
 			dPremium += s.PremiumRequests
 			dUnc += uncachedInput(s)
 			dCached += s.CacheReadTokens
 			dOut += s.CompletionTokens
-			dCost += calcCost(model, s)
-			dNC += calcCostNocache(model, s)
+			dCost += calcCost(model, s, day)
+			dNC += calcCostNocache(model, s, day)
 		}
 		dTotal := dUnc + dCached
-		dPremCost := float64(dPremium) * premiumRequestCost
+		dPremCost := dPremium * getPremiumRequestCost(day)
 		dDiscount := "-"
 		if dCost > 0 {
 			dDiscount = fmt.Sprintf("%.0f%%", (1-dPremCost/dCost)*100)
 		}
 		dailyRows = append(dailyRows, []string{
-			day, commaInt(dCalls), commaInt(dPremium),
+			day, commaInt(dCalls), commaFloat(dPremium, 0),
 			fmtTokens(dUnc), fmtTokens(dCached),
 			fmtTokens(dOut), cacheHitPct(dTotal, dCached),
 			fmtCost(dCost), fmtCost(dNC), fmtCost(dPremCost), dDiscount,
@@ -1558,8 +1624,8 @@ func main() {
 			CacheCreationTokens: r.CacheCreationTokens, CacheReadTokens: r.CacheReadTokens,
 		}
 		c := projCosts[proj]
-		c[0] += calcCost(model, rs)
-		c[1] += calcCostNocache(model, rs)
+		c[0] += calcCost(model, rs, r.Timestamp)
+		c[1] += calcCostNocache(model, rs, r.Timestamp)
 		projCosts[proj] = c
 	}
 
@@ -1582,7 +1648,7 @@ func main() {
 		s := pe.s
 		pc := projCosts[pe.name]
 		projRows = append(projRows, []string{
-			pe.name, commaInt(s.APICalls), commaInt(s.PremiumRequests),
+			pe.name, commaInt(s.APICalls), commaFloat(s.PremiumRequests, 0),
 			fmtTokens(uncachedInput(s)),
 			fmtTokens(s.CacheReadTokens), fmtTokens(s.CompletionTokens),
 			cacheHitPct(s.PromptTokens, s.CacheReadTokens),
@@ -1602,7 +1668,7 @@ func main() {
 
 	var priceRows [][]string
 	for _, model := range usedList {
-		p := getPricing(model)
+		p := getPricing(model, "")
 		if p != nil {
 			priceRows = append(priceRows, []string{
 				model,

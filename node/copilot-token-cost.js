@@ -36,9 +36,22 @@ function loadPricing() {
 }
 
 const _pricingData = loadPricing();
-const MODEL_PRICING = _pricingData.model_pricing;
-const PREMIUM_MULTIPLIER = _pricingData.premium_multiplier;
-const PREMIUM_REQUEST_COST = _pricingData.premium_request_cost;
+const PRICING_PERIODS = _pricingData.pricing_periods;
+
+
+function getPeriod(timestamp) {
+  if (timestamp == null) return PRICING_PERIODS[0];
+  const dateStr = timestamp.substring(0, 10);
+  for (const period of PRICING_PERIODS) {
+    if (dateStr >= period.effective_from) return period;
+  }
+  return PRICING_PERIODS[PRICING_PERIODS.length - 1];
+}
+
+
+function getPremiumRequestCost(timestamp) {
+  return getPeriod(timestamp).premium_request_cost;
+}
 
 
 // ─── SQLite schema & DB layer ───────────────────────────────────────────────
@@ -377,24 +390,26 @@ function normalizeModel(modelName) {
 }
 
 
-function getPricing(modelName) {
+function getPricing(modelName, timestamp) {
   const normalized = normalizeModel(modelName);
-  if (MODEL_PRICING[normalized]) return MODEL_PRICING[normalized];
-  for (const key of Object.keys(MODEL_PRICING)) {
+  const mp = getPeriod(timestamp).model_pricing;
+  if (mp[normalized]) return mp[normalized];
+  for (const key of Object.keys(mp)) {
     if (normalized.startsWith(key) || key.startsWith(normalized)) {
-      return MODEL_PRICING[key];
+      return mp[key];
     }
   }
   return null;
 }
 
 
-function getPremiumMultiplier(modelName) {
+function getPremiumMultiplier(modelName, timestamp) {
   const normalized = normalizeModel(modelName);
-  if (normalized in PREMIUM_MULTIPLIER) return PREMIUM_MULTIPLIER[normalized];
-  for (const key of Object.keys(PREMIUM_MULTIPLIER)) {
+  const mult = getPeriod(timestamp).premium_multiplier;
+  if (normalized in mult) return mult[normalized];
+  for (const key of Object.keys(mult)) {
     if (normalized.startsWith(key) || key.startsWith(normalized)) {
-      return PREMIUM_MULTIPLIER[key];
+      return mult[key];
     }
   }
   return 1;
@@ -510,8 +525,8 @@ function projectName(cwd) {
 
 // ─── Cost helpers ────────────────────────────────────────────────────────────
 
-function calcCost(model, stats) {
-  const pricing = getPricing(model);
+function calcCost(model, stats, timestamp) {
+  const pricing = getPricing(model, timestamp);
   if (!pricing) return 0.0;
   const netInput = Math.max(0, stats.prompt_tokens - stats.cache_read_tokens - stats.cache_creation_tokens);
   return (
@@ -523,13 +538,31 @@ function calcCost(model, stats) {
 }
 
 
-function calcCostNocache(model, stats) {
-  const pricing = getPricing(model);
+function calcCostNocache(model, stats, timestamp) {
+  const pricing = getPricing(model, timestamp);
   if (!pricing) return 0.0;
   return (
     (stats.prompt_tokens / 1e6) * pricing.input +
     (stats.completion_tokens / 1e6) * pricing.output
   );
+}
+
+
+function sumDailyCost(model, dailyStats, costFn) {
+  let total = 0;
+  for (const day of Object.keys(dailyStats)) {
+    if (dailyStats[day][model]) total += costFn(model, dailyStats[day][model], day);
+  }
+  return total;
+}
+
+
+function sumDailyPremCost(model, dailyStats) {
+  let total = 0;
+  for (const day of Object.keys(dailyStats)) {
+    if (dailyStats[day][model]) total += dailyStats[day][model].premium_requests * getPremiumRequestCost(day);
+  }
+  return total;
 }
 
 
@@ -819,7 +852,7 @@ function addRecord(s, r, model) {
   s.cache_creation_tokens += r.cache_creation_tokens;
   s.cache_read_tokens += r.cache_read_tokens;
   if (r.is_user_turn) {
-    s.premium_requests += getPremiumMultiplier(model);
+    s.premium_requests += getPremiumMultiplier(model, r.timestamp);
   }
 }
 
@@ -905,19 +938,23 @@ function main() {
   const dateRange = dateFromDisplay ? `${dateFromDisplay} → ${dateToDisplay}` : null;
 
   // ─── Query aggregated stats from DB ──────────────────────────────────
+  const dailyStats = queryDailyStats(db, dateFrom, dateTo);
+  for (const day of Object.keys(dailyStats)) {
+    for (const model of Object.keys(dailyStats[day])) {
+      const s = dailyStats[day][model];
+      s.premium_requests = s.user_turns * getPremiumMultiplier(model, day);
+      delete s.user_turns;
+    }
+  }
+
   const modelStats = queryModelStats(db, dateFrom, dateTo);
   for (const model of Object.keys(modelStats)) {
     const s = modelStats[model];
-    s.premium_requests = s.user_turns * getPremiumMultiplier(model);
     delete s.user_turns;
-  }
-
-  const dailyStats = queryDailyStats(db, dateFrom, dateTo);
-  for (const day of Object.values(dailyStats)) {
-    for (const model of Object.keys(day)) {
-      const s = day[model];
-      s.premium_requests = s.user_turns * getPremiumMultiplier(model);
-      delete s.user_turns;
+    // Compute model-level premium_requests from daily (multiplier varies by day)
+    s.premium_requests = 0;
+    for (const day of Object.keys(dailyStats)) {
+      if (dailyStats[day][model]) s.premium_requests += dailyStats[day][model].premium_requests;
     }
   }
 
@@ -966,11 +1003,11 @@ function main() {
     };
     for (const model of Object.keys(modelStats).sort()) {
       const stats = modelStats[model];
-      const cost = calcCost(model, stats);
-      const costNc = calcCostNocache(model, stats);
+      const cost = sumDailyCost(model, dailyStats, calcCost);
+      const costNc = sumDailyCost(model, dailyStats, calcCostNocache);
       output.models[model] = {
         ...stats, input_uncached_tokens: uncachedInput(stats),
-        premium_request_cost: Math.round(stats.premium_requests * PREMIUM_REQUEST_COST * 10000) / 10000,
+        premium_request_cost: Math.round(sumDailyPremCost(model, dailyStats) * 10000) / 10000,
         cost: Math.round(cost * 10000) / 10000,
         cost_without_cache: Math.round(costNc * 10000) / 10000,
       };
@@ -982,8 +1019,8 @@ function main() {
       output.daily[day] = {};
       for (const model of Object.keys(dailyStats[day])) {
         const stats = dailyStats[day][model];
-        const cost = calcCost(model, stats);
-        const costNc = calcCostNocache(model, stats);
+        const cost = calcCost(model, stats, day);
+        const costNc = calcCostNocache(model, stats, day);
         output.daily[day][model] = {
           ...stats, input_uncached_tokens: uncachedInput(stats),
           cost: Math.round(cost * 10000) / 10000,
@@ -1007,8 +1044,8 @@ function main() {
         cache_creation_tokens: r.cache_creation_tokens, cache_read_tokens: r.cache_read_tokens,
       };
       if (!projCosts[proj]) projCosts[proj] = { cost: 0, cost_without_cache: 0 };
-      projCosts[proj].cost += calcCost(model, rs);
-      projCosts[proj].cost_without_cache += calcCostNocache(model, rs);
+      projCosts[proj].cost += calcCost(model, rs, r.timestamp);
+      projCosts[proj].cost_without_cache += calcCostNocache(model, rs, r.timestamp);
     }
     for (const proj of Object.keys(projectStats)) {
       output.projects[proj] = {
@@ -1020,7 +1057,7 @@ function main() {
     output.total_cost = Math.round(output.total_cost * 10000) / 10000;
     output.total_cost_without_cache = Math.round(output.total_cost_without_cache * 10000) / 10000;
     output.total_premium_request_cost = Math.round(
-      Object.values(modelStats).reduce((a, s) => a + s.premium_requests * PREMIUM_REQUEST_COST, 0) * 10000
+      Object.keys(modelStats).reduce((a, m) => a + sumDailyPremCost(m, dailyStats), 0) * 10000
     ) / 10000;
     console.log(JSON.stringify(output, null, 2));
     db.close();
@@ -1046,12 +1083,12 @@ function main() {
   const modelRows = [];
   let tCost = 0, tNc = 0, tUnc = 0, tCached = 0, tCw = 0, tOut = 0, tCalls = 0, tPrompt = 0, tPremium = 0, tPremCost = 0;
   const sortedModels = Object.keys(modelStats).sort((a, b) =>
-    calcCostNocache(b, modelStats[b]) - calcCostNocache(a, modelStats[a])
+    sumDailyCost(b, dailyStats, calcCostNocache) - sumDailyCost(a, dailyStats, calcCostNocache)
   );
   for (const model of sortedModels) {
     const s = modelStats[model];
-    const cost = calcCost(model, s);
-    const costNc = calcCostNocache(model, s);
+    const cost = sumDailyCost(model, dailyStats, calcCost);
+    const costNc = sumDailyCost(model, dailyStats, calcCostNocache);
     const unc = uncachedInput(s);
     tCost += cost; tNc += costNc;
     tUnc += unc; tCached += s.cache_read_tokens; tCw += s.cache_creation_tokens;
@@ -1060,7 +1097,7 @@ function main() {
     const p = getPricing(model);
     const mult = getPremiumMultiplier(model);
     const premiumStr = mult > 0 ? s.premium_requests.toLocaleString('en-US') : '-';
-    const premCost = s.premium_requests * PREMIUM_REQUEST_COST;
+    const premCost = sumDailyPremCost(model, dailyStats);
     tPremCost += premCost;
     const premCostStr = mult === 0 ? '-' : fmtCost(premCost);
     modelRows.push([
@@ -1094,12 +1131,12 @@ function main() {
     const s = modelStats[model];
     const mult = getPremiumMultiplier(model);
     if (mult === 0) continue;
-    const cost = calcCost(model, s);
+    const cost = sumDailyCost(model, dailyStats, calcCost);
     if (s.premium_requests > 0) {
       premTotalCost += cost;
       premTotalReqs += s.premium_requests;
       const costPer = cost / s.premium_requests;
-      const premCost = s.premium_requests * PREMIUM_REQUEST_COST;
+      const premCost = sumDailyPremCost(model, dailyStats);
       const discount = cost > 0 ? ((1 - premCost / cost) * 100).toFixed(0) + '%' : '-';
       premRows.push([
         model, `${mult}×`, s.premium_requests.toLocaleString('en-US'),
@@ -1114,7 +1151,7 @@ function main() {
   }
   if (premRows.length > 0) {
     const avgCost = premTotalReqs > 0 ? premTotalCost / premTotalReqs : 0;
-    const totalPremCost = premTotalReqs * PREMIUM_REQUEST_COST;
+    const totalPremCost = Object.keys(modelStats).reduce((a, m) => a + sumDailyPremCost(m, dailyStats), 0);
     const totalDiscount = premTotalCost > 0 ? ((1 - totalPremCost / premTotalCost) * 100).toFixed(0) + '%' : '-';
     const premFooter = ['TOTAL', '', premTotalReqs.toLocaleString('en-US'), fmtCost(premTotalCost), fmtCost(avgCost), fmtCost(totalPremCost), totalDiscount];
     const premNotes = ['ℹ️  Models with 0× multiplier (free tier) are excluded'];
@@ -1138,11 +1175,11 @@ function main() {
       dUnc += uncachedInput(s);
       dCached += s.cache_read_tokens;
       dOut += s.completion_tokens;
-      dCost += calcCost(m, s);
-      dNc += calcCostNocache(m, s);
+      dCost += calcCost(m, s, day);
+      dNc += calcCostNocache(m, s, day);
     }
     const dTotal = dUnc + dCached;
-    const dPremCost = dPremium * PREMIUM_REQUEST_COST;
+    const dPremCost = dPremium * getPremiumRequestCost(day);
     const dDiscount = dCost > 0 ? ((1 - dPremCost / dCost) * 100).toFixed(0) + '%' : '-';
     dailyRows.push([
       day, dCalls.toLocaleString('en-US'), dPremium.toLocaleString('en-US'),
@@ -1166,8 +1203,8 @@ function main() {
       cache_creation_tokens: r.cache_creation_tokens, cache_read_tokens: r.cache_read_tokens,
     };
     if (!projCosts[proj]) projCosts[proj] = { cost: 0, cost_nc: 0 };
-    projCosts[proj].cost += calcCost(model, rs);
-    projCosts[proj].cost_nc += calcCostNocache(model, rs);
+    projCosts[proj].cost += calcCost(model, rs, r.timestamp);
+    projCosts[proj].cost_nc += calcCostNocache(model, rs, r.timestamp);
   }
 
   const projHeaders = ['Project', 'Calls', 'Premium', 'Input', 'Cached', 'Output', 'Hit%', 'Cost', 'No-Cache'];
