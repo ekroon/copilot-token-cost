@@ -10,6 +10,15 @@ Available in **Python**, **Go**, and **Node.js** — all three produce identical
 
 ## Usage
 
+### Install with mise
+
+```bash
+mise use -g github:ekroon/copilot-token-cost
+copilot-token-cost                         # default: last 7 days
+copilot-token-cost 30                      # last 30 days
+copilot-token-cost --json                  # machine-readable output
+```
+
 ### Python
 
 ```bash
@@ -92,3 +101,7 @@ python3 copilot-token-cost.py --sync
 - **Daily breakdown** — usage and cost by day
 - **Per-project breakdown** — usage and cost by workspace/project
 - **Pricing reference** — rates used for calculations
+
+## Historical Pricing
+
+The `pricing.json` file contains time-ranged pricing periods. Each API call's cost is calculated using the pricing that was in effect at its timestamp. This means pricing changes (e.g., premium request multiplier changes) are correctly applied retroactively when recalculating costs.
