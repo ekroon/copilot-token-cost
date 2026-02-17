@@ -27,6 +27,7 @@ jobs:
           gh label create pricing --description "Pricing data updates" --color "0075ca" 2>/dev/null || true
 
       - name: Create pricing update issue
+        id: create_issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -57,14 +58,46 @@ jobs:
           EOF
           )
 
-          if ! gh issue create \
+          issue_url=$(gh issue create \
             --title "$title" \
-            --assignee "copilot" \
             --label "pricing" \
-            --body "$body"; then
-            echo "Could not assign issue to 'copilot'; creating unassigned issue."
-            gh issue create \
-              --title "$title" \
-              --label "pricing" \
-              --body "$body"
+            --body "$body")
+          issue_number="${issue_url##*/}"
+          echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
+
+      - name: Assign Copilot to issue (GraphQL)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_ASSIGNABLE_NODE_ID: ${{ vars.COPILOT_ASSIGNABLE_NODE_ID }}
+        run: |
+          issue_number="${{ steps.create_issue.outputs.issue_number }}"
+
+          issue_id=$(gh api graphql \
+            -f query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){id}}}' \
+            -f owner='${{ github.repository_owner }}' \
+            -f repo='${{ github.event.repository.name }}' \
+            -F number="$issue_number" \
+            --jq '.data.repository.issue.id')
+
+          copilot_id="${COPILOT_ASSIGNABLE_NODE_ID:-}"
+          if [ -z "$copilot_id" ]; then
+            copilot_id=$(gh api graphql \
+              -f query='query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){issue(number:1){assignees(first:20){nodes{id login}}}}}' \
+              -f owner='${{ github.repository_owner }}' \
+              -f repo='${{ github.event.repository.name }}' \
+              --jq '.data.repository.issue.assignees.nodes[]? | select(.login=="Copilot") | .id' 2>/dev/null || true)
+          fi
+
+          if [ -z "$copilot_id" ]; then
+            echo "Could not resolve Copilot node ID; leaving issue #$issue_number unassigned."
+            exit 0
+          fi
+
+          if gh api graphql \
+            -f query='mutation($assignableId:ID!,$assigneeId:ID!){addAssigneesToAssignable(input:{assignableId:$assignableId,assigneeIds:[$assigneeId]}){assignable{... on Issue{number assignees(first:10){nodes{login}}}}}}' \
+            -f assignableId="$issue_id" \
+            -f assigneeId="$copilot_id" >/dev/null; then
+            echo "Assigned Copilot to issue #$issue_number."
+          else
+            echo "Could not assign Copilot via GraphQL; leaving issue #$issue_number unassigned."
           fi
