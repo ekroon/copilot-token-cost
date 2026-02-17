@@ -67,7 +67,7 @@ jobs:
 
       - name: Assign Copilot to issue (GraphQL)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN || secrets.GITHUB_TOKEN }}
           COPILOT_ASSIGNABLE_NODE_ID: ${{ vars.COPILOT_ASSIGNABLE_NODE_ID }}
         run: |
           issue_number="${{ steps.create_issue.outputs.issue_number }}"
@@ -93,11 +93,15 @@ jobs:
             exit 0
           fi
 
-          if gh api graphql \
+          if assign_output=$(gh api graphql \
             -f query='mutation($assignableId:ID!,$assigneeId:ID!){addAssigneesToAssignable(input:{assignableId:$assignableId,assigneeIds:[$assigneeId]}){assignable{... on Issue{number assignees(first:10){nodes{login}}}}}}' \
             -f assignableId="$issue_id" \
-            -f assigneeId="$copilot_id" >/dev/null; then
+            -f assigneeId="$copilot_id" 2>&1); then
             echo "Assigned Copilot to issue #$issue_number."
           else
+            echo "$assign_output"
+            if echo "$assign_output" | grep -qi "not writable"; then
+              echo "Tip: set repository secret COPILOT_ASSIGN_TOKEN (PAT with repo scope) to allow Copilot assignment."
+            fi
             echo "Could not assign Copilot via GraphQL; leaving issue #$issue_number unassigned."
           fi
