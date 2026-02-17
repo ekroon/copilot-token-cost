@@ -20,15 +20,19 @@ jobs:
           date=$(python3 -c "import json; d=json.load(open('pricing.json')); print(d['pricing_periods'][0]['effective_from'])")
           echo "date=$date" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure pricing label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create pricing --description "Pricing data updates" --color "0075ca" 2>/dev/null || true
+
       - name: Create pricing update issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh issue create \
-            --title "Check for Copilot pricing updates (current: ${{ steps.current.outputs.date }})" \
-            --assignee "copilot" \
-            --label "pricing" \
-            --body "## Task
+          title="Check for Copilot pricing updates (current: ${{ steps.current.outputs.date }})"
+          body=$(cat <<'EOF'
+          ## Task
 
           Check if GitHub Copilot model pricing or premium request multipliers have changed since **${{ steps.current.outputs.date }}**.
 
@@ -49,10 +53,18 @@ jobs:
 
           \`\`\`
           effective_from: ${{ steps.current.outputs.date }}
-          \`\`\`"
+          \`\`\`
+          EOF
+          )
 
-      - name: Ensure pricing label exists
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh label create pricing --description "Pricing data updates" --color "0075ca" 2>/dev/null || true
+          if ! gh issue create \
+            --title "$title" \
+            --assignee "copilot" \
+            --label "pricing" \
+            --body "$body"; then
+            echo "Could not assign issue to 'copilot'; creating unassigned issue."
+            gh issue create \
+              --title "$title" \
+              --label "pricing" \
+              --body "$body"
+          fi
