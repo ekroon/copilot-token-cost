@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -197,11 +198,26 @@ func (s *Stats) add(r Record, model string) {
 // ─── Log parsing ────────────────────────────────────────────────────────────
 
 func parseLogFile(logPath string) []Record {
-	data, err := os.ReadFile(logPath)
+	return parseLogFileInRange(logPath, "", "")
+}
+
+func parseLogFileInRange(logPath string, minTimestamp, maxTimestamp string) []Record {
+	content, tailUsed, err := readLogContentForRange(logPath, minTimestamp, maxTimestamp)
 	if err != nil {
 		return nil
 	}
-	content := string(data)
+	records := parseLogContent(content, logPath, minTimestamp, maxTimestamp)
+	if tailUsed && len(records) == 0 {
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			return records
+		}
+		return parseLogContent(string(data), logPath, minTimestamp, maxTimestamp)
+	}
+	return records
+}
+
+func parseLogContent(content, logPath, minTimestamp, maxTimestamp string) []Record {
 	lines := strings.Split(content, "\n")
 	records := make([]Record, 0, strings.Count(content, `"completion_tokens"`))
 
@@ -210,24 +226,42 @@ func parseLogFile(logPath string) []Record {
 	lastInitiator := "agent"
 
 	for i, line := range lines {
-		if m := reTimestamp.FindStringSubmatch(line); m != nil {
-			lastTimestamp = m[1]
+		if len(line) >= 19 &&
+			line[4] == '-' && line[7] == '-' &&
+			line[10] == 'T' && line[13] == ':' && line[16] == ':' {
+			lastTimestamp = line[:19]
 		}
-		if m := reSession.FindStringSubmatch(line); m != nil {
-			lastSession = m[1]
+		if strings.Contains(line, "Workspace initialized") || strings.Contains(line, "Created ACP session") || strings.Contains(line, "Flushed ") {
+			if m := reSession.FindStringSubmatch(line); m != nil {
+				lastSession = m[1]
+			}
 		}
-		if m := reInitiator.FindStringSubmatch(line); m != nil {
-			lastInitiator = m[1]
+		if strings.Contains(line, "PremiumRequestProcessor: Setting X-Initiator") {
+			if m := reInitiator.FindStringSubmatch(line); m != nil {
+				lastInitiator = m[1]
+			}
 		}
-		if m := reModelJSON.FindStringSubmatch(line); m != nil {
-			candidate := m[1]
-			if !strings.HasPrefix(candidate, "{") && (strings.Contains(candidate, "claude") || strings.Contains(candidate, "gpt") || strings.Contains(candidate, "gemini")) {
-				lastModel = candidate
+		if strings.Contains(line, `"model"`) {
+			if m := reModelJSON.FindStringSubmatch(line); m != nil {
+				candidate := m[1]
+				if !strings.HasPrefix(candidate, "{") && (strings.Contains(candidate, "claude") || strings.Contains(candidate, "gpt") || strings.Contains(candidate, "gemini")) {
+					lastModel = candidate
+				}
 			}
 		}
 
 		if !strings.Contains(line, `"completion_tokens"`) {
 			continue
+		}
+		if lastTimestamp != "" {
+			if minTimestamp != "" && lastTimestamp < minTimestamp {
+				lastInitiator = "agent"
+				continue
+			}
+			if maxTimestamp != "" && lastTimestamp >= maxTimestamp {
+				lastInitiator = "agent"
+				continue
+			}
 		}
 
 		promptMatch := rePromptTokens.FindStringSubmatch(line)
@@ -319,6 +353,38 @@ func parseLogFile(logPath string) []Record {
 		lastInitiator = "agent"
 	}
 	return records
+}
+
+func readLogContentForRange(logPath, minTimestamp, maxTimestamp string) (string, bool, error) {
+	if minTimestamp == "" && maxTimestamp == "" {
+		data, err := os.ReadFile(logPath)
+		return string(data), false, err
+	}
+	const tailBytes int64 = 4 * 1024 * 1024
+	f, err := os.Open(logPath)
+	if err != nil {
+		return "", false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", false, err
+	}
+	if info.Size() <= tailBytes {
+		data, err := io.ReadAll(f)
+		return string(data), false, err
+	}
+	if _, err := f.Seek(info.Size()-tailBytes, io.SeekStart); err != nil {
+		return "", false, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return "", false, err
+	}
+	if idx := strings.IndexByte(string(data), '\n'); idx >= 0 {
+		return string(data[idx+1:]), true, nil
+	}
+	return string(data), true, nil
 }
 
 func loadSessionWorkspaces(sessionDir string) map[string]string {
@@ -836,6 +902,14 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 
 	totalInserted := 0
 	parsedCount := 0
+	minTimestamp := ""
+	maxTimestamp := ""
+	if minTime != nil {
+		minTimestamp = minTime.Format("2006-01-02T15:04:05")
+	}
+	if maxTime != nil {
+		maxTimestamp = maxTime.Format("2006-01-02T15:04:05")
+	}
 	parsedMtimeByFile := map[string]float64{}
 	if !force {
 		rows, err := db.Query("SELECT log_file, mtime FROM parsed_logs WHERE source = ?", source)
@@ -897,7 +971,7 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 				return 0
 			}
 		}
-		records := parseLogFile(logPath)
+		records := parseLogFileInRange(logPath, minTimestamp, maxTimestamp)
 		for _, r := range records {
 			isUT := 0
 			if r.IsUserTurn {
