@@ -74,7 +74,7 @@ func runMainWithArgs(t *testing.T, root string, args ...string) (string, string)
 	if err := os.Setenv("HOME", filepath.Join(root, "home")); err != nil {
 		t.Fatalf("set HOME: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "copilot-tokens.db"), []byte{}, 0o644); err != nil {
+	if err := os.WriteFile(getDBPath(), []byte{}, 0o644); err != nil {
 		t.Fatalf("create db marker: %v", err)
 	}
 
@@ -148,7 +148,10 @@ func TestMainPathsWithoutMocking(t *testing.T) {
 	}
 
 	otherDB := filepath.Join(root, "other.db")
-	if b, err := os.ReadFile(filepath.Join(root, "copilot-tokens.db")); err == nil {
+	xdgDB := filepath.Join(root, "home", ".local", "state", "copilot-token-cost", "copilot-tokens.db")
+	if b, err := os.ReadFile(xdgDB); err == nil {
+		_ = os.WriteFile(otherDB, b, 0o644)
+	} else if b, err := os.ReadFile(filepath.Join(root, "copilot-tokens.db")); err == nil {
 		_ = os.WriteFile(otherDB, b, 0o644)
 	}
 	out, _ = runMainWithArgs(t, root, "--import-file", otherDB, "--json")

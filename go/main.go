@@ -203,7 +203,7 @@ func parseLogFile(logPath string) []Record {
 	}
 	content := string(data)
 	lines := strings.Split(content, "\n")
-	var records []Record
+	records := make([]Record, 0, strings.Count(content, `"completion_tokens"`))
 
 	lastModel := "unknown"
 	var lastTimestamp, lastSession string
@@ -230,45 +230,80 @@ func parseLogFile(logPath string) []Record {
 			continue
 		}
 
-		blockStart := i - 10
-		if blockStart < 0 {
-			blockStart = 0
+		promptMatch := rePromptTokens.FindStringSubmatch(line)
+		compMatch := reCompTokens.FindStringSubmatch(line)
+		var cacheCreation, cacheReadVal int
+		cacheCreationSet := false
+		cacheReadSet := false
+		if m := reCacheCreation.FindStringSubmatch(line); m != nil {
+			cacheCreation, _ = strconv.Atoi(m[1])
+			cacheCreationSet = true
 		}
-		blockEnd := i + 15
-		if blockEnd > len(lines) {
-			blockEnd = len(lines)
+		if m := reCacheRead.FindStringSubmatch(line); m != nil {
+			cacheReadVal, _ = strconv.Atoi(m[1])
+			cacheReadSet = true
 		}
-		block := strings.Join(lines[blockStart:blockEnd], "\n")
+		if !cacheReadSet {
+			if m := reCachedTokens.FindStringSubmatch(line); m != nil {
+				cacheReadVal, _ = strconv.Atoi(m[1])
+				cacheReadSet = true
+			}
+		}
 
-		promptMatch := rePromptTokens.FindStringSubmatch(block)
-		compMatch := reCompTokens.FindStringSubmatch(block)
-		if promptMatch == nil || compMatch == nil {
-			continue
-		}
-
-		// Check for model in block
-		if m := reModelJSON.FindStringSubmatch(block); m != nil {
-			candidate := m[1]
-			if strings.Contains(candidate, "claude") || strings.Contains(candidate, "gpt") || strings.Contains(candidate, "gemini") {
-				lastModel = candidate
+		if promptMatch == nil || compMatch == nil || !cacheCreationSet || !cacheReadSet || lastModel == "unknown" {
+			blockStart := i - 10
+			if blockStart < 0 {
+				blockStart = 0
+			}
+			blockEnd := i + 16
+			if blockEnd > len(lines) {
+				blockEnd = len(lines)
+			}
+			for j := blockStart; j < blockEnd; j++ {
+				if promptMatch == nil {
+					if m := rePromptTokens.FindStringSubmatch(lines[j]); m != nil {
+						promptMatch = m
+					}
+				}
+				if compMatch == nil {
+					if m := reCompTokens.FindStringSubmatch(lines[j]); m != nil {
+						compMatch = m
+					}
+				}
+				if !cacheCreationSet {
+					if m := reCacheCreation.FindStringSubmatch(lines[j]); m != nil {
+						cacheCreation, _ = strconv.Atoi(m[1])
+						cacheCreationSet = true
+					}
+				}
+				if !cacheReadSet {
+					if m := reCacheRead.FindStringSubmatch(lines[j]); m != nil {
+						cacheReadVal, _ = strconv.Atoi(m[1])
+						cacheReadSet = true
+					} else if m := reCachedTokens.FindStringSubmatch(lines[j]); m != nil {
+						cacheReadVal, _ = strconv.Atoi(m[1])
+						cacheReadSet = true
+					}
+				}
+				if lastModel == "unknown" {
+					if m := reModelJSON.FindStringSubmatch(lines[j]); m != nil {
+						candidate := m[1]
+						if strings.Contains(candidate, "claude") || strings.Contains(candidate, "gpt") || strings.Contains(candidate, "gemini") {
+							lastModel = candidate
+						}
+					}
+				}
+				if promptMatch != nil && compMatch != nil && cacheCreationSet && cacheReadSet && lastModel != "unknown" {
+					break
+				}
+			}
+			if promptMatch == nil || compMatch == nil {
+				continue
 			}
 		}
 
 		promptTokens, _ := strconv.Atoi(promptMatch[1])
 		completionTokens, _ := strconv.Atoi(compMatch[1])
-
-		var cacheCreation, cacheReadVal int
-		if m := reCacheCreation.FindStringSubmatch(block); m != nil {
-			cacheCreation, _ = strconv.Atoi(m[1])
-		}
-		if m := reCacheRead.FindStringSubmatch(block); m != nil {
-			cacheReadVal, _ = strconv.Atoi(m[1])
-		}
-		if cacheReadVal == 0 {
-			if m := reCachedTokens.FindStringSubmatch(block); m != nil {
-				cacheReadVal, _ = strconv.Atoi(m[1])
-			}
-		}
 
 		records = append(records, Record{
 			Model:               lastModel,
@@ -355,20 +390,18 @@ CREATE INDEX IF NOT EXISTS idx_api_calls_session ON api_calls(session_id);
 `
 
 func getDBPath() string {
-	exe, _ := os.Executable()
-	exeDir := filepath.Dir(exe)
-	candidates := []string{
-		filepath.Join(exeDir, "copilot-tokens.db"),
-		filepath.Join(exeDir, "..", "copilot-tokens.db"),
-		filepath.Join(".", "copilot-tokens.db"),
-		filepath.Join("..", "copilot-tokens.db"),
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p
+	xdgStateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
+	if xdgStateHome == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			xdgStateHome = filepath.Join(home, ".local", "state")
 		}
 	}
-	return filepath.Join("..", "copilot-tokens.db")
+	if xdgStateHome == "" {
+		xdgStateHome = filepath.Join(".local", "state")
+	}
+	xdgDBPath := filepath.Join(xdgStateHome, "copilot-token-cost", "copilot-tokens.db")
+	_ = os.MkdirAll(filepath.Dir(xdgDBPath), 0o755)
+	return xdgDBPath
 }
 
 func initDB(dbPath string) *sql.DB {
@@ -378,6 +411,7 @@ func initDB(dbPath string) *sql.DB {
 		os.Exit(1)
 	}
 	db.Exec("PRAGMA journal_mode=WAL")
+	db.Exec("PRAGMA synchronous=NORMAL")
 	db.Exec("PRAGMA foreign_keys=ON")
 	_, err = db.Exec(schemaSQLGo)
 	if err != nil {
@@ -802,6 +836,27 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 
 	totalInserted := 0
 	parsedCount := 0
+	tx, err := db.Begin()
+	if err != nil {
+		return 0
+	}
+	insertStmt, err := tx.Prepare(
+		"INSERT OR IGNORE INTO api_calls " +
+			"(model, model_normalized, prompt_tokens, completion_tokens, " +
+			"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
+			"timestamp, session_id, log_file, source) " +
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		_ = tx.Rollback()
+		return 0
+	}
+	defer insertStmt.Close()
+	parsedStmt, err := tx.Prepare("INSERT OR REPLACE INTO parsed_logs (log_file, mtime, source, record_count, parsed_at) VALUES (?, ?, ?, ?, datetime('now'))")
+	if err != nil {
+		_ = tx.Rollback()
+		return 0
+	}
+	defer parsedStmt.Close()
 
 	for _, logPath := range matches {
 		filename := filepath.Base(logPath)
@@ -823,13 +878,25 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 			continue
 		}
 		records := parseLogFile(logPath)
-		insertRecords(db, records, source)
-		markLogParsed(db, filename, mtime, len(records), source)
+		for _, r := range records {
+			isUT := 0
+			if r.IsUserTurn {
+				isUT = 1
+			}
+			_, _ = insertStmt.Exec(r.Model, normalizeModel(r.Model), r.PromptTokens, r.CompletionTokens,
+				r.CacheCreationTokens, r.CacheReadTokens, isUT,
+				r.Timestamp, r.SessionID, r.LogFile, source)
+		}
+		_, _ = parsedStmt.Exec(filename, mtime, source, len(records))
 		totalInserted += len(records)
 		parsedCount++
 		if force {
 			fmt.Fprintf(os.Stderr, "  📄 [%d/%d] %s (%d records)\n", parsedCount, len(matches), filename, len(records))
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return 0
 	}
 
 	workspaces := loadSessionWorkspaces(sessionDir)
