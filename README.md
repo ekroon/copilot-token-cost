@@ -63,6 +63,8 @@ node node/copilot-token-cost.js --json     # machine-readable output
 | `--sync` | Force full re-sync of all log files into the database |
 | `--import-file FILE` | Import data from JSONL or SQLite file |
 | `--export-file FILE` | Export data as JSONL |
+| `--codespaces-sync` | Sync Copilot data from running Codespaces via `gh cs cp` |
+| `--codespaces-include-stopped` | Include stopped Codespaces (requires `--codespaces-sync`) |
 
 ## SQLite Database
 
