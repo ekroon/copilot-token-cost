@@ -1,0 +1,15 @@
+{
+  "benchmark_contract": {
+    "scenario": "cold parsing on deterministic synthetic process log fixture",
+    "fixture": {
+      "seed": 20260218,
+      "log_files": 40,
+      "records_per_file": 200
+    },
+    "command": "cd go && go test -run '^$' -bench '^BenchmarkParseLogFile(Baseline)?Synthetic$' -benchtime=30x -count=1",
+    "target_ratio_max": 0.2
+  },
+  "baseline_parser_ns_per_op": 9324267,
+  "optimized_parser_ns_per_op": 1662004,
+  "optimized_to_baseline_ratio": 0.1782
+}
