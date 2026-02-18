@@ -2,7 +2,7 @@
 
 Parses Copilot CLI process logs to extract per-model token usage and calculates estimated API-equivalent costs.
 
-Available in **Python**, **Go**, and **Node.js** — all three produce identical output.
+Go-based CLI for parsing Copilot token usage and estimating API-equivalent costs.
 
 ## Gist
 
@@ -19,16 +19,6 @@ copilot-token-cost 30                      # last 30 days
 copilot-token-cost --json                  # machine-readable output
 ```
 
-### Python
-
-```bash
-python3 copilot-token-cost.py              # default: last 7 days
-python3 copilot-token-cost.py 30           # last 30 days
-python3 copilot-token-cost.py 1            # today only
-python3 copilot-token-cost.py --all        # all available logs
-python3 copilot-token-cost.py --json       # machine-readable output
-```
-
 ### Go
 
 ```bash
@@ -37,15 +27,6 @@ cd go && go build -o copilot-token-cost .  # build once
 ./go/copilot-token-cost 30                 # last 30 days
 ./go/copilot-token-cost --all              # all available logs
 ./go/copilot-token-cost --json             # machine-readable output
-```
-
-### Node.js
-
-```bash
-node node/copilot-token-cost.js            # default: last 7 days
-node node/copilot-token-cost.js 30         # last 30 days
-node node/copilot-token-cost.js --all      # all available logs
-node node/copilot-token-cost.js --json     # machine-readable output
 ```
 
 ## Common Flags
@@ -68,7 +49,7 @@ node node/copilot-token-cost.js --json     # machine-readable output
 
 ## SQLite Database
 
-All three implementations share a single SQLite database (`copilot-tokens.db`) in the project directory. The database:
+The Go implementation uses a single SQLite database (`copilot-tokens.db`) in the project directory. The database:
 
 - **Auto-syncs** on every run — only new/modified log files are re-parsed
 - **Improves performance** — subsequent runs skip already-parsed logs
@@ -78,22 +59,22 @@ All three implementations share a single SQLite database (`copilot-tokens.db`) i
 
 Export data from one machine:
 ```bash
-python3 copilot-token-cost.py --export-file tokens.jsonl
+./go/copilot-token-cost --export-file tokens.jsonl
 ```
 
 Import on another:
 ```bash
-python3 copilot-token-cost.py --import-file tokens.jsonl
+./go/copilot-token-cost --import-file tokens.jsonl
 ```
 
 You can also copy `copilot-tokens.db` directly, or import from another SQLite DB:
 ```bash
-python3 copilot-token-cost.py --import-file /path/to/other/copilot-tokens.db
+./go/copilot-token-cost --import-file /path/to/other/copilot-tokens.db
 ```
 
 Use `--sync` to force a full re-parse of all log files (useful after updates):
 ```bash
-python3 copilot-token-cost.py --sync
+./go/copilot-token-cost --sync
 ```
 
 ## Output

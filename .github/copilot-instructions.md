@@ -2,13 +2,11 @@
 
 ## Project Overview
 
-This is the **Copilot CLI Token Usage & Cost Calculator** — a tool that parses Copilot CLI process logs to extract per-model token usage and calculates estimated API-equivalent costs. It has three implementations: Python, Go, and Node.js.
+This is the **Copilot CLI Token Usage & Cost Calculator** — a Go-based tool that parses Copilot CLI process logs to extract per-model token usage and calculates estimated API-equivalent costs.
 
 ## Repository Structure
 
-- `copilot-token-cost.py` + `db.py` — Python implementation
 - `go/main.go` — Go implementation
-- `node/copilot-token-cost.js` — Node.js implementation
 - `pricing.json` — Shared pricing data (historical, time-ranged)
 - `.github/workflows/` — CI, release, and pricing update workflows
 
@@ -48,7 +46,7 @@ The file uses a **time-ranged historical pricing** format:
 3. Apply the changes (new prices, new multipliers, new models)
 4. Add a descriptive `_label` explaining what changed
 5. **Never modify existing periods** — they represent historical truth
-6. All three implementations (Python, Go, Node.js) read this same file
+6. The Go implementation reads this same file
 
 ## Where to Find Pricing Data
 
@@ -69,4 +67,4 @@ The file uses a **time-ranged historical pricing** format:
 
 ## Code Style
 - Minimal comments — only where clarification is needed
-- All three implementations should stay in sync with the same features and output format
+- Keep Go output and behavior stable when making feature changes
