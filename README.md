@@ -47,6 +47,18 @@ cd go && go build -o copilot-token-cost .  # build once
 | `--codespaces-sync` | Sync Copilot data from running Codespaces via `gh cs cp` |
 | `--codespaces-include-stopped` | Include stopped Codespaces (requires `--codespaces-sync`) |
 
+## Semver Tagging Helper
+
+Use the helper script to create and push the next release tag based on existing `vX.Y.Z` tags:
+
+```bash
+./scripts/semver-tag.sh patch   # v1.2.3 -> v1.2.4
+./scripts/semver-tag.sh minor   # v1.2.3 -> v1.3.0
+./scripts/semver-tag.sh major   # v1.2.3 -> v2.0.0
+```
+
+If no semver tags exist yet, it starts from `v0.0.0`.
+
 ## SQLite Database
 
 The Go implementation uses a single SQLite database (`copilot-tokens.db`) in the project directory. The database:
