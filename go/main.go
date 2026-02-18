@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -159,23 +160,23 @@ func getPremiumMultiplier(model string, timestamp string) float64 {
 // ─── Record & Stats ─────────────────────────────────────────────────────────
 
 type Record struct {
-	Model              string
-	PromptTokens       int
-	CompletionTokens   int
+	Model               string
+	PromptTokens        int
+	CompletionTokens    int
 	CacheCreationTokens int
-	CacheReadTokens    int
-	IsUserTurn         bool
-	Timestamp          string
-	SessionID          string
-	LogFile            string
+	CacheReadTokens     int
+	IsUserTurn          bool
+	Timestamp           string
+	SessionID           string
+	LogFile             string
 }
 
 type Stats struct {
-	APICalls            int `json:"api_calls"`
-	PromptTokens        int `json:"prompt_tokens"`
-	CompletionTokens    int `json:"completion_tokens"`
-	CacheCreationTokens int `json:"cache_creation_tokens"`
-	CacheReadTokens     int `json:"cache_read_tokens"`
+	APICalls            int     `json:"api_calls"`
+	PromptTokens        int     `json:"prompt_tokens"`
+	CompletionTokens    int     `json:"completion_tokens"`
+	CacheCreationTokens int     `json:"cache_creation_tokens"`
+	CacheReadTokens     int     `json:"cache_read_tokens"`
 	PremiumRequests     float64 `json:"premium_requests"`
 }
 
@@ -269,15 +270,15 @@ func parseLogFile(logPath string) []Record {
 		}
 
 		records = append(records, Record{
-			Model:              lastModel,
-			PromptTokens:       promptTokens,
-			CompletionTokens:   completionTokens,
+			Model:               lastModel,
+			PromptTokens:        promptTokens,
+			CompletionTokens:    completionTokens,
 			CacheCreationTokens: cacheCreation,
-			CacheReadTokens:    cacheReadVal,
-			IsUserTurn:         lastInitiator == "user",
-			Timestamp:          lastTimestamp,
-			SessionID:          lastSession,
-			LogFile:            filepath.Base(logPath),
+			CacheReadTokens:     cacheReadVal,
+			IsUserTurn:          lastInitiator == "user",
+			Timestamp:           lastTimestamp,
+			SessionID:           lastSession,
+			LogFile:             filepath.Base(logPath),
 		})
 		lastInitiator = "agent"
 	}
@@ -338,6 +339,12 @@ CREATE TABLE IF NOT EXISTS session_workspaces (
     session_id TEXT PRIMARY KEY,
     cwd TEXT NOT NULL,
     source TEXT DEFAULT 'local'
+);
+
+CREATE TABLE IF NOT EXISTS codespace_sync_state (
+    codespace_name TEXT PRIMARY KEY,
+    last_used_at TEXT,
+    last_synced_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_calls_timestamp ON api_calls(timestamp);
@@ -430,6 +437,26 @@ func clearSource(db *sql.DB, source string) {
 	db.Exec("DELETE FROM api_calls WHERE source = ?", source)
 	db.Exec("DELETE FROM parsed_logs WHERE source = ?", source)
 	db.Exec("DELETE FROM session_workspaces WHERE source = ?", source)
+}
+
+func getCodespaceLastUsed(db *sql.DB, codespaceName string) string {
+	var lastUsed sql.NullString
+	err := db.QueryRow(
+		"SELECT last_used_at FROM codespace_sync_state WHERE codespace_name = ?",
+		codespaceName,
+	).Scan(&lastUsed)
+	if err != nil || !lastUsed.Valid {
+		return ""
+	}
+	return lastUsed.String
+}
+
+func upsertCodespaceSyncState(db *sql.DB, codespaceName string, lastUsedAt string) {
+	db.Exec(
+		"INSERT OR REPLACE INTO codespace_sync_state (codespace_name, last_used_at, last_synced_at) VALUES (?, ?, datetime('now'))",
+		codespaceName,
+		lastUsedAt,
+	)
 }
 
 func buildFilters(dateFrom, dateTo string) (string, []interface{}) {
@@ -723,16 +750,16 @@ func importSQLiteDB(db *sql.DB, otherDBPath, sourceOverride string) int {
 	return int(count)
 }
 
-func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool) int {
+func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source string) int {
 	var existing int
-	db.QueryRow("SELECT COUNT(*) FROM api_calls").Scan(&existing)
+	db.QueryRow("SELECT COUNT(*) FROM api_calls WHERE source = ?", source).Scan(&existing)
 	matches, _ := filepath.Glob(filepath.Join(logsDir, "process-*.log"))
 	sort.Strings(matches)
 
 	if force {
 		// Clear parse tracker so all logs are re-parsed; keep existing api_calls (INSERT OR IGNORE handles dedup)
-		db.Exec("DELETE FROM parsed_logs WHERE source = 'local'")
-		fmt.Fprintf(os.Stderr, "  🔄 Force re-sync: re-parsing %d log files (keeping %s existing records)\n", len(matches), addCommas(strconv.Itoa(existing)))
+		db.Exec("DELETE FROM parsed_logs WHERE source = ?", source)
+		fmt.Fprintf(os.Stderr, "  🔄 Force re-sync (%s): re-parsing %d log files (keeping %s existing records)\n", source, len(matches), addCommas(strconv.Itoa(existing)))
 	}
 
 	totalInserted := 0
@@ -745,12 +772,12 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool) int {
 			continue
 		}
 		mtime := float64(info.ModTime().UnixMilli()) / 1000.0
-		if !force && isLogParsed(db, filename, mtime, "local") {
+		if !force && isLogParsed(db, filename, mtime, source) {
 			continue
 		}
 		records := parseLogFile(logPath)
-		insertRecords(db, records, "local")
-		markLogParsed(db, filename, mtime, len(records), "local")
+		insertRecords(db, records, source)
+		markLogParsed(db, filename, mtime, len(records), source)
 		totalInserted += len(records)
 		parsedCount++
 		if force {
@@ -760,17 +787,104 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool) int {
 
 	workspaces := loadSessionWorkspaces(sessionDir)
 	for sessionID, cwd := range workspaces {
-		upsertSessionWorkspace(db, sessionID, cwd, "local")
+		upsertSessionWorkspace(db, sessionID, cwd, source)
 	}
 
 	if parsedCount > 0 {
 		var totalNow int
-		db.QueryRow("SELECT COUNT(*) FROM api_calls").Scan(&totalNow)
+		db.QueryRow("SELECT COUNT(*) FROM api_calls WHERE source = ?", source).Scan(&totalNow)
 		newRecords := totalNow - existing
-		fmt.Fprintf(os.Stderr, "  ✅ Synced %d log files: %s new records (%s total in DB)\n", parsedCount, addCommas(strconv.Itoa(newRecords)), addCommas(strconv.Itoa(totalNow)))
+		fmt.Fprintf(os.Stderr, "  ✅ Synced %d log files (%s): %s new records (%s total)\n", parsedCount, source, addCommas(strconv.Itoa(newRecords)), addCommas(strconv.Itoa(totalNow)))
 	}
 
 	return totalInserted
+}
+
+type codespaceInfo struct {
+	Name       string `json:"name"`
+	State      string `json:"state"`
+	LastUsedAt string `json:"lastUsedAt"`
+}
+
+func listCodespaces(includeStopped bool) []codespaceInfo {
+	cmd := exec.Command("gh", "cs", "list", "--json", "name,state,lastUsedAt", "--limit", "1000")
+	out, err := cmd.Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: failed to list codespaces\n")
+		return nil
+	}
+	var all []codespaceInfo
+	if err := json.Unmarshal(out, &all); err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: invalid JSON from gh cs list\n")
+		return nil
+	}
+	allowed := map[string]bool{"Available": true}
+	if includeStopped {
+		allowed["Shutdown"] = true
+	}
+	var filtered []codespaceInfo
+	for _, cs := range all {
+		if cs.Name != "" && allowed[cs.State] {
+			filtered = append(filtered, cs)
+		}
+	}
+	return filtered
+}
+
+func syncCodespacesToDB(db *sql.DB, includeStopped bool) int {
+	codespaces := listCodespaces(includeStopped)
+	if len(codespaces) == 0 {
+		return 0
+	}
+	total := 0
+	for _, cs := range codespaces {
+		if cs.LastUsedAt != "" && getCodespaceLastUsed(db, cs.Name) == cs.LastUsedAt {
+			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (unchanged lastUsedAt)\n", cs.Name)
+			continue
+		}
+
+		shouldStop := cs.State == "Shutdown"
+		tmpDir, err := os.MkdirTemp("", "copilot-cs-")
+		if err != nil {
+			continue
+		}
+		copied := false
+		func() {
+			defer os.RemoveAll(tmpDir)
+			if shouldStop {
+				defer exec.Command("gh", "cs", "stop", "-c", cs.Name).Run()
+			}
+
+			stage := filepath.Join(tmpDir, cs.Name)
+			_ = os.MkdirAll(stage, 0755)
+			cpCmd := exec.Command("gh", "cs", "cp", "-r", "-c", cs.Name, "remote:~/.copilot", stage)
+			cpOut, cpErr := cpCmd.CombinedOutput()
+			if cpErr != nil {
+				msg := strings.TrimSpace(string(cpOut))
+				if msg == "" {
+					msg = "gh cs cp failed"
+				}
+				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s\n", cs.Name, msg)
+				return
+			}
+
+			copilotDir := filepath.Join(stage, ".copilot")
+			logsDir := filepath.Join(copilotDir, "logs")
+			sessionDir := filepath.Join(copilotDir, "session-state")
+			if _, err := os.Stat(logsDir); err != nil {
+				fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: no .copilot/logs in copied data\n", cs.Name)
+				return
+			}
+
+			total += syncLogsToDB(db, logsDir, sessionDir, false, "codespace:"+cs.Name)
+			copied = true
+		}()
+
+		if copied {
+			upsertCodespaceSyncState(db, cs.Name, cs.LastUsedAt)
+		}
+	}
+	return total
 }
 
 func projectName(cwd string) string {
@@ -936,20 +1050,48 @@ func displayWidth(s string) int {
 
 func isWideRune(r rune) bool {
 	// East Asian Width W/F ranges
-	if r >= 0x1100 && r <= 0x115F { return true }
-	if r >= 0x2E80 && r <= 0x303E { return true }
-	if r >= 0x3040 && r <= 0x33BF { return true }
-	if r >= 0x3400 && r <= 0x4DBF { return true }
-	if r >= 0x4E00 && r <= 0xA4CF { return true }
-	if r >= 0xA960 && r <= 0xA97C { return true }
-	if r >= 0xAC00 && r <= 0xD7FF { return true }
-	if r >= 0xF900 && r <= 0xFAFF { return true }
-	if r >= 0xFE10 && r <= 0xFE6F { return true }
-	if r >= 0xFF01 && r <= 0xFF60 { return true }
-	if r >= 0xFFE0 && r <= 0xFFE6 { return true }
-	if r >= 0x1F000 && r <= 0x1FFFF { return true }
-	if r >= 0x20000 && r <= 0x2FFFF { return true }
-	if r >= 0x30000 && r <= 0x3FFFF { return true }
+	if r >= 0x1100 && r <= 0x115F {
+		return true
+	}
+	if r >= 0x2E80 && r <= 0x303E {
+		return true
+	}
+	if r >= 0x3040 && r <= 0x33BF {
+		return true
+	}
+	if r >= 0x3400 && r <= 0x4DBF {
+		return true
+	}
+	if r >= 0x4E00 && r <= 0xA4CF {
+		return true
+	}
+	if r >= 0xA960 && r <= 0xA97C {
+		return true
+	}
+	if r >= 0xAC00 && r <= 0xD7FF {
+		return true
+	}
+	if r >= 0xF900 && r <= 0xFAFF {
+		return true
+	}
+	if r >= 0xFE10 && r <= 0xFE6F {
+		return true
+	}
+	if r >= 0xFF01 && r <= 0xFF60 {
+		return true
+	}
+	if r >= 0xFFE0 && r <= 0xFFE6 {
+		return true
+	}
+	if r >= 0x1F000 && r <= 0x1FFFF {
+		return true
+	}
+	if r >= 0x20000 && r <= 0x2FFFF {
+		return true
+	}
+	if r >= 0x30000 && r <= 0x3FFFF {
+		return true
+	}
 	return false
 }
 
@@ -1082,11 +1224,14 @@ func main() {
 	syncFlag := flag.Bool("sync", false, "Force full re-sync of all log files")
 	importFile := flag.String("import-file", "", "Import data from JSONL or SQLite file")
 	exportFile := flag.String("export-file", "", "Export data as JSONL")
+	codespacesSync := flag.Bool("codespaces-sync", false, "Sync Copilot data from running Codespaces via gh cs cp")
+	codespacesIncludeStopped := flag.Bool("codespaces-include-stopped", false, "Include stopped Codespaces (will wake and sync them)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: copilot-token-cost [days] [--all] [--today] [--yesterday]\n")
 		fmt.Fprintf(os.Stderr, "                         [--from N] [--to N] [--logs-dir PATH] [--json]\n")
 		fmt.Fprintf(os.Stderr, "                         [--sync] [--import-file FILE] [--export-file FILE]\n\n")
+		fmt.Fprintf(os.Stderr, "                         [--codespaces-sync] [--codespaces-include-stopped]\n\n")
 		fmt.Fprintf(os.Stderr, "Copilot CLI Token Cost Calculator\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost              # last 7 days\n")
@@ -1099,8 +1244,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --sync       # force full re-sync\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --export-file data.jsonl  # export\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --import-file data.jsonl  # import\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --codespaces-sync  # sync running codespaces\n")
 	}
 	flag.Parse()
+
+	if *codespacesIncludeStopped && !*codespacesSync {
+		fmt.Fprintln(os.Stderr, "--codespaces-include-stopped requires --codespaces-sync")
+		os.Exit(1)
+	}
 
 	home, _ := os.UserHomeDir()
 	logsDir := filepath.Join(home, ".copilot", "logs")
@@ -1201,7 +1352,11 @@ func main() {
 	defer database.Close()
 
 	if logsExist {
-		syncLogsToDB(database, logsDir, sessionDir, *syncFlag)
+		syncLogsToDB(database, logsDir, sessionDir, *syncFlag, "local")
+	}
+
+	if *codespacesSync {
+		syncCodespacesToDB(database, *codespacesIncludeStopped)
 	}
 
 	if *importFile != "" {
@@ -1319,16 +1474,16 @@ func main() {
 		}
 
 		type output struct {
-			Period                string                       `json:"period"`
-			DateRange             *string                      `json:"date_range"`
-			LogFiles              int                          `json:"log_files"`
-			APICalls              int                          `json:"api_calls"`
-			Models                map[string]jsonStats         `json:"models"`
-			Daily                 map[string]map[string]interface{} `json:"daily"`
-			Projects              map[string]jsonStats         `json:"projects"`
-			TotalCost             float64                      `json:"total_cost"`
-			TotalCostNoCache      float64                      `json:"total_cost_without_cache"`
-			TotalPremiumRequestCost float64                    `json:"total_premium_request_cost"`
+			Period                  string                            `json:"period"`
+			DateRange               *string                           `json:"date_range"`
+			LogFiles                int                               `json:"log_files"`
+			APICalls                int                               `json:"api_calls"`
+			Models                  map[string]jsonStats              `json:"models"`
+			Daily                   map[string]map[string]interface{} `json:"daily"`
+			Projects                map[string]jsonStats              `json:"projects"`
+			TotalCost               float64                           `json:"total_cost"`
+			TotalCostNoCache        float64                           `json:"total_cost_without_cache"`
+			TotalPremiumRequestCost float64                           `json:"total_premium_request_cost"`
 		}
 
 		out := output{
@@ -1357,8 +1512,8 @@ func main() {
 				CompletionTokens: s.CompletionTokens, CacheCreationTokens: s.CacheCreationTokens,
 				CacheReadTokens: s.CacheReadTokens, PremiumRequests: s.PremiumRequests,
 				PremiumRequestCost: roundN(premCost, 4),
-				InputUncached: uncachedInput(s),
-				Cost: roundN(cost, 4), CostWithoutCache: roundN(costNC, 4),
+				InputUncached:      uncachedInput(s),
+				Cost:               roundN(cost, 4), CostWithoutCache: roundN(costNC, 4),
 			}
 			out.TotalPremiumRequestCost += premCost
 		}
@@ -1378,8 +1533,8 @@ func main() {
 					CompletionTokens: s.CompletionTokens, CacheCreationTokens: s.CacheCreationTokens,
 					CacheReadTokens: s.CacheReadTokens, PremiumRequests: s.PremiumRequests,
 					PremiumRequestCost: roundN(s.PremiumRequests*getPremiumRequestCost(day), 4),
-					InputUncached: uncachedInput(s),
-					Cost: roundN(cost, 4), CostWithoutCache: roundN(costNC, 4),
+					InputUncached:      uncachedInput(s),
+					Cost:               roundN(cost, 4), CostWithoutCache: roundN(costNC, 4),
 				}
 			}
 			dayMap["_total_cost"] = roundN(dayTotal, 4)
@@ -1415,8 +1570,8 @@ func main() {
 				CompletionTokens: s.CompletionTokens, CacheCreationTokens: s.CacheCreationTokens,
 				CacheReadTokens: s.CacheReadTokens, PremiumRequests: s.PremiumRequests,
 				PremiumRequestCost: roundN(s.PremiumRequests*getPremiumRequestCost(""), 4),
-				InputUncached: uncachedInput(s),
-				Cost: roundN(pc[0], 4), CostWithoutCache: roundN(pc[1], 4),
+				InputUncached:      uncachedInput(s),
+				Cost:               roundN(pc[0], 4), CostWithoutCache: roundN(pc[1], 4),
 			}
 		}
 

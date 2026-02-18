@@ -14,6 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { spawnSync } = require('child_process');
 const Database = require('better-sqlite3');
 
 const DB_PATH = path.join(__dirname, '..', 'copilot-tokens.db');
@@ -85,6 +86,11 @@ CREATE TABLE IF NOT EXISTS session_workspaces (
     cwd TEXT NOT NULL,
     source TEXT DEFAULT 'local'
 );
+CREATE TABLE IF NOT EXISTS codespace_sync_state (
+    codespace_name TEXT PRIMARY KEY,
+    last_used_at TEXT,
+    last_synced_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_api_calls_timestamp ON api_calls(timestamp);
 CREATE INDEX IF NOT EXISTS idx_api_calls_model ON api_calls(model_normalized);
 CREATE INDEX IF NOT EXISTS idx_api_calls_session ON api_calls(session_id);
@@ -146,6 +152,21 @@ function clearSource(db, source = 'local') {
   db.prepare('DELETE FROM api_calls WHERE source = ?').run(source);
   db.prepare('DELETE FROM parsed_logs WHERE source = ?').run(source);
   db.prepare('DELETE FROM session_workspaces WHERE source = ?').run(source);
+}
+
+
+function getCodespaceLastUsed(db, codespaceName) {
+  const row = db.prepare(
+    'SELECT last_used_at FROM codespace_sync_state WHERE codespace_name = ?'
+  ).get(codespaceName);
+  return row ? row.last_used_at : null;
+}
+
+
+function upsertCodespaceSyncState(db, codespaceName, lastUsedAt) {
+  db.prepare(
+    "INSERT OR REPLACE INTO codespace_sync_state (codespace_name, last_used_at, last_synced_at) VALUES (?, ?, datetime('now'))"
+  ).run(codespaceName, lastUsedAt ?? null);
 }
 
 
@@ -335,8 +356,8 @@ function importSQLiteDB(db, otherDBPath, sourceOverride) {
 }
 
 
-function syncLogsToDB(db, logsDir, sessionDir, force = false) {
-  const existing = db.prepare('SELECT COUNT(*) AS c FROM api_calls').get().c;
+function syncLogsToDB(db, logsDir, sessionDir, force = false, source = 'local') {
+  const existing = db.prepare('SELECT COUNT(*) AS c FROM api_calls WHERE source = ?').get(source).c;
   const logFiles = fs.readdirSync(logsDir)
     .filter(f => f.startsWith('process-') && f.endsWith('.log'))
     .sort()
@@ -344,8 +365,8 @@ function syncLogsToDB(db, logsDir, sessionDir, force = false) {
 
   // Clear parse tracker so all logs are re-parsed; keep existing api_calls (INSERT OR IGNORE handles dedup)
   if (force) {
-    db.exec("DELETE FROM parsed_logs WHERE source = 'local'");
-    process.stderr.write(`  🔄 Force re-sync: re-parsing ${logFiles.length} log files (keeping ${existing.toLocaleString()} existing records)\n`);
+    db.prepare('DELETE FROM parsed_logs WHERE source = ?').run(source);
+    process.stderr.write(`  🔄 Force re-sync (${source}): re-parsing ${logFiles.length} log files (keeping ${existing.toLocaleString()} existing records)\n`);
   }
   let totalInserted = 0;
   let parsedCount = 0;
@@ -353,11 +374,11 @@ function syncLogsToDB(db, logsDir, sessionDir, force = false) {
   for (const logPath of logFiles) {
     const filename = path.basename(logPath);
     const mtime = fs.statSync(logPath).mtimeMs / 1000;
-    if (!force && isLogParsed(db, filename, mtime)) continue;
+    if (!force && isLogParsed(db, filename, mtime, source)) continue;
     const records = parseLogFile(logPath);
     records.forEach(r => { r.model_normalized = normalizeModel(r.model); });
-    insertRecords(db, records);
-    markLogParsed(db, filename, mtime, records.length);
+    insertRecords(db, records, source);
+    markLogParsed(db, filename, mtime, records.length, source);
     totalInserted += records.length;
     parsedCount++;
     if (force) {
@@ -366,14 +387,82 @@ function syncLogsToDB(db, logsDir, sessionDir, force = false) {
   }
   const workspaces = loadSessionWorkspaces(sessionDir);
   for (const [sid, cwd] of Object.entries(workspaces)) {
-    upsertSessionWorkspace(db, sid, cwd);
+    upsertSessionWorkspace(db, sid, cwd, source);
   }
   if (parsedCount > 0) {
-    const totalNow = db.prepare('SELECT COUNT(*) AS c FROM api_calls').get().c;
+    const totalNow = db.prepare('SELECT COUNT(*) AS c FROM api_calls WHERE source = ?').get(source).c;
     const newRecords = totalNow - existing;
-    process.stderr.write(`  ✅ Synced ${parsedCount} log files: ${newRecords.toLocaleString()} new records (${totalNow.toLocaleString()} total in DB)\n`);
+    process.stderr.write(`  ✅ Synced ${parsedCount} log files (${source}): ${newRecords.toLocaleString()} new records (${totalNow.toLocaleString()} total)\n`);
   }
   return totalInserted;
+}
+
+
+function listCodespaces(includeStopped = false) {
+  const proc = spawnSync('gh', ['cs', 'list', '--json', 'name,state,lastUsedAt', '--limit', '1000'], { encoding: 'utf-8' });
+  if (proc.status !== 0) {
+    const err = (proc.stderr || '').trim();
+    process.stderr.write(`  ⚠️ Codespaces sync skipped: ${err || 'failed to list codespaces'}\n`);
+    return [];
+  }
+  let items = [];
+  try {
+    items = JSON.parse(proc.stdout || '[]');
+  } catch {
+    process.stderr.write('  ⚠️ Codespaces sync skipped: invalid JSON from gh cs list\n');
+    return [];
+  }
+  const allowed = new Set(['Available']);
+  if (includeStopped) allowed.add('Shutdown');
+  return items.filter(cs => cs.name && allowed.has(cs.state));
+}
+
+
+function syncCodespacesToDB(db, includeStopped = false) {
+  const codespaces = listCodespaces(includeStopped);
+  if (!codespaces.length) return 0;
+  let total = 0;
+  for (const cs of codespaces) {
+    const name = cs.name;
+    const state = cs.state || '';
+    const lastUsedAt = cs.lastUsedAt ?? null;
+    if (lastUsedAt && getCodespaceLastUsed(db, name) === lastUsedAt) {
+      process.stderr.write(`  ⏭️  Skipping ${name} (unchanged lastUsedAt)\n`);
+      continue;
+    }
+
+    const shouldStop = state === 'Shutdown';
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-cs-'));
+    let copied = false;
+    try {
+      const stage = path.join(tmpDir, name);
+      fs.mkdirSync(stage, { recursive: true });
+      const cp = spawnSync('gh', ['cs', 'cp', '-r', '-c', name, 'remote:~/.copilot', stage], { encoding: 'utf-8' });
+      if (cp.status !== 0) {
+        const err = (cp.stderr || '').trim();
+        process.stderr.write(`  ⚠️ Failed to copy ${name}: ${err || 'gh cs cp failed'}\n`);
+        continue;
+      }
+
+      const copilotDir = path.join(stage, '.copilot');
+      const logsDir = path.join(copilotDir, 'logs');
+      const sessionDir = path.join(copilotDir, 'session-state');
+      if (!fs.existsSync(logsDir)) {
+        process.stderr.write(`  ⚠️ Skipping ${name}: no .copilot/logs in copied data\n`);
+        continue;
+      }
+      total += syncLogsToDB(db, logsDir, sessionDir, false, `codespace:${name}`);
+      copied = true;
+    } finally {
+      if (shouldStop) {
+        spawnSync('gh', ['cs', 'stop', '-c', name], { stdio: 'ignore' });
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+
+    if (copied) upsertCodespaceSyncState(db, name, lastUsedAt);
+  }
+  return total;
 }
 
 
@@ -742,6 +831,8 @@ function parseArgs(argv) {
     sync: false,
     import_file: null,
     export_file: null,
+    codespaces_sync: false,
+    codespaces_include_stopped: false,
   };
   const positional = [];
   let i = 0;
@@ -752,6 +843,8 @@ function parseArgs(argv) {
     else if (a === '--yesterday') { args.yesterday = true; }
     else if (a === '--json') { args.json = true; }
     else if (a === '--sync') { args.sync = true; }
+    else if (a === '--codespaces-sync') { args.codespaces_sync = true; }
+    else if (a === '--codespaces-include-stopped') { args.codespaces_include_stopped = true; }
     else if (a === '--help' || a === '-h') { args.help = true; }
     else if (a === '--from') { i++; args.from_days = parseInt(argv[i], 10); }
     else if (a === '--to') { i++; args.to_days = parseInt(argv[i], 10); }
@@ -766,6 +859,10 @@ function parseArgs(argv) {
     i++;
   }
   if (positional.length > 0) args.days = positional[0];
+  if (args.codespaces_include_stopped && !args.codespaces_sync) {
+    process.stderr.write('--codespaces-include-stopped requires --codespaces-sync\n');
+    process.exit(1);
+  }
   return args;
 }
 
@@ -774,6 +871,7 @@ function showHelp() {
   console.log(`usage: copilot-token-cost.js [days] [--all] [--today] [--yesterday]
                             [--from N] [--to N] [--logs-dir PATH] [--json]
                             [--sync] [--import-file FILE] [--export-file FILE]
+                            [--codespaces-sync] [--codespaces-include-stopped]
 
 Copilot CLI Token Cost Calculator
 
@@ -792,6 +890,9 @@ options:
   --sync                Force full re-sync of all log files
   --import-file FILE    Import data from JSONL or SQLite file
   --export-file FILE    Export data as JSONL
+  --codespaces-sync     Sync Copilot data from running Codespaces via gh cs cp
+  --codespaces-include-stopped
+                        Include stopped Codespaces (will wake and sync them)
 
 Examples:
   copilot-token-cost.js              # last 7 days
@@ -876,6 +977,10 @@ function main() {
 
   if (fs.existsSync(logsDir)) {
     syncLogsToDB(db, logsDir, sessionDir, args.sync);
+  }
+
+  if (args.codespaces_sync) {
+    syncCodespacesToDB(db, args.codespaces_include_stopped);
   }
 
   if (args.import_file) {

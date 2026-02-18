@@ -17,7 +17,9 @@ import argparse
 import db
 import json
 import re
+import subprocess
 import sys
+import tempfile
 import unicodedata
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -185,16 +187,19 @@ def project_name(cwd: str) -> str:
     return path
 
 
-def sync_logs_to_db(conn, logs_dir: Path, session_dir: Path, force: bool = False) -> int:
+def sync_logs_to_db(conn, logs_dir: Path, session_dir: Path, force: bool = False, source: str = 'local') -> int:
     """Parse log files and sync records into the SQLite database. Returns total new records inserted."""
-    existing = conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+    existing = conn.execute("SELECT COUNT(*) FROM api_calls WHERE source = ?", (source,)).fetchone()[0]
     log_files = sorted(logs_dir.glob("process-*.log"))
 
     if force:
         # Clear parse tracker so all logs are re-parsed; keep existing api_calls (INSERT OR IGNORE handles dedup)
-        conn.execute("DELETE FROM parsed_logs WHERE source = 'local'")
+        conn.execute("DELETE FROM parsed_logs WHERE source = ?", (source,))
         conn.commit()
-        print(f"  🔄 Force re-sync: re-parsing {len(log_files)} log files (keeping {existing:,} existing records)", file=sys.stderr)
+        print(
+            f"  🔄 Force re-sync ({source}): re-parsing {len(log_files)} log files (keeping {existing:,} existing records)",
+            file=sys.stderr
+        )
 
     total_inserted = 0
     parsed_count = 0
@@ -202,13 +207,13 @@ def sync_logs_to_db(conn, logs_dir: Path, session_dir: Path, force: bool = False
     for log_path in log_files:
         filename = log_path.name
         mtime = log_path.stat().st_mtime
-        if not force and db.is_log_parsed(conn, filename, mtime):
+        if not force and db.is_log_parsed(conn, filename, mtime, source=source):
             continue
         records = parse_log_file(log_path)
         for r in records:
             r['model_normalized'] = normalize_model(r['model'])
-        db.insert_records(conn, records)
-        db.mark_log_parsed(conn, filename, mtime, len(records))
+        db.insert_records(conn, records, source=source)
+        db.mark_log_parsed(conn, filename, mtime, len(records), source=source)
         total_inserted += len(records)
         parsed_count += 1
         if force:
@@ -216,14 +221,103 @@ def sync_logs_to_db(conn, logs_dir: Path, session_dir: Path, force: bool = False
 
     workspaces = load_session_workspaces(session_dir)
     for session_id, cwd in workspaces.items():
-        db.upsert_session_workspace(conn, session_id, cwd)
+        db.upsert_session_workspace(conn, session_id, cwd, source=source)
 
     if parsed_count > 0:
-        total_now = conn.execute("SELECT COUNT(*) FROM api_calls").fetchone()[0]
+        total_now = conn.execute("SELECT COUNT(*) FROM api_calls WHERE source = ?", (source,)).fetchone()[0]
         new_records = total_now - existing
-        print(f"  ✅ Synced {parsed_count} log files: {new_records:,} new records ({total_now:,} total in DB)", file=sys.stderr)
+        print(f"  ✅ Synced {parsed_count} log files ({source}): {new_records:,} new records ({total_now:,} total)", file=sys.stderr)
 
     return total_inserted
+
+
+def list_codespaces(include_stopped: bool) -> list[dict]:
+    """List codespaces to sync based on state filters."""
+    try:
+        proc = subprocess.run(
+            ["gh", "cs", "list", "--json", "name,state,lastUsedAt", "--limit", "1000"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+    except FileNotFoundError:
+        print("  ⚠️ Codespaces sync skipped: gh CLI not found", file=sys.stderr)
+        return []
+    if proc.returncode != 0:
+        stderr = (proc.stderr or '').strip()
+        print(f"  ⚠️ Codespaces sync skipped: {stderr or 'failed to list codespaces'}", file=sys.stderr)
+        return []
+    try:
+        items = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        print("  ⚠️ Codespaces sync skipped: invalid JSON from gh cs list", file=sys.stderr)
+        return []
+    allowed = {"Available"}
+    if include_stopped:
+        allowed.add("Shutdown")
+    return [cs for cs in items if cs.get("state") in allowed and cs.get("name")]
+
+
+def sync_codespaces_to_db(conn, include_stopped: bool = False) -> int:
+    """Sync ~/.copilot from codespaces via gh cs cp and import into DB sources."""
+    codespaces = list_codespaces(include_stopped=include_stopped)
+    if not codespaces:
+        return 0
+    total = 0
+    for cs in codespaces:
+        name = cs["name"]
+        state = cs.get("state", "")
+        last_used_at = cs.get("lastUsedAt")
+        if last_used_at and db.get_codespace_last_used(conn, name) == last_used_at:
+            print(f"  ⏭️  Skipping {name} (unchanged lastUsedAt)", file=sys.stderr)
+            continue
+
+        source = f"codespace:{name}"
+        should_stop = state == "Shutdown"
+        copied = False
+        try:
+            with tempfile.TemporaryDirectory(prefix="copilot-cs-") as tmp:
+                stage = Path(tmp) / name
+                stage.mkdir(parents=True, exist_ok=True)
+                try:
+                    cp = subprocess.run(
+                        ["gh", "cs", "cp", "-r", "-c", name, "remote:~/.copilot", str(stage)],
+                        capture_output=True,
+                        text=True,
+                        check=False
+                    )
+                except FileNotFoundError:
+                    print("  ⚠️ Codespaces sync skipped: gh CLI not found", file=sys.stderr)
+                    return total
+                if cp.returncode != 0:
+                    stderr = (cp.stderr or '').strip()
+                    print(f"  ⚠️ Failed to copy {name}: {stderr or 'gh cs cp failed'}", file=sys.stderr)
+                    continue
+
+                copilot_dir = stage / ".copilot"
+                logs_dir = copilot_dir / "logs"
+                session_dir = copilot_dir / "session-state"
+                if not logs_dir.exists():
+                    print(f"  ⚠️ Skipping {name}: no .copilot/logs in copied data", file=sys.stderr)
+                    continue
+
+                total += sync_logs_to_db(conn, logs_dir, session_dir, force=False, source=source)
+                copied = True
+        finally:
+            if should_stop:
+                try:
+                    subprocess.run(
+                        ["gh", "cs", "stop", "-c", name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False
+                    )
+                except FileNotFoundError:
+                    pass
+
+        if copied:
+            db.upsert_codespace_sync_state(conn, name, last_used_at)
+    return total
 
 
 # ─── Cost helpers ────────────────────────────────────────────────────────────
@@ -389,7 +483,12 @@ def main():
     parser.add_argument('--sync', action='store_true', help='Force full re-sync of all log files')
     parser.add_argument('--import-file', type=str, metavar='FILE', help='Import data from JSONL or SQLite file')
     parser.add_argument('--export-file', type=str, metavar='FILE', help='Export data as JSONL')
+    parser.add_argument('--codespaces-sync', action='store_true', help='Sync Copilot data from running Codespaces via gh cs cp')
+    parser.add_argument('--codespaces-include-stopped', action='store_true', help='Include stopped Codespaces (will wake and sync them)')
     args = parser.parse_args()
+
+    if args.codespaces_include_stopped and not args.codespaces_sync:
+        parser.error('--codespaces-include-stopped requires --codespaces-sync')
 
     home = Path.home()
     logs_dir = Path(args.logs_dir) if args.logs_dir else home / ".copilot" / "logs"
@@ -400,6 +499,9 @@ def main():
 
     if logs_dir.exists():
         sync_logs_to_db(conn, logs_dir, session_dir, force=args.sync)
+
+    if args.codespaces_sync:
+        sync_codespaces_to_db(conn, include_stopped=args.codespaces_include_stopped)
 
     if args.import_file:
         import_path = args.import_file

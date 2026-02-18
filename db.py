@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS session_workspaces (
     source TEXT DEFAULT 'local'
 );
 
+CREATE TABLE IF NOT EXISTS codespace_sync_state (
+    codespace_name TEXT PRIMARY KEY,
+    last_used_at TEXT,
+    last_synced_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_api_calls_timestamp ON api_calls(timestamp);
 CREATE INDEX IF NOT EXISTS idx_api_calls_model ON api_calls(model_normalized);
 CREATE INDEX IF NOT EXISTS idx_api_calls_session ON api_calls(session_id);
@@ -97,6 +103,25 @@ def upsert_session_workspace(conn, session_id: str, cwd: str, source: str = 'loc
     conn.execute(
         "INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source) VALUES (?, ?, ?)",
         (session_id, cwd, source)
+    )
+    conn.commit()
+
+
+def get_codespace_last_used(conn, codespace_name: str) -> str | None:
+    """Return last_used_at recorded at the last successful sync for a codespace."""
+    row = conn.execute(
+        "SELECT last_used_at FROM codespace_sync_state WHERE codespace_name = ?",
+        (codespace_name,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def upsert_codespace_sync_state(conn, codespace_name: str, last_used_at: str | None):
+    """Record the latest successful sync marker for a codespace."""
+    conn.execute(
+        "INSERT OR REPLACE INTO codespace_sync_state (codespace_name, last_used_at, last_synced_at) "
+        "VALUES (?, ?, datetime('now'))",
+        (codespace_name, last_used_at)
     )
     conn.commit()
 
