@@ -1822,7 +1822,7 @@ func main() {
 	fmt.Println()
 
 	// ── Per-project table ───────────────────────────────────────────────
-	projCosts := make(map[string][2]float64)
+	projCosts := make(map[string][3]float64)
 	for _, r := range filtered {
 		cwd := ""
 		if r.SessionID != "" {
@@ -1840,10 +1840,13 @@ func main() {
 		c := projCosts[proj]
 		c[0] += calcCost(model, rs, r.Timestamp)
 		c[1] += calcCostNocache(model, rs, r.Timestamp)
+		if r.IsUserTurn {
+			c[2] += getPremiumMultiplier(model, r.Timestamp) * getPremiumRequestCost(r.Timestamp)
+		}
 		projCosts[proj] = c
 	}
 
-	projHeaders := []string{"Project", "Calls", "Premium", "Input", "Cached", "Output", "Hit%", "Cost", "No-Cache"}
+	projHeaders := []string{"Project", "Calls", "Premium", "Input", "Cached", "Output", "Cost", "Prem Cost"}
 	// Sort projects by no-cache cost descending
 	type projEntry struct {
 		name string
@@ -1865,8 +1868,7 @@ func main() {
 			pe.name, commaInt(s.APICalls), commaFloat(s.PremiumRequests, 0),
 			fmtTokens(uncachedInput(s)),
 			fmtTokens(s.CacheReadTokens), fmtTokens(s.CompletionTokens),
-			cacheHitPct(s.PromptTokens, s.CacheReadTokens),
-			fmtCost(pc[0]), fmtCost(pc[1]),
+			fmtCost(pc[0]), fmtCost(pc[2]),
 		})
 	}
 	printTable("PER-PROJECT BREAKDOWN", projHeaders, projRows, nil, nil)
