@@ -1,13 +1,5 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-
 # Go binary
 go/copilot-token-cost
-
-# Node
-node/node_modules/
 
 # SQLite database
 copilot-tokens.db

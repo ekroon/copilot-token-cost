@@ -7,11 +7,6 @@ repos:
       - id: check-yaml
       - id: check-json
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.9.7
-    hooks:
-      - id: ruff
-
   - repo: https://github.com/dnephin/pre-commit-golang
     rev: v0.5.1
     hooks:

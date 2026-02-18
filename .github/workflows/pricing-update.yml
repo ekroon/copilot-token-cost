@@ -19,7 +19,7 @@ jobs:
       - name: Get current pricing period date
         id: current
         run: |
-          date=$(python3 -c "import json; d=json.load(open('pricing.json')); print(d['pricing_periods'][0]['effective_from'])")
+          date=$(jq -r '.pricing_periods[0].effective_from' pricing.json)
           echo "date=$date" >> "$GITHUB_OUTPUT"
 
       - name: Ensure pricing label exists
