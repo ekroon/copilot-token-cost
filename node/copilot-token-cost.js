@@ -82,9 +82,10 @@ CREATE TABLE IF NOT EXISTS parsed_logs (
     PRIMARY KEY (log_file, source)
 );
 CREATE TABLE IF NOT EXISTS session_workspaces (
-    session_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
     cwd TEXT NOT NULL,
-    source TEXT DEFAULT 'local'
+    source TEXT DEFAULT 'local',
+    PRIMARY KEY (session_id, source)
 );
 CREATE TABLE IF NOT EXISTS codespace_sync_state (
     codespace_name TEXT PRIMARY KEY,
@@ -102,7 +103,30 @@ function initDB(dbPath) {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA_SQL);
+  migrateSessionWorkspacesSchema(db);
   return db;
+}
+
+
+function migrateSessionWorkspacesSchema(db) {
+  const row = db.prepare(
+    "SELECT group_concat(name, ',') AS cols FROM (" +
+    "SELECT name FROM pragma_table_info('session_workspaces') WHERE pk > 0 ORDER BY pk" +
+    ")"
+  ).get();
+  if (row?.cols === 'session_id,source') return;
+  db.exec(`
+ALTER TABLE session_workspaces RENAME TO session_workspaces_old;
+CREATE TABLE session_workspaces (
+    session_id TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    source TEXT DEFAULT 'local',
+    PRIMARY KEY (session_id, source)
+);
+INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source)
+SELECT session_id, cwd, COALESCE(source, 'local') FROM session_workspaces_old;
+DROP TABLE session_workspaces_old;
+`);
 }
 
 
@@ -238,7 +262,7 @@ function queryProjectStats(db, dateFrom, dateTo, source) {
     'SUM(a.cache_creation_tokens) AS cache_creation_tokens, ' +
     'SUM(a.cache_read_tokens) AS cache_read_tokens, ' +
     'SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) AS user_turns ' +
-    `FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id${where} ` +
+    `FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id AND a.source = sw.source${where} ` +
     'GROUP BY cwd'
   ).all(...params);
   const result = {};
@@ -266,10 +290,10 @@ function queryRecords(db, dateFrom, dateTo, source) {
 
 function querySessionWorkspaces(db, source) {
   const rows = source != null
-    ? db.prepare('SELECT session_id, cwd FROM session_workspaces WHERE source = ?').all(source)
-    : db.prepare('SELECT session_id, cwd FROM session_workspaces').all();
+    ? db.prepare('SELECT session_id, cwd, source FROM session_workspaces WHERE source = ?').all(source)
+    : db.prepare('SELECT session_id, cwd, source FROM session_workspaces').all();
   const result = {};
-  for (const row of rows) result[row.session_id] = row.cwd;
+  for (const row of rows) result[`${row.source}\x1f${row.session_id}`] = row.cwd;
   return result;
 }
 
@@ -418,7 +442,7 @@ function listCodespaces(includeStopped = false) {
 }
 
 
-function syncCodespacesToDB(db, includeStopped = false) {
+function syncCodespacesToDB(db, includeStopped = false, force = false) {
   const codespaces = listCodespaces(includeStopped);
   if (!codespaces.length) return 0;
   let total = 0;
@@ -437,21 +461,29 @@ function syncCodespacesToDB(db, includeStopped = false) {
     try {
       const stage = path.join(tmpDir, name);
       fs.mkdirSync(stage, { recursive: true });
-      const cp = spawnSync('gh', ['cs', 'cp', '-r', '-c', name, 'remote:~/.copilot', stage], { encoding: 'utf-8' });
+      const cp = spawnSync('gh', ['cs', 'cp', '-e', '-r', '-c', name, 'remote:/home/vscode/.copilot', stage], { encoding: 'utf-8' });
       if (cp.status !== 0) {
         const err = (cp.stderr || '').trim();
-        process.stderr.write(`  ⚠️ Failed to copy ${name}: ${err || 'gh cs cp failed'}\n`);
+        if (err.includes('No such file or directory')) {
+          process.stderr.write(`  ⚠️ Skipping ${name}: /home/vscode/.copilot not found\n`);
+        } else {
+          process.stderr.write(`  ⚠️ Failed to copy ${name}: ${err || 'gh cs cp failed'}\n`);
+        }
         continue;
       }
 
-      const copilotDir = path.join(stage, '.copilot');
+      let copilotDir = path.join(stage, '.copilot');
+      if (!fs.existsSync(path.join(copilotDir, 'logs'))) {
+        const alt = path.join(stage, 'home', 'vscode', '.copilot');
+        if (fs.existsSync(path.join(alt, 'logs'))) copilotDir = alt;
+      }
       const logsDir = path.join(copilotDir, 'logs');
       const sessionDir = path.join(copilotDir, 'session-state');
       if (!fs.existsSync(logsDir)) {
         process.stderr.write(`  ⚠️ Skipping ${name}: no .copilot/logs in copied data\n`);
         continue;
       }
-      total += syncLogsToDB(db, logsDir, sessionDir, false, `codespace:${name}`);
+      total += syncLogsToDB(db, logsDir, sessionDir, force, `codespace:${name}`);
       copied = true;
     } finally {
       if (shouldStop) {
@@ -980,7 +1012,7 @@ function main() {
   }
 
   if (args.codespaces_sync) {
-    syncCodespacesToDB(db, args.codespaces_include_stopped);
+    syncCodespacesToDB(db, args.codespaces_include_stopped, args.sync);
   }
 
   if (args.import_file) {
@@ -1141,7 +1173,8 @@ function main() {
     const projCosts = {};
     for (const r of filteredRecords) {
       const sid = r.session_id;
-      const cwd = sid ? (sessionWorkspaces[sid] || '') : '';
+      const source = r.source || '';
+      const cwd = sid ? (sessionWorkspaces[`${source}\x1f${sid}`] || '') : '';
       const proj = cwd ? projectName(cwd) : '(unknown)';
       const model = r.model_normalized;
       const rs = {
@@ -1300,7 +1333,8 @@ function main() {
   const projCosts = {};
   for (const r of filteredRecords) {
     const sid = r.session_id;
-    const cwd = sid ? (sessionWorkspaces[sid] || '') : '';
+    const source = r.source || '';
+    const cwd = sid ? (sessionWorkspaces[`${source}\x1f${sid}`] || '') : '';
     const proj = cwd ? projectName(cwd) : '(unknown)';
     const model = r.model_normalized;
     const rs = {
