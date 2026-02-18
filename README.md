@@ -40,6 +40,7 @@ cd go && go build -o copilot-token-cost .  # build once
 | `--from N` | Start from N days ago (0=today) |
 | `--to N` | End at N days ago (0=today) |
 | `--logs-dir PATH` | Override logs directory |
+| `--project TEXT` | Filter stats/output to projects whose workspace path matches this text (case-insensitive) |
 | `--json` | Machine-readable JSON output |
 | `--sync` | Force full re-sync of all log files into the database (including codespaces when `--codespaces-sync` is used) |
 | `--import-file FILE` | Import data from JSONL or SQLite file |

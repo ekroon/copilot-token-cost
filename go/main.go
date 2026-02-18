@@ -486,7 +486,7 @@ func upsertCodespaceSyncState(db *sql.DB, codespaceName string, lastUsedAt strin
 	)
 }
 
-func buildFilters(dateFrom, dateTo string) (string, []interface{}) {
+func buildFilters(dateFrom, dateTo, projectFilter string) (string, []interface{}) {
 	var clauses []string
 	var params []interface{}
 	if dateFrom != "" {
@@ -496,6 +496,14 @@ func buildFilters(dateFrom, dateTo string) (string, []interface{}) {
 	if dateTo != "" {
 		clauses = append(clauses, "a.timestamp < ?")
 		params = append(params, dateTo)
+	}
+	if projectNeedle := strings.TrimSpace(strings.ToLower(projectFilter)); projectNeedle != "" {
+		clauses = append(clauses,
+			"LOWER(COALESCE(("+
+				"SELECT sw.cwd FROM session_workspaces sw "+
+				"WHERE sw.session_id = a.session_id AND sw.source = a.source LIMIT 1"+
+				"), '(unknown)')) LIKE ?")
+		params = append(params, "%"+projectNeedle+"%")
 	}
 	where := ""
 	if len(clauses) > 0 {
@@ -513,8 +521,8 @@ type dbModelStats struct {
 	UserTurns           int
 }
 
-func queryModelStats(db *sql.DB, dateFrom, dateTo string) map[string]*dbModelStats {
-	where, params := buildFilters(dateFrom, dateTo)
+func queryModelStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[string]*dbModelStats {
+	where, params := buildFilters(dateFrom, dateTo, projectFilter)
 	q := "SELECT model_normalized, COUNT(*) AS api_calls, " +
 		"SUM(prompt_tokens), SUM(completion_tokens), " +
 		"SUM(cache_creation_tokens), SUM(cache_read_tokens), " +
@@ -536,8 +544,8 @@ func queryModelStats(db *sql.DB, dateFrom, dateTo string) map[string]*dbModelSta
 	return result
 }
 
-func queryDailyStats(db *sql.DB, dateFrom, dateTo string) map[string]map[string]*dbModelStats {
-	where, params := buildFilters(dateFrom, dateTo)
+func queryDailyStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[string]map[string]*dbModelStats {
+	where, params := buildFilters(dateFrom, dateTo, projectFilter)
 	q := "SELECT substr(a.timestamp, 1, 10) AS day, model_normalized, " +
 		"COUNT(*) AS api_calls, SUM(prompt_tokens), SUM(completion_tokens), " +
 		"SUM(cache_creation_tokens), SUM(cache_read_tokens), " +
@@ -565,8 +573,8 @@ func queryDailyStats(db *sql.DB, dateFrom, dateTo string) map[string]map[string]
 	return result
 }
 
-func queryProjectStats(db *sql.DB, dateFrom, dateTo string) map[string]*dbModelStats {
-	where, params := buildFilters(dateFrom, dateTo)
+func queryProjectStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[string]*dbModelStats {
+	where, params := buildFilters(dateFrom, dateTo, projectFilter)
 	q := "SELECT COALESCE(sw.cwd, '') AS cwd, COUNT(*) AS api_calls, " +
 		"SUM(a.prompt_tokens), SUM(a.completion_tokens), " +
 		"SUM(a.cache_creation_tokens), SUM(a.cache_read_tokens), " +
@@ -589,8 +597,8 @@ func queryProjectStats(db *sql.DB, dateFrom, dateTo string) map[string]*dbModelS
 	return result
 }
 
-func queryRecords(db *sql.DB, dateFrom, dateTo string) []Record {
-	where, params := buildFilters(dateFrom, dateTo)
+func queryRecords(db *sql.DB, dateFrom, dateTo, projectFilter string) []Record {
+	where, params := buildFilters(dateFrom, dateTo, projectFilter)
 	q := "SELECT model, model_normalized, prompt_tokens, completion_tokens, " +
 		"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
 		"timestamp, session_id, log_file, source FROM api_calls a" + where
@@ -641,8 +649,8 @@ func querySessionWorkspaces(db *sql.DB) map[string]string {
 	return result
 }
 
-func queryLogFileCount(db *sql.DB, dateFrom, dateTo string) int {
-	where, params := buildFilters(dateFrom, dateTo)
+func queryLogFileCount(db *sql.DB, dateFrom, dateTo, projectFilter string) int {
+	where, params := buildFilters(dateFrom, dateTo, projectFilter)
 	q := "SELECT COUNT(DISTINCT log_file) FROM api_calls a" + where
 	var count int
 	db.QueryRow(q, params...).Scan(&count)
@@ -1269,6 +1277,7 @@ func main() {
 	fromDays := flag.Int("from", -1, "Start from N days ago (0=today, 1=yesterday)")
 	toDays := flag.Int("to", -1, "End at N days ago (0=today, 1=yesterday)")
 	logsDirFlag := flag.String("logs-dir", "", "Override logs directory")
+	projectFilter := flag.String("project", "", "Filter by project/workspace path (case-insensitive substring)")
 	jsonFlag := flag.Bool("json", false, "Output as JSON")
 	syncFlag := flag.Bool("sync", false, "Force full re-sync of all log files")
 	importFile := flag.String("import-file", "", "Import data from JSONL or SQLite file")
@@ -1278,7 +1287,7 @@ func main() {
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: copilot-token-cost [days] [--all] [--today] [--yesterday]\n")
-		fmt.Fprintf(os.Stderr, "                         [--from N] [--to N] [--logs-dir PATH] [--json]\n")
+		fmt.Fprintf(os.Stderr, "                         [--from N] [--to N] [--logs-dir PATH] [--project TEXT] [--json]\n")
 		fmt.Fprintf(os.Stderr, "                         [--sync] [--import-file FILE] [--export-file FILE]\n\n")
 		fmt.Fprintf(os.Stderr, "                         [--codespaces-sync] [--codespaces-include-stopped]\n\n")
 		fmt.Fprintf(os.Stderr, "Copilot CLI Token Cost Calculator\n\n")
@@ -1290,6 +1299,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --yesterday  # yesterday only\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --from 3     # 3 days ago until now\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --all        # all logs\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --project graph-hopper  # filter to matching projects\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --sync       # force full re-sync\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --export-file data.jsonl  # export\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --import-file data.jsonl  # import\n")
@@ -1431,8 +1441,10 @@ func main() {
 		return
 	}
 
+	projectFilterValue := strings.TrimSpace(*projectFilter)
+
 	// ─── Query aggregated stats from DB ────────────────────────────────
-	dbDailyStats := queryDailyStats(database, dateFromQuery, dateToQuery)
+	dbDailyStats := queryDailyStats(database, dateFromQuery, dateToQuery, projectFilterValue)
 	dailyStats := make(map[string]map[string]*Stats)
 	for day, models := range dbDailyStats {
 		dailyStats[day] = make(map[string]*Stats)
@@ -1449,7 +1461,7 @@ func main() {
 	}
 
 	// Compute model-level premium_requests from daily (multiplier varies by day)
-	dbModelStatsMap := queryModelStats(database, dateFromQuery, dateToQuery)
+	dbModelStatsMap := queryModelStats(database, dateFromQuery, dateToQuery, projectFilterValue)
 	modelStats := make(map[string]*Stats)
 	for model, dbs := range dbModelStatsMap {
 		var premReqs float64
@@ -1468,7 +1480,7 @@ func main() {
 		}
 	}
 
-	dbProjectStats := queryProjectStats(database, dateFromQuery, dateToQuery)
+	dbProjectStats := queryProjectStats(database, dateFromQuery, dateToQuery, projectFilterValue)
 	projectStats := make(map[string]*Stats)
 	for cwd, dbs := range dbProjectStats {
 		proj := "(unknown)"
@@ -1495,14 +1507,14 @@ func main() {
 		}
 	}
 
-	filtered := queryRecords(database, dateFromQuery, dateToQuery)
+	filtered := queryRecords(database, dateFromQuery, dateToQuery, projectFilterValue)
 	sessionWorkspaces := querySessionWorkspaces(database)
 
 	totalRecords := 0
 	for _, s := range modelStats {
 		totalRecords += s.APICalls
 	}
-	logFileCount := queryLogFileCount(database, dateFromQuery, dateToQuery)
+	logFileCount := queryLogFileCount(database, dateFromQuery, dateToQuery, projectFilterValue)
 
 	if totalRecords == 0 {
 		fmt.Printf("No API calls found in %s.\n", periodLabel)
@@ -1662,8 +1674,15 @@ func main() {
 	if dateRange != "" {
 		dateSuffix = " (" + dateRange + ")"
 	}
+	projectSuffix := ""
+	if projectFilterValue != "" {
+		projectSuffix = "  │  Project filter: " + projectFilterValue
+	}
 	fmt.Printf("  Period: %s%s  │  Log files: %d  │  API calls: %s  │  Premium requests: %s\n",
 		periodLabel, dateSuffix, logFileCount, commaInt(totalRecords), commaFloat(totalPremium, 0))
+	if projectSuffix != "" {
+		fmt.Println(projectSuffix)
+	}
 	fmt.Println()
 
 	// ── Per-model table ─────────────────────────────────────────────────
