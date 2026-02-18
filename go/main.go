@@ -780,7 +780,7 @@ func importSQLiteDB(db *sql.DB, otherDBPath, sourceOverride string) int {
 	return int(count)
 }
 
-func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source string) int {
+func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source string, minTime, maxTime *time.Time) int {
 	var existing int
 	db.QueryRow("SELECT COUNT(*) FROM api_calls WHERE source = ?", source).Scan(&existing)
 	matches, _ := filepath.Glob(filepath.Join(logsDir, "process-*.log"))
@@ -800,6 +800,15 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 		info, err := os.Stat(logPath)
 		if err != nil {
 			continue
+		}
+		if !force {
+			modTime := info.ModTime()
+			if minTime != nil && modTime.Before(*minTime) {
+				continue
+			}
+			if maxTime != nil && !modTime.Before(*maxTime) {
+				continue
+			}
 		}
 		mtime := float64(info.ModTime().UnixMilli()) / 1000.0
 		if !force && isLogParsed(db, filename, mtime, source) {
@@ -916,7 +925,7 @@ func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 				return
 			}
 
-			total += syncLogsToDB(db, logsDir, sessionDir, force, "codespace:"+cs.Name)
+			total += syncLogsToDB(db, logsDir, sessionDir, force, "codespace:"+cs.Name, nil, nil)
 			copied = true
 		}()
 
@@ -1391,8 +1400,18 @@ func main() {
 	database := initDB(dbPath)
 	defer database.Close()
 
+	var syncFrom, syncTo *time.Time
+	if !useCutoffMin {
+		c := cutoff
+		syncFrom = &c
+	}
+	if cutoffEnd != nil {
+		c := *cutoffEnd
+		syncTo = &c
+	}
+
 	if logsExist {
-		syncLogsToDB(database, logsDir, sessionDir, *syncFlag, "local")
+		syncLogsToDB(database, logsDir, sessionDir, *syncFlag, "local", syncFrom, syncTo)
 	}
 
 	if *codespacesSync {

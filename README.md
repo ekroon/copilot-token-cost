@@ -64,6 +64,7 @@ If no semver tags exist yet, it starts from `v0.0.0`.
 The Go implementation uses a single SQLite database (`copilot-tokens.db`) in the project directory. The database:
 
 - **Auto-syncs** on every run — only new/modified log files are re-parsed
+- **Fast first run** — non-`--all` runs only sync logs in the requested date window
 - **Improves performance** — subsequent runs skip already-parsed logs
 - **Enables data portability** — export from a codespace, import locally
 
