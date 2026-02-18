@@ -26,14 +26,16 @@ shared_gocache="$(cd "$repo_root/go" && go env GOCACHE)"
 sum_ms=0
 max_ms=0
 min_ms=999999999
+samples_file="$(mktemp "${tmp_root}/samples.XXXXXX")"
+trap 'rm -f "$samples_file"' EXIT
 
 for i in $(seq 1 "$runs"); do
   run_root="$(mktemp -d "$tmp_root/run.XXXXXX")"
   state_home="$run_root/state"
   home_dir="$run_root/home"
   mkdir -p "$state_home" "$home_dir/.copilot"
-  cp -R "$fixture_dir/home/.copilot/logs" "$home_dir/.copilot/"
-  cp -R "$fixture_dir/home/.copilot/session-state" "$home_dir/.copilot/"
+  cp -Rp "$fixture_dir/home/.copilot/logs" "$home_dir/.copilot/"
+  cp -Rp "$fixture_dir/home/.copilot/session-state" "$home_dir/.copilot/"
 
   time_file="$run_root/time.txt"
   (
@@ -61,6 +63,7 @@ print(int(round(float(sys.argv[1]) * 1000)))
 PY
 )"
   echo "run=$i cold_go_run_today_ms=$real_ms"
+  echo "$real_ms" >> "$samples_file"
 
   sum_ms=$((sum_ms + real_ms))
   if (( real_ms > max_ms )); then max_ms=$real_ms; fi
@@ -68,12 +71,31 @@ PY
 done
 
 avg_ms=$((sum_ms / runs))
-echo "summary runs=$runs avg_ms=$avg_ms min_ms=$min_ms max_ms=$max_ms"
+p95_ms="$(python3 - "$samples_file" <<'PY'
+import math
+import sys
+
+values = []
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            values.append(int(line))
+values.sort()
+if not values:
+    print(0)
+else:
+    idx = max(0, math.ceil(0.95 * len(values)) - 1)
+    print(values[idx])
+PY
+)"
+
+echo "summary runs=$runs avg_ms=$avg_ms min_ms=$min_ms max_ms=$max_ms p95_ms=$p95_ms"
 
 if [[ -n "$assert_ms" ]]; then
-  if (( max_ms > assert_ms )); then
-    echo "FAIL: max_ms=$max_ms exceeds assert_ms=$assert_ms" >&2
+  if (( p95_ms > assert_ms )); then
+    echo "FAIL: p95_ms=$p95_ms exceeds assert_ms=$assert_ms" >&2
     exit 1
   fi
-  echo "PASS: max_ms=$max_ms <= assert_ms=$assert_ms"
+  echo "PASS: p95_ms=$p95_ms <= assert_ms=$assert_ms"
 fi

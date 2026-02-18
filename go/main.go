@@ -836,27 +836,23 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 
 	totalInserted := 0
 	parsedCount := 0
-	tx, err := db.Begin()
-	if err != nil {
-		return 0
+	parsedMtimeByFile := map[string]float64{}
+	if !force {
+		rows, err := db.Query("SELECT log_file, mtime FROM parsed_logs WHERE source = ?", source)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var file string
+				var mtime float64
+				if err := rows.Scan(&file, &mtime); err == nil {
+					parsedMtimeByFile[file] = mtime
+				}
+			}
+		}
 	}
-	insertStmt, err := tx.Prepare(
-		"INSERT OR IGNORE INTO api_calls " +
-			"(model, model_normalized, prompt_tokens, completion_tokens, " +
-			"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
-			"timestamp, session_id, log_file, source) " +
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		_ = tx.Rollback()
-		return 0
-	}
-	defer insertStmt.Close()
-	parsedStmt, err := tx.Prepare("INSERT OR REPLACE INTO parsed_logs (log_file, mtime, source, record_count, parsed_at) VALUES (?, ?, ?, ?, datetime('now'))")
-	if err != nil {
-		_ = tx.Rollback()
-		return 0
-	}
-	defer parsedStmt.Close()
+	var tx *sql.Tx
+	var insertStmt *sql.Stmt
+	var parsedStmt *sql.Stmt
 
 	for _, logPath := range matches {
 		filename := filepath.Base(logPath)
@@ -874,8 +870,32 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 			}
 		}
 		mtime := float64(info.ModTime().UnixMilli()) / 1000.0
-		if !force && isLogParsed(db, filename, mtime, source) {
-			continue
+		if !force {
+			if parsedMtime, ok := parsedMtimeByFile[filename]; ok && parsedMtime == mtime {
+				continue
+			}
+		}
+		if tx == nil {
+			tx, err = db.Begin()
+			if err != nil {
+				return 0
+			}
+			insertStmt, err = tx.Prepare(
+				"INSERT OR IGNORE INTO api_calls " +
+					"(model, model_normalized, prompt_tokens, completion_tokens, " +
+					"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
+					"timestamp, session_id, log_file, source) " +
+					"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+			if err != nil {
+				_ = tx.Rollback()
+				return 0
+			}
+			parsedStmt, err = tx.Prepare("INSERT OR REPLACE INTO parsed_logs (log_file, mtime, source, record_count, parsed_at) VALUES (?, ?, ?, ?, datetime('now'))")
+			if err != nil {
+				_ = insertStmt.Close()
+				_ = tx.Rollback()
+				return 0
+			}
 		}
 		records := parseLogFile(logPath)
 		for _, r := range records {
@@ -894,14 +914,20 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 			fmt.Fprintf(os.Stderr, "  📄 [%d/%d] %s (%d records)\n", parsedCount, len(matches), filename, len(records))
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		_ = tx.Rollback()
-		return 0
+	if tx != nil {
+		_ = insertStmt.Close()
+		_ = parsedStmt.Close()
+		if err := tx.Commit(); err != nil {
+			_ = tx.Rollback()
+			return 0
+		}
 	}
 
-	workspaces := loadSessionWorkspaces(sessionDir)
-	for sessionID, cwd := range workspaces {
-		upsertSessionWorkspace(db, sessionID, cwd, source)
+	if parsedCount > 0 {
+		workspaces := loadSessionWorkspaces(sessionDir)
+		for sessionID, cwd := range workspaces {
+			upsertSessionWorkspace(db, sessionID, cwd, source)
+		}
 	}
 
 	if parsedCount > 0 {

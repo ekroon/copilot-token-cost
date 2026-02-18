@@ -95,6 +95,18 @@ Use `--sync` to force a full re-parse of all log files (useful after updates):
 ./go/copilot-token-cost --sync
 ```
 
+## Performance Checks
+
+Parser benchmark regression check:
+```bash
+./scripts/check-performance.sh
+```
+
+End-to-end cold `go run . --today` check on deterministic 3x synthetic data (isolated `XDG_STATE_HOME`):
+```bash
+./scripts/check-e2e-go-run-target.sh 250 20
+```
+
 ## Output
 
 - **Per-model summary** — calls, tokens, cache hit%, cost, and hypothetical no-cache cost
