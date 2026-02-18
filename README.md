@@ -62,7 +62,11 @@ If no semver tags exist yet, it starts from `v0.0.0`.
 
 ## SQLite Database
 
-The Go implementation uses a single SQLite database (`copilot-tokens.db`) in the project directory. The database:
+The Go implementation uses a single SQLite database (`copilot-tokens.db`) in:
+- `$XDG_STATE_HOME/copilot-token-cost/` when `XDG_STATE_HOME` is set
+- `~/.local/state/copilot-token-cost/` as fallback
+
+Legacy project/binary locations are not used automatically; migration is manual. The database:
 
 - **Auto-syncs** on every run — only new/modified log files are re-parsed
 - **Fast first run** — non-`--all` runs only sync logs in the requested date window

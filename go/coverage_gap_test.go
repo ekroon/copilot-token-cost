@@ -77,21 +77,51 @@ func TestIsWideRuneRangeCoverage(t *testing.T) {
 	}
 }
 
-func TestGetDBPathFindsCurrentDirFile(t *testing.T) {
+func TestGetDBPathUsesOnlyXDGLocation(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
 	tmp := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	oldXDG := os.Getenv("XDG_STATE_HOME")
 	if err := os.Chdir(tmp); err != nil {
 		t.Fatalf("chdir temp: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(cwd) })
-	if err := os.WriteFile(filepath.Join(tmp, "copilot-tokens.db"), []byte{}, 0o644); err != nil {
+	t.Cleanup(func() {
+		_ = os.Chdir(cwd)
+		_ = os.Setenv("HOME", oldHome)
+		_ = os.Setenv("XDG_STATE_HOME", oldXDG)
+	})
+	home := filepath.Join(tmp, "home")
+	xdg := filepath.Join(tmp, "state")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.Setenv("HOME", home); err != nil {
+		t.Fatalf("set HOME: %v", err)
+	}
+	if err := os.Setenv("XDG_STATE_HOME", xdg); err != nil {
+		t.Fatalf("set XDG_STATE_HOME: %v", err)
+	}
+	legacyPath := filepath.Join(tmp, "copilot-tokens.db")
+	if err := os.WriteFile(legacyPath, []byte("legacy-db"), 0o644); err != nil {
 		t.Fatalf("create db file: %v", err)
 	}
-	if got := getDBPath(); !strings.Contains(got, "copilot-tokens.db") {
-		t.Fatalf("getDBPath=%q", got)
+	got := getDBPath()
+	want := filepath.Join(xdg, "copilot-token-cost", "copilot-tokens.db")
+	absGot, err := filepath.Abs(got)
+	if err != nil {
+		t.Fatalf("abs path: %v", err)
+	}
+	if absGot != want {
+		t.Fatalf("getDBPath=%q (abs %q), want %q", got, absGot, want)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("expected legacy db to remain in place, err=%v", err)
+	}
+	if _, err := os.Stat(want); err == nil {
+		t.Fatalf("did not expect xdg db file to be copied automatically")
 	}
 }
 
