@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -201,6 +202,72 @@ exit 1
 	}
 }
 
+func writeFakeGHParallel(t *testing.T, dir string) {
+	t.Helper()
+	script := `#!/bin/sh
+set -eu
+counter_dir="${GH_COUNTER_DIR:-}"
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
+  printf '[{"name":"cs1","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs2","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs3","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs4","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"}]'
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
+  cs=""
+  stage=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-c" ]; then
+      cs="$arg"
+    fi
+    prev="$arg"
+    stage="$arg"
+  done
+  lock=""
+  if [ -n "$counter_dir" ]; then
+    mkdir -p "$counter_dir"
+    lock="$counter_dir/lock"
+    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+    active="$(cat "$counter_dir/active" 2>/dev/null || echo 0)"
+    active=$((active + 1))
+    echo "$active" > "$counter_dir/active"
+    max="$(cat "$counter_dir/max" 2>/dev/null || echo 0)"
+    if [ "$active" -gt "$max" ]; then
+      echo "$active" > "$counter_dir/max"
+    fi
+    rmdir "$lock"
+  fi
+  sleep 0.4
+  mkdir -p "$stage/.copilot/logs" "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$stage/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<EOF
+cwd: /tmp/${cs}-repo
+EOF
+  if [ -n "$counter_dir" ]; then
+    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+    active="$(cat "$counter_dir/active" 2>/dev/null || echo 1)"
+    active=$((active - 1))
+    if [ "$active" -lt 0 ]; then active=0; fi
+    echo "$active" > "$counter_dir/active"
+    rmdir "$lock"
+  fi
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "stop" ]; then
+  exit 0
+fi
+exit 1
+`
+	path := filepath.Join(dir, "gh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write parallel fake gh: %v", err)
+	}
+}
+
 func withPath(t *testing.T, dir string) {
 	t.Helper()
 	old := os.Getenv("PATH")
@@ -268,6 +335,39 @@ func TestSyncCodespacesToDBIncludeStopped(t *testing.T) {
 	}
 	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs2'") != 1 {
 		t.Fatalf("expected one cs2 record")
+	}
+}
+
+func TestSyncCodespacesToDBCopiesInParallel(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGHParallel(t, binDir)
+	withPath(t, binDir)
+
+	counterDir := filepath.Join(t.TempDir(), "counter")
+	oldCounter := os.Getenv("GH_COUNTER_DIR")
+	if err := os.Setenv("GH_COUNTER_DIR", counterDir); err != nil {
+		t.Fatalf("set GH_COUNTER_DIR: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Setenv("GH_COUNTER_DIR", oldCounter) })
+
+	db := initDB(filepath.Join(t.TempDir(), "codespaces-parallel.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	inserted := syncCodespacesToDB(db, false, false)
+	if inserted != 4 {
+		t.Fatalf("syncCodespacesToDB inserted=%d, want 4", inserted)
+	}
+
+	maxBytes, err := os.ReadFile(filepath.Join(counterDir, "max"))
+	if err != nil {
+		t.Fatalf("read max parallelism: %v", err)
+	}
+	maxParallel, err := strconv.Atoi(strings.TrimSpace(string(maxBytes)))
+	if err != nil {
+		t.Fatalf("parse max parallelism: %v", err)
+	}
+	if maxParallel < 2 {
+		t.Fatalf("expected parallel copy concurrency >=2, got %d", maxParallel)
 	}
 }
 

@@ -68,6 +68,28 @@ func TestParseLogFileMissingFile(t *testing.T) {
 	}
 }
 
+func TestParseLogFileInRange(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "sample.log")
+	content := `2025-01-01T09:59:59 {"model":"gpt-4.1"}
+2025-01-01T09:59:59 {"prompt_tokens":5,"completion_tokens":1}
+2025-01-01T10:00:00 {"model":"gpt-4.1"}
+2025-01-01T10:00:00 {"prompt_tokens":10,"completion_tokens":2}
+2025-01-01T11:00:00 {"model":"gpt-4.1"}
+2025-01-01T11:00:00 {"prompt_tokens":20,"completion_tokens":3}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	records := parseLogFileInRange(logPath, "2025-01-01T10:00:00", "2025-01-01T11:00:00")
+	if len(records) != 1 {
+		t.Fatalf("expected 1 in-range record, got %d", len(records))
+	}
+	if records[0].Timestamp != "2025-01-01T10:00:00" {
+		t.Fatalf("unexpected in-range timestamp: %s", records[0].Timestamp)
+	}
+}
+
 func TestCacheHitPct(t *testing.T) {
 	if got := cacheHitPct(0, 10); got != "-" {
 		t.Fatalf("expected '-', got %q", got)
