@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -893,6 +895,9 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 	db.QueryRow("SELECT COUNT(*) FROM api_calls WHERE source = ?", source).Scan(&existing)
 	matches, _ := filepath.Glob(filepath.Join(logsDir, "process-*.log"))
 	sort.Strings(matches)
+	if len(matches) > 0 {
+		fmt.Fprintf(os.Stderr, "  🔎 Scanning %d log files (%s)\n", len(matches), source)
+	}
 
 	if force {
 		// Clear parse tracker so all logs are re-parsed; keep existing api_calls (INSERT OR IGNORE handles dedup)
@@ -1021,9 +1026,17 @@ type codespaceInfo struct {
 }
 
 func listCodespaces(includeStopped bool) []codespaceInfo {
-	cmd := exec.Command("gh", "cs", "list", "--json", "name,state,lastUsedAt", "--limit", "1000")
+	fmt.Fprintf(os.Stderr, "  🔄 Codespaces: listing...\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "cs", "list", "--json", "name,state,lastUsedAt", "--limit", "1000")
+	cmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
 	out, err := cmd.Output()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: listing timed out\n")
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: failed to list codespaces\n")
 		return nil
 	}
@@ -1042,6 +1055,7 @@ func listCodespaces(includeStopped bool) []codespaceInfo {
 			filtered = append(filtered, cs)
 		}
 	}
+	fmt.Fprintf(os.Stderr, "  📦 Codespaces: %d to sync\n", len(filtered))
 	return filtered
 }
 
@@ -1051,7 +1065,7 @@ func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 		return 0
 	}
 	total := 0
-	for _, cs := range codespaces {
+	for idx, cs := range codespaces {
 		if cs.LastUsedAt != "" && getCodespaceLastUsed(db, cs.Name) == cs.LastUsedAt {
 			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (unchanged lastUsedAt)\n", cs.Name)
 			continue
@@ -1066,15 +1080,32 @@ func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 		func() {
 			defer os.RemoveAll(tmpDir)
 			if shouldStop {
-				defer exec.Command("gh", "cs", "stop", "-c", cs.Name).Run()
+				defer func() {
+					stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer stopCancel()
+					stopCmd := exec.CommandContext(stopCtx, "gh", "cs", "stop", "-c", cs.Name)
+					stopCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+					_ = stopCmd.Run()
+				}()
 			}
 
 			stage := filepath.Join(tmpDir, cs.Name)
 			_ = os.MkdirAll(stage, 0755)
-			cpCmd := exec.Command("gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
-			cpOut, cpErr := cpCmd.CombinedOutput()
+			fmt.Fprintf(os.Stderr, "  📦 [%d/%d] Copying %s...\n", idx+1, len(codespaces), cs.Name)
+			cpCtx, cpCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cpCancel()
+			cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
+			cpCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+			var cpErrBuf bytes.Buffer
+			cpCmd.Stdout = os.Stderr
+			cpCmd.Stderr = io.MultiWriter(os.Stderr, &cpErrBuf)
+			cpErr := cpCmd.Run()
 			if cpErr != nil {
-				msg := strings.TrimSpace(string(cpOut))
+				if cpCtx.Err() == context.DeadlineExceeded {
+					fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out\n", cs.Name)
+					return
+				}
+				msg := strings.TrimSpace(cpErrBuf.String())
 				if strings.Contains(msg, "No such file or directory") {
 					fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
 				} else {
@@ -1085,6 +1116,7 @@ func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 				}
 				return
 			}
+			fmt.Fprintf(os.Stderr, "  ✅ Copied %s\n", cs.Name)
 
 			copilotDir := filepath.Join(stage, ".copilot")
 			if _, err := os.Stat(filepath.Join(copilotDir, "logs")); err != nil {
