@@ -1025,6 +1025,15 @@ type codespaceInfo struct {
 	LastUsedAt string `json:"lastUsedAt"`
 }
 
+type codespaceCopyResult struct {
+	Idx        int
+	Codespace  codespaceInfo
+	TmpDir     string
+	LogsDir    string
+	SessionDir string
+	Copied     bool
+}
+
 func listCodespaces(includeStopped bool) []codespaceInfo {
 	fmt.Fprintf(os.Stderr, "  🔄 Codespaces: listing...\n")
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -1059,85 +1068,124 @@ func listCodespaces(includeStopped bool) []codespaceInfo {
 	return filtered
 }
 
+func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
+	res := codespaceCopyResult{
+		Idx:       idx,
+		Codespace: cs,
+	}
+	shouldStop := cs.State == "Shutdown"
+	tmpDir, err := os.MkdirTemp("", "copilot-cs-")
+	if err != nil {
+		return res
+	}
+	res.TmpDir = tmpDir
+
+	if shouldStop {
+		defer func() {
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer stopCancel()
+			stopCmd := exec.CommandContext(stopCtx, "gh", "cs", "stop", "-c", cs.Name)
+			stopCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+			_ = stopCmd.Run()
+		}()
+	}
+
+	stage := filepath.Join(tmpDir, cs.Name)
+	_ = os.MkdirAll(stage, 0755)
+	fmt.Fprintf(os.Stderr, "  📦 [%d/%d] Copying %s...\n", idx+1, total, cs.Name)
+	cpCtx, cpCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cpCancel()
+	cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
+	cpCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+	var cpErrBuf bytes.Buffer
+	cpCmd.Stdout = io.Discard
+	cpCmd.Stderr = &cpErrBuf
+	cpErr := cpCmd.Run()
+	if cpErr != nil {
+		if cpCtx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out\n", cs.Name)
+			return res
+		}
+		msg := strings.TrimSpace(cpErrBuf.String())
+		if strings.Contains(msg, "No such file or directory") {
+			fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
+		} else {
+			if msg == "" {
+				msg = "gh cs cp failed"
+			}
+			fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s\n", cs.Name, msg)
+		}
+		return res
+	}
+	fmt.Fprintf(os.Stderr, "  ✅ Copied %s\n", cs.Name)
+
+	copilotDir := filepath.Join(stage, ".copilot")
+	if _, err := os.Stat(filepath.Join(copilotDir, "logs")); err != nil {
+		alt := filepath.Join(stage, "home", "vscode", ".copilot")
+		if _, altErr := os.Stat(filepath.Join(alt, "logs")); altErr == nil {
+			copilotDir = alt
+		}
+	}
+	logsDir := filepath.Join(copilotDir, "logs")
+	sessionDir := filepath.Join(copilotDir, "session-state")
+	if _, err := os.Stat(logsDir); err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: no .copilot/logs in copied data\n", cs.Name)
+		return res
+	}
+
+	res.LogsDir = logsDir
+	res.SessionDir = sessionDir
+	res.Copied = true
+	return res
+}
+
 func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 	codespaces := listCodespaces(includeStopped)
 	if len(codespaces) == 0 {
 		return 0
 	}
-	total := 0
-	for idx, cs := range codespaces {
+	var pending []codespaceInfo
+	for _, cs := range codespaces {
 		if cs.LastUsedAt != "" && getCodespaceLastUsed(db, cs.Name) == cs.LastUsedAt {
 			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (unchanged lastUsedAt)\n", cs.Name)
 			continue
 		}
+		pending = append(pending, cs)
+	}
+	if len(pending) == 0 {
+		return 0
+	}
 
-		shouldStop := cs.State == "Shutdown"
-		tmpDir, err := os.MkdirTemp("", "copilot-cs-")
-		if err != nil {
-			continue
-		}
-		copied := false
-		func() {
-			defer os.RemoveAll(tmpDir)
-			if shouldStop {
-				defer func() {
-					stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer stopCancel()
-					stopCmd := exec.CommandContext(stopCtx, "gh", "cs", "stop", "-c", cs.Name)
-					stopCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-					_ = stopCmd.Run()
-				}()
+	workers := 4
+	fmt.Fprintf(os.Stderr, "  🚚 Codespaces copy parallelism: %d workers (%d pending)\n", workers, len(pending))
+	jobs := make(chan int, len(pending))
+	results := make(chan codespaceCopyResult, len(pending))
+	for w := 0; w < workers; w++ {
+		go func() {
+			for idx := range jobs {
+				results <- copyCodespaceData(pending[idx], idx, len(pending))
 			}
-
-			stage := filepath.Join(tmpDir, cs.Name)
-			_ = os.MkdirAll(stage, 0755)
-			fmt.Fprintf(os.Stderr, "  📦 [%d/%d] Copying %s...\n", idx+1, len(codespaces), cs.Name)
-			cpCtx, cpCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-			defer cpCancel()
-			cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
-			cpCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-			var cpErrBuf bytes.Buffer
-			cpCmd.Stdout = os.Stderr
-			cpCmd.Stderr = io.MultiWriter(os.Stderr, &cpErrBuf)
-			cpErr := cpCmd.Run()
-			if cpErr != nil {
-				if cpCtx.Err() == context.DeadlineExceeded {
-					fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out\n", cs.Name)
-					return
-				}
-				msg := strings.TrimSpace(cpErrBuf.String())
-				if strings.Contains(msg, "No such file or directory") {
-					fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
-				} else {
-					if msg == "" {
-						msg = "gh cs cp failed"
-					}
-					fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s\n", cs.Name, msg)
-				}
-				return
-			}
-			fmt.Fprintf(os.Stderr, "  ✅ Copied %s\n", cs.Name)
-
-			copilotDir := filepath.Join(stage, ".copilot")
-			if _, err := os.Stat(filepath.Join(copilotDir, "logs")); err != nil {
-				alt := filepath.Join(stage, "home", "vscode", ".copilot")
-				if _, altErr := os.Stat(filepath.Join(alt, "logs")); altErr == nil {
-					copilotDir = alt
-				}
-			}
-			logsDir := filepath.Join(copilotDir, "logs")
-			sessionDir := filepath.Join(copilotDir, "session-state")
-			if _, err := os.Stat(logsDir); err != nil {
-				fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: no .copilot/logs in copied data\n", cs.Name)
-				return
-			}
-
-			total += syncLogsToDB(db, logsDir, sessionDir, force, "codespace:"+cs.Name, nil, nil)
-			copied = true
 		}()
+	}
+	for i := 0; i < len(pending); i++ {
+		jobs <- i
+	}
+	close(jobs)
 
-		if copied {
-			upsertCodespaceSyncState(db, cs.Name, cs.LastUsedAt)
+	ordered := make([]codespaceCopyResult, len(pending))
+	for i := 0; i < len(pending); i++ {
+		res := <-results
+		ordered[res.Idx] = res
+	}
+
+	total := 0
+	for _, res := range ordered {
+		if res.Copied {
+			total += syncLogsToDB(db, res.LogsDir, res.SessionDir, force, "codespace:"+res.Codespace.Name, nil, nil)
+			upsertCodespaceSyncState(db, res.Codespace.Name, res.Codespace.LastUsedAt)
+		}
+		if res.TmpDir != "" {
+			_ = os.RemoveAll(res.TmpDir)
 		}
 	}
 	return total
