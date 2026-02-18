@@ -14,9 +14,15 @@ const (
 	benchmarkLogFiles       = 40
 	benchmarkRecordsPerFile = 200
 	benchmarkFixtureSeed    = 20260218
+	e2eBenchmarkLogFiles    = 203
+	e2eBenchmarkRecords     = 250
 )
 
 func writeSyntheticBenchmarkFixture(tb testing.TB, logsDir, sessionDir string) {
+	writeSyntheticBenchmarkFixtureWithSize(tb, logsDir, sessionDir, benchmarkLogFiles, benchmarkRecordsPerFile)
+}
+
+func writeSyntheticBenchmarkFixtureWithSize(tb testing.TB, logsDir, sessionDir string, fileCount, recordsPerFile int) {
 	tb.Helper()
 	if err := os.MkdirAll(logsDir, 0o755); err != nil {
 		tb.Fatalf("mkdir logs: %v", err)
@@ -36,11 +42,11 @@ func writeSyntheticBenchmarkFixture(tb testing.TB, logsDir, sessionDir string) {
 
 	base := time.Date(2026, 2, 18, 12, 0, 0, 0, time.UTC)
 	models := []string{"gpt-5-mini", "claude-sonnet-4.6", "gemini-2.5-pro"}
-	for fileIdx := 0; fileIdx < benchmarkLogFiles; fileIdx++ {
+	for fileIdx := 0; fileIdx < fileCount; fileIdx++ {
 		ts := base.Add(-time.Duration(fileIdx) * time.Minute)
 		var b strings.Builder
-		b.Grow(benchmarkRecordsPerFile * 240)
-		for rec := 0; rec < benchmarkRecordsPerFile; rec++ {
+		b.Grow(recordsPerFile * 240)
+		for rec := 0; rec < recordsPerFile; rec++ {
 			lineTS := ts.Add(time.Duration(rec) * time.Second).Format("2006-01-02T15:04:05")
 			model := models[(fileIdx+rec+benchmarkFixtureSeed)%len(models)]
 			initiator := "agent"
@@ -63,6 +69,24 @@ func writeSyntheticBenchmarkFixture(tb testing.TB, logsDir, sessionDir string) {
 		}
 		if err := os.Chtimes(logPath, ts, ts); err != nil {
 			tb.Fatalf("chtimes log: %v", err)
+		}
+	}
+}
+
+func BenchmarkColdStartupAndParse3x(b *testing.B) {
+	root := b.TempDir()
+	logsDir := filepath.Join(root, "logs")
+	sessionDir := filepath.Join(root, "session-state")
+	writeSyntheticBenchmarkFixtureWithSize(b, logsDir, sessionDir, e2eBenchmarkLogFiles, e2eBenchmarkRecords)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dbPath := filepath.Join(root, fmt.Sprintf("bench-3x-%d.db", i))
+		db := initDB(dbPath)
+		inserted := syncLogsToDB(db, logsDir, sessionDir, false, "bench-3x", nil, nil)
+		_ = db.Close()
+		if inserted == 0 {
+			b.Fatal("syncLogsToDB inserted 0 records for 3x fixture")
 		}
 	}
 }
