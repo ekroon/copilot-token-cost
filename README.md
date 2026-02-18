@@ -60,7 +60,7 @@ node node/copilot-token-cost.js --json     # machine-readable output
 | `--to N` | End at N days ago (0=today) |
 | `--logs-dir PATH` | Override logs directory |
 | `--json` | Machine-readable JSON output |
-| `--sync` | Force full re-sync of all log files into the database |
+| `--sync` | Force full re-sync of all log files into the database (including codespaces when `--codespaces-sync` is used) |
 | `--import-file FILE` | Import data from JSONL or SQLite file |
 | `--export-file FILE` | Export data as JSONL |
 | `--codespaces-sync` | Sync Copilot data from running Codespaces via `gh cs cp` |

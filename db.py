@@ -34,9 +34,10 @@ CREATE TABLE IF NOT EXISTS parsed_logs (
 );
 
 CREATE TABLE IF NOT EXISTS session_workspaces (
-    session_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
     cwd TEXT NOT NULL,
-    source TEXT DEFAULT 'local'
+    source TEXT DEFAULT 'local',
+    PRIMARY KEY (session_id, source)
 );
 
 CREATE TABLE IF NOT EXISTS codespace_sync_state (
@@ -59,7 +60,37 @@ def get_connection(db_path: Path = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
+    migrate_session_workspaces_schema(conn)
     return conn
+
+
+def migrate_session_workspaces_schema(conn):
+    """Migrate session_workspaces to composite PK (session_id, source) for source-safe joins."""
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_workspaces'"
+    ).fetchone()
+    if not table_exists:
+        return
+    pk_cols = [
+        row[1]
+        for row in conn.execute("PRAGMA table_info(session_workspaces)").fetchall()
+        if row[5] > 0
+    ]
+    if pk_cols == ['session_id', 'source']:
+        return
+    conn.executescript("""
+    ALTER TABLE session_workspaces RENAME TO session_workspaces_old;
+    CREATE TABLE session_workspaces (
+        session_id TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        source TEXT DEFAULT 'local',
+        PRIMARY KEY (session_id, source)
+    );
+    INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source)
+    SELECT session_id, cwd, COALESCE(source, 'local') FROM session_workspaces_old;
+    DROP TABLE session_workspaces_old;
+    """)
+    conn.commit()
 
 
 def is_log_parsed(conn, log_file: str, mtime: float, source: str = 'local') -> bool:
@@ -316,7 +347,8 @@ def query_project_stats(conn, date_from=None, date_to=None, source=None) -> dict
         "SUM(a.cache_creation_tokens) AS cache_creation_tokens, "
         "SUM(a.cache_read_tokens) AS cache_read_tokens, "
         "SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) AS user_turns "
-        f"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id{where} "
+        f"FROM api_calls a LEFT JOIN session_workspaces sw "
+        f"ON a.session_id = sw.session_id AND a.source = sw.source{where} "
         "GROUP BY cwd"
     )
     result = {}
@@ -356,6 +388,18 @@ def query_session_workspaces(conn, source=None) -> dict:
     else:
         rows = conn.execute("SELECT session_id, cwd FROM session_workspaces")
     return {row[0]: row[1] for row in rows}
+
+
+def query_session_workspaces_by_source(conn, source=None) -> dict:
+    """Return {(session_id, source): cwd} dict, optionally filtered by source."""
+    if source is not None:
+        rows = conn.execute(
+            "SELECT session_id, cwd, source FROM session_workspaces WHERE source = ?",
+            (source,)
+        )
+    else:
+        rows = conn.execute("SELECT session_id, cwd, source FROM session_workspaces")
+    return {(row[0], row[2]): row[1] for row in rows}
 
 
 def clear_source(conn, source: str = 'local'):

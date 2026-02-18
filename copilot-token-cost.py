@@ -258,7 +258,7 @@ def list_codespaces(include_stopped: bool) -> list[dict]:
     return [cs for cs in items if cs.get("state") in allowed and cs.get("name")]
 
 
-def sync_codespaces_to_db(conn, include_stopped: bool = False) -> int:
+def sync_codespaces_to_db(conn, include_stopped: bool = False, force: bool = False) -> int:
     """Sync ~/.copilot from codespaces via gh cs cp and import into DB sources."""
     codespaces = list_codespaces(include_stopped=include_stopped)
     if not codespaces:
@@ -281,7 +281,7 @@ def sync_codespaces_to_db(conn, include_stopped: bool = False) -> int:
                 stage.mkdir(parents=True, exist_ok=True)
                 try:
                     cp = subprocess.run(
-                        ["gh", "cs", "cp", "-r", "-c", name, "remote:~/.copilot", str(stage)],
+                        ["gh", "cs", "cp", "-e", "-r", "-c", name, "remote:/home/vscode/.copilot", str(stage)],
                         capture_output=True,
                         text=True,
                         check=False
@@ -291,17 +291,24 @@ def sync_codespaces_to_db(conn, include_stopped: bool = False) -> int:
                     return total
                 if cp.returncode != 0:
                     stderr = (cp.stderr or '').strip()
-                    print(f"  ⚠️ Failed to copy {name}: {stderr or 'gh cs cp failed'}", file=sys.stderr)
+                    if "No such file or directory" in stderr:
+                        print(f"  ⚠️ Skipping {name}: /home/vscode/.copilot not found", file=sys.stderr)
+                    else:
+                        print(f"  ⚠️ Failed to copy {name}: {stderr or 'gh cs cp failed'}", file=sys.stderr)
                     continue
 
                 copilot_dir = stage / ".copilot"
+                if not (copilot_dir / "logs").exists():
+                    alt = stage / "home" / "vscode" / ".copilot"
+                    if (alt / "logs").exists():
+                        copilot_dir = alt
                 logs_dir = copilot_dir / "logs"
                 session_dir = copilot_dir / "session-state"
                 if not logs_dir.exists():
                     print(f"  ⚠️ Skipping {name}: no .copilot/logs in copied data", file=sys.stderr)
                     continue
 
-                total += sync_logs_to_db(conn, logs_dir, session_dir, force=False, source=source)
+                total += sync_logs_to_db(conn, logs_dir, session_dir, force=force, source=source)
                 copied = True
         finally:
             if should_stop:
@@ -501,7 +508,7 @@ def main():
         sync_logs_to_db(conn, logs_dir, session_dir, force=args.sync)
 
     if args.codespaces_sync:
-        sync_codespaces_to_db(conn, include_stopped=args.codespaces_include_stopped)
+        sync_codespaces_to_db(conn, include_stopped=args.codespaces_include_stopped, force=args.sync)
 
     if args.import_file:
         import_path = args.import_file
@@ -584,7 +591,7 @@ def main():
 
     # ─── Get filtered records and session workspaces for per-project cost calc ─
     filtered_records = db.query_records(conn, date_from, date_to)
-    session_workspaces = db.query_session_workspaces(conn)
+    session_workspaces = db.query_session_workspaces_by_source(conn)
 
     total_records = sum(s['api_calls'] for s in model_stats.values())
     log_file_count = conn.execute(
@@ -640,7 +647,8 @@ def main():
         proj_costs = defaultdict(lambda: {'cost': 0.0, 'cost_without_cache': 0.0})
         for r in filtered_records:
             sid = r.get('session_id')
-            cwd = session_workspaces.get(sid, '') if sid else ''
+            src = r.get('source', '')
+            cwd = session_workspaces.get((sid, src), '') if sid else ''
             proj = project_name(cwd) if cwd else '(unknown)'
             model = normalize_model(r['model'])
             rs = {'prompt_tokens': r['prompt_tokens'], 'completion_tokens': r['completion_tokens'],
@@ -779,7 +787,8 @@ def main():
     proj_costs = defaultdict(lambda: {'cost': 0.0, 'cost_nc': 0.0})
     for r in filtered_records:
         sid = r.get('session_id')
-        cwd = session_workspaces.get(sid, '') if sid else ''
+        src = r.get('source', '')
+        cwd = session_workspaces.get((sid, src), '') if sid else ''
         proj = project_name(cwd) if cwd else '(unknown)'
         model = normalize_model(r['model'])
         rs = {'prompt_tokens': r['prompt_tokens'], 'completion_tokens': r['completion_tokens'],

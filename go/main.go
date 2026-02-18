@@ -169,6 +169,7 @@ type Record struct {
 	Timestamp           string
 	SessionID           string
 	LogFile             string
+	Source              string
 }
 
 type Stats struct {
@@ -336,9 +337,10 @@ CREATE TABLE IF NOT EXISTS parsed_logs (
 );
 
 CREATE TABLE IF NOT EXISTS session_workspaces (
-    session_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
     cwd TEXT NOT NULL,
-    source TEXT DEFAULT 'local'
+    source TEXT DEFAULT 'local',
+    PRIMARY KEY (session_id, source)
 );
 
 CREATE TABLE IF NOT EXISTS codespace_sync_state (
@@ -382,7 +384,32 @@ func initDB(dbPath string) *sql.DB {
 		fmt.Fprintf(os.Stderr, "Error creating schema: %v\n", err)
 		os.Exit(1)
 	}
+	migrateSessionWorkspacesSchema(db)
 	return db
+}
+
+func migrateSessionWorkspacesSchema(db *sql.DB) {
+	var pkCols sql.NullString
+	_ = db.QueryRow(
+		"SELECT group_concat(name, ',') FROM (" +
+			"SELECT name FROM pragma_table_info('session_workspaces') WHERE pk > 0 ORDER BY pk" +
+			")",
+	).Scan(&pkCols)
+	if pkCols.Valid && pkCols.String == "session_id,source" {
+		return
+	}
+	_, _ = db.Exec(`
+ALTER TABLE session_workspaces RENAME TO session_workspaces_old;
+CREATE TABLE session_workspaces (
+    session_id TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    source TEXT DEFAULT 'local',
+    PRIMARY KEY (session_id, source)
+);
+INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source)
+SELECT session_id, cwd, COALESCE(source, 'local') FROM session_workspaces_old;
+DROP TABLE session_workspaces_old;
+`)
 }
 
 func isLogParsed(db *sql.DB, logFile string, mtime float64, source string) bool {
@@ -544,7 +571,7 @@ func queryProjectStats(db *sql.DB, dateFrom, dateTo string) map[string]*dbModelS
 		"SUM(a.prompt_tokens), SUM(a.completion_tokens), " +
 		"SUM(a.cache_creation_tokens), SUM(a.cache_read_tokens), " +
 		"SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) " +
-		"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id" + where +
+		"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id AND a.source = sw.source" + where +
 		" GROUP BY cwd"
 	rows, err := db.Query(q, params...)
 	if err != nil {
@@ -566,7 +593,7 @@ func queryRecords(db *sql.DB, dateFrom, dateTo string) []Record {
 	where, params := buildFilters(dateFrom, dateTo)
 	q := "SELECT model, model_normalized, prompt_tokens, completion_tokens, " +
 		"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
-		"timestamp, session_id, log_file FROM api_calls a" + where
+		"timestamp, session_id, log_file, source FROM api_calls a" + where
 	rows, err := db.Query(q, params...)
 	if err != nil {
 		return nil
@@ -577,10 +604,10 @@ func queryRecords(db *sql.DB, dateFrom, dateTo string) []Record {
 		var r Record
 		var modelNorm string
 		var isUT int
-		var ts, sid, lf sql.NullString
+		var ts, sid, lf, src sql.NullString
 		rows.Scan(&r.Model, &modelNorm, &r.PromptTokens, &r.CompletionTokens,
 			&r.CacheCreationTokens, &r.CacheReadTokens, &isUT,
-			&ts, &sid, &lf)
+			&ts, &sid, &lf, &src)
 		r.IsUserTurn = isUT == 1
 		if ts.Valid {
 			r.Timestamp = ts.String
@@ -591,22 +618,25 @@ func queryRecords(db *sql.DB, dateFrom, dateTo string) []Record {
 		if lf.Valid {
 			r.LogFile = lf.String
 		}
+		if src.Valid {
+			r.Source = src.String
+		}
 		records = append(records, r)
 	}
 	return records
 }
 
 func querySessionWorkspaces(db *sql.DB) map[string]string {
-	rows, err := db.Query("SELECT session_id, cwd FROM session_workspaces")
+	rows, err := db.Query("SELECT session_id, cwd, source FROM session_workspaces")
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
 	result := make(map[string]string)
 	for rows.Next() {
-		var sid, cwd string
-		rows.Scan(&sid, &cwd)
-		result[sid] = cwd
+		var sid, cwd, source string
+		rows.Scan(&sid, &cwd, &source)
+		result[source+"\x1f"+sid] = cwd
 	}
 	return result
 }
@@ -831,7 +861,7 @@ func listCodespaces(includeStopped bool) []codespaceInfo {
 	return filtered
 }
 
-func syncCodespacesToDB(db *sql.DB, includeStopped bool) int {
+func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 	codespaces := listCodespaces(includeStopped)
 	if len(codespaces) == 0 {
 		return 0
@@ -857,18 +887,28 @@ func syncCodespacesToDB(db *sql.DB, includeStopped bool) int {
 
 			stage := filepath.Join(tmpDir, cs.Name)
 			_ = os.MkdirAll(stage, 0755)
-			cpCmd := exec.Command("gh", "cs", "cp", "-r", "-c", cs.Name, "remote:~/.copilot", stage)
+			cpCmd := exec.Command("gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
 			cpOut, cpErr := cpCmd.CombinedOutput()
 			if cpErr != nil {
 				msg := strings.TrimSpace(string(cpOut))
-				if msg == "" {
-					msg = "gh cs cp failed"
+				if strings.Contains(msg, "No such file or directory") {
+					fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
+				} else {
+					if msg == "" {
+						msg = "gh cs cp failed"
+					}
+					fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s\n", cs.Name, msg)
 				}
-				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s\n", cs.Name, msg)
 				return
 			}
 
 			copilotDir := filepath.Join(stage, ".copilot")
+			if _, err := os.Stat(filepath.Join(copilotDir, "logs")); err != nil {
+				alt := filepath.Join(stage, "home", "vscode", ".copilot")
+				if _, altErr := os.Stat(filepath.Join(alt, "logs")); altErr == nil {
+					copilotDir = alt
+				}
+			}
 			logsDir := filepath.Join(copilotDir, "logs")
 			sessionDir := filepath.Join(copilotDir, "session-state")
 			if _, err := os.Stat(logsDir); err != nil {
@@ -876,7 +916,7 @@ func syncCodespacesToDB(db *sql.DB, includeStopped bool) int {
 				return
 			}
 
-			total += syncLogsToDB(db, logsDir, sessionDir, false, "codespace:"+cs.Name)
+			total += syncLogsToDB(db, logsDir, sessionDir, force, "codespace:"+cs.Name)
 			copied = true
 		}()
 
@@ -1356,7 +1396,7 @@ func main() {
 	}
 
 	if *codespacesSync {
-		syncCodespacesToDB(database, *codespacesIncludeStopped)
+		syncCodespacesToDB(database, *codespacesIncludeStopped, *syncFlag)
 	}
 
 	if *importFile != "" {
@@ -1547,7 +1587,7 @@ func main() {
 		for _, r := range filtered {
 			cwd := ""
 			if r.SessionID != "" {
-				cwd = sessionWorkspaces[r.SessionID]
+				cwd = sessionWorkspaces[r.Source+"\x1f"+r.SessionID]
 			}
 			proj := "(unknown)"
 			if cwd != "" {
@@ -1767,7 +1807,7 @@ func main() {
 	for _, r := range filtered {
 		cwd := ""
 		if r.SessionID != "" {
-			cwd = sessionWorkspaces[r.SessionID]
+			cwd = sessionWorkspaces[r.Source+"\x1f"+r.SessionID]
 		}
 		proj := "(unknown)"
 		if cwd != "" {
