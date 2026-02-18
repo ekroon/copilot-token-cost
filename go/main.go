@@ -1518,7 +1518,7 @@ func main() {
 
 	if totalRecords == 0 {
 		fmt.Printf("No API calls found in %s.\n", periodLabel)
-		os.Exit(0)
+		return
 	}
 
 	// ─── JSON output ────────────────────────────────────────────────────
