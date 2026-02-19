@@ -1139,10 +1139,13 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 	return res
 }
 
-func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
+func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, error) {
 	codespaces := listCodespaces(includeStopped)
+	if codespaces == nil {
+		return 0, fmt.Errorf("failed to list codespaces")
+	}
 	if len(codespaces) == 0 {
-		return 0
+		return 0, nil
 	}
 	var pending []codespaceInfo
 	for _, cs := range codespaces {
@@ -1153,7 +1156,7 @@ func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 		pending = append(pending, cs)
 	}
 	if len(pending) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	workers := 4
@@ -1179,15 +1182,26 @@ func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 	}
 
 	total := 0
+	failedCopies := 0
 	for _, res := range ordered {
 		if res.Copied {
 			total += syncLogsToDB(db, res.LogsDir, res.SessionDir, force, "codespace:"+res.Codespace.Name, nil, nil)
 			upsertCodespaceSyncState(db, res.Codespace.Name, res.Codespace.LastUsedAt)
+		} else {
+			failedCopies++
 		}
 		if res.TmpDir != "" {
 			_ = os.RemoveAll(res.TmpDir)
 		}
 	}
+	if failedCopies > 0 {
+		return total, fmt.Errorf("codespaces sync incomplete: %d of %d copies failed", failedCopies, len(pending))
+	}
+	return total, nil
+}
+
+func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
+	total, _ := syncCodespacesToDBTick(db, includeStopped, force)
 	return total
 }
 
@@ -1531,12 +1545,19 @@ func main() {
 	exportFile := flag.String("export-file", "", "Export data as JSONL")
 	codespacesSync := flag.Bool("codespaces-sync", false, "Sync Copilot data from running Codespaces via gh cs cp")
 	codespacesIncludeStopped := flag.Bool("codespaces-include-stopped", false, "Include stopped Codespaces (will wake and sync them)")
+	webFlag := flag.Bool("web", false, "Run in web mode (respects date-window flags)")
+	webListen := flag.String("web-listen", "127.0.0.1:7331", "Web mode listen address")
+	webRefreshInterval := flag.Duration("web-refresh-interval", 30*time.Second, "Web mode refresh interval")
+	webCodespacesMode := flag.String("web-codespaces-mode", "auto", "Web mode Codespaces sync mode: manual|auto (default auto: background startup sync + periodic sync)")
+	webCodespacesInterval := flag.Duration("web-codespaces-interval", 5*time.Minute, "Web mode Codespaces periodic sync interval when mode=auto")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: copilot-token-cost [days] [--all] [--today] [--yesterday]\n")
 		fmt.Fprintf(os.Stderr, "                         [--from N] [--to N] [--logs-dir PATH] [--project TEXT] [--json]\n")
 		fmt.Fprintf(os.Stderr, "                         [--sync] [--import-file FILE] [--export-file FILE]\n\n")
 		fmt.Fprintf(os.Stderr, "                         [--codespaces-sync] [--codespaces-include-stopped]\n\n")
+		fmt.Fprintf(os.Stderr, "                         [--web] [--web-listen ADDR] [--web-refresh-interval DURATION]\n")
+		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-mode manual|auto] [--web-codespaces-interval DURATION]\n\n")
 		fmt.Fprintf(os.Stderr, "Copilot CLI Token Cost Calculator\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost              # last 7 days\n")
@@ -1551,10 +1572,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --export-file data.jsonl  # export\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --import-file data.jsonl  # import\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --codespaces-sync  # sync running codespaces\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --today  # web mode with date window\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-mode manual  # disable auto codespaces sync\n")
 	}
 	flag.Parse()
 
-	if *codespacesIncludeStopped && !*codespacesSync {
+	webCodespacesModeValue := strings.ToLower(strings.TrimSpace(*webCodespacesMode))
+	if webCodespacesModeValue != "manual" && webCodespacesModeValue != "auto" {
+		fmt.Fprintln(os.Stderr, "--web-codespaces-mode must be one of: manual, auto")
+		os.Exit(1)
+	}
+
+	if *webFlag && *jsonFlag {
+		fmt.Fprintln(os.Stderr, "--web cannot be used with --json")
+		os.Exit(1)
+	}
+	if *webFlag && *exportFile != "" {
+		fmt.Fprintln(os.Stderr, "--web cannot be used with --export-file")
+		os.Exit(1)
+	}
+
+	if *codespacesIncludeStopped && !*codespacesSync && !*webFlag {
 		fmt.Fprintln(os.Stderr, "--codespaces-include-stopped requires --codespaces-sync")
 		os.Exit(1)
 	}
@@ -1652,11 +1690,6 @@ func main() {
 		dateRange = dateFromDisplay + " → " + dateToDisplay
 	}
 
-	// ─── DB setup and sync ─────────────────────────────────────────────
-	dbPath := getDBPath()
-	database := initDB(dbPath)
-	defer database.Close()
-
 	var syncFrom, syncTo *time.Time
 	if !useCutoffMin {
 		c := cutoff
@@ -1666,6 +1699,34 @@ func main() {
 		c := *cutoffEnd
 		syncTo = &c
 	}
+
+	if *webFlag {
+		cfg := webModeConfig{
+			ListenAddress:            *webListen,
+			RefreshInterval:          *webRefreshInterval,
+			CodespacesMode:           webCodespacesModeValue,
+			CodespacesInterval:       *webCodespacesInterval,
+			CodespacesIncludeStopped: *codespacesIncludeStopped,
+			LogsDir:                  logsDir,
+			SessionDir:               sessionDir,
+			PeriodLabel:              periodLabel,
+			DateRange:                dateRange,
+			DateFromQuery:            dateFromQuery,
+			DateToQuery:              dateToQuery,
+			SyncFrom:                 syncFrom,
+			SyncTo:                   syncTo,
+		}
+		if err := runWebMode(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// ─── DB setup and sync ─────────────────────────────────────────────
+	dbPath := getDBPath()
+	database := initDB(dbPath)
+	defer database.Close()
 
 	if logsExist {
 		syncLogsToDB(database, logsDir, sessionDir, *syncFlag, "local", syncFrom, syncTo)
@@ -1691,77 +1752,14 @@ func main() {
 	projectFilterValue := strings.TrimSpace(*projectFilter)
 
 	// ─── Query aggregated stats from DB ────────────────────────────────
-	dbDailyStats := queryDailyStats(database, dateFromQuery, dateToQuery, projectFilterValue)
-	dailyStats := make(map[string]map[string]*Stats)
-	for day, models := range dbDailyStats {
-		dailyStats[day] = make(map[string]*Stats)
-		for model, dbs := range models {
-			dailyStats[day][model] = &Stats{
-				APICalls:            dbs.APICalls,
-				PromptTokens:        dbs.PromptTokens,
-				CompletionTokens:    dbs.CompletionTokens,
-				CacheCreationTokens: dbs.CacheCreationTokens,
-				CacheReadTokens:     dbs.CacheReadTokens,
-				PremiumRequests:     float64(dbs.UserTurns) * getPremiumMultiplier(model, day),
-			}
-		}
-	}
-
-	// Compute model-level premium_requests from daily (multiplier varies by day)
-	dbModelStatsMap := queryModelStats(database, dateFromQuery, dateToQuery, projectFilterValue)
-	modelStats := make(map[string]*Stats)
-	for model, dbs := range dbModelStatsMap {
-		var premReqs float64
-		for _, models := range dailyStats {
-			if s, ok := models[model]; ok {
-				premReqs += s.PremiumRequests
-			}
-		}
-		modelStats[model] = &Stats{
-			APICalls:            dbs.APICalls,
-			PromptTokens:        dbs.PromptTokens,
-			CompletionTokens:    dbs.CompletionTokens,
-			CacheCreationTokens: dbs.CacheCreationTokens,
-			CacheReadTokens:     dbs.CacheReadTokens,
-			PremiumRequests:     premReqs,
-		}
-	}
-
-	dbProjectStats := queryProjectStats(database, dateFromQuery, dateToQuery, projectFilterValue)
-	projectStats := make(map[string]*Stats)
-	for cwd, dbs := range dbProjectStats {
-		proj := "(unknown)"
-		if cwd != "" {
-			proj = projectName(cwd)
-		}
-		s := &Stats{
-			APICalls:            dbs.APICalls,
-			PromptTokens:        dbs.PromptTokens,
-			CompletionTokens:    dbs.CompletionTokens,
-			CacheCreationTokens: dbs.CacheCreationTokens,
-			CacheReadTokens:     dbs.CacheReadTokens,
-			PremiumRequests:     float64(dbs.UserTurns), // already aggregated across models
-		}
-		if existing, ok := projectStats[proj]; ok {
-			existing.APICalls += s.APICalls
-			existing.PromptTokens += s.PromptTokens
-			existing.CompletionTokens += s.CompletionTokens
-			existing.CacheCreationTokens += s.CacheCreationTokens
-			existing.CacheReadTokens += s.CacheReadTokens
-			existing.PremiumRequests += s.PremiumRequests
-		} else {
-			projectStats[proj] = s
-		}
-	}
-
-	filtered := queryRecords(database, dateFromQuery, dateToQuery, projectFilterValue)
-	sessionWorkspaces := querySessionWorkspaces(database)
-
-	totalRecords := 0
-	for _, s := range modelStats {
-		totalRecords += s.APICalls
-	}
-	logFileCount := queryLogFileCount(database, dateFromQuery, dateToQuery, projectFilterValue)
+	aggregatedStats := loadAggregatedStats(database, dateFromQuery, dateToQuery, projectFilterValue)
+	dailyStats := aggregatedStats.DailyStats
+	modelStats := aggregatedStats.ModelStats
+	projectStats := aggregatedStats.ProjectStats
+	filtered := aggregatedStats.Records
+	sessionWorkspaces := aggregatedStats.SessionWorkspaces
+	totalRecords := aggregatedStats.TotalRecords
+	logFileCount := aggregatedStats.LogFileCount
 
 	if totalRecords == 0 {
 		fmt.Printf("No API calls found in %s.\n", periodLabel)
