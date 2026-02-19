@@ -1716,7 +1716,7 @@ func main() {
 	}
 
 	if *codespacesIncludeStopped && !*codespacesSync && !*webFlag {
-		fmt.Fprintln(os.Stderr, "--codespaces-include-stopped requires --codespaces-sync")
+		fmt.Fprintln(os.Stderr, "--codespaces-include-stopped requires either --codespaces-sync or --web")
 		os.Exit(1)
 	}
 

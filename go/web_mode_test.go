@@ -420,6 +420,7 @@ func TestStartCodespacesAutoSyncLoopWaitsForInterval(t *testing.T) {
 	}
 
 	state.refreshMu.Lock()
+	defer state.refreshMu.Unlock()
 }
 
 func TestRefreshLocalSnapshotSingleFlightConflict(t *testing.T) {
