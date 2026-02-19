@@ -8,3 +8,6 @@ copilot-tokens.db-shm
 
 # OS
 .DS_Store
+
+# Playwright CLI session artifacts
+.playwright-cli/
