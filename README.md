@@ -46,7 +46,36 @@ cd go && go build -o copilot-token-cost .  # build once
 | `--import-file FILE` | Import data from JSONL or SQLite file |
 | `--export-file FILE` | Export data as JSONL |
 | `--codespaces-sync` | Sync Copilot data from running Codespaces via `gh cs cp` |
-| `--codespaces-include-stopped` | Include stopped Codespaces (requires `--codespaces-sync`) |
+| `--codespaces-include-stopped` | Include stopped Codespaces (requires `--codespaces-sync` or `--web`) |
+| `--web` | Run local web dashboard mode (respects date-window flags like `--today`, `--yesterday`, `--from/--to`; cannot be combined with `--json` or `--export-file`) |
+| `--web-listen ADDR` | Web mode listen address (default `127.0.0.1:7331`) |
+| `--web-refresh-interval DURATION` | Local refresh interval in web mode (default `30s`) |
+| `--web-codespaces-mode MODE` | Web Codespaces sync mode: `manual` or `auto` (default `auto`: background startup sync + periodic sync) |
+| `--web-codespaces-interval DURATION` | Web Codespaces sync interval when mode is `auto` (default `5m`) |
+
+## Web mode
+
+```bash
+./go/copilot-token-cost --web
+./go/copilot-token-cost --web --today
+./go/copilot-token-cost --web --web-codespaces-mode manual
+```
+
+Web mode is Data-star-first: the dashboard shell is server-rendered with Datastar-driven updates (no custom fetch loop).
+The overview renders as tables/sections (`Sync status`, `Per-model summary`, `Per-project summary`, `Daily totals`), and live updates emit `datastar-patch-elements` SSE fragments that patch `#overview-summary`, `#sync-status-region`, `#model-summary-region`, `#project-summary-region`, `#daily-totals-region`, and `#stats-json`.
+The dashboard keeps a persistent `GET /events` SSE stream open; reconnecting starts a fresh stream for subsequent broadcasts, and keep-alive heartbeat events are sent while idle.
+Web mode respects the same date-window flags as CLI output (`<days>`, `--today`, `--yesterday`, `--from/--to`, `--all`).
+The server starts immediately and serves the latest DB snapshot; startup then runs local refresh + Codespaces sync in the background (Codespaces only when mode is `auto`).
+Startup and sync progress are logged to stderr (startup handoff plus local/codespaces start/finish/failure lines).
+Periodic behavior remains configurable: local refresh uses `--web-refresh-interval` (default `30s`) and auto Codespaces sync uses `--web-codespaces-interval` (default `5m`).
+Use `--web-codespaces-mode manual` to disable startup/periodic Codespaces sync and trigger it on-demand via `POST /actions/sync-codespaces`.
+
+Web endpoints:
+- `GET /` — dashboard shell
+- `GET /events` — persistent Datastar SSE stream for live patch broadcasts + heartbeat keep-alives
+- `GET /api/stats` — current JSON stats snapshot
+- `GET /healthz` — liveness check (`ok`)
+- `POST /actions/sync-codespaces` — trigger Codespaces sync and return SSE patch
 
 ## Semver Tagging Helper
 

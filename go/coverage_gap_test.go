@@ -174,6 +174,30 @@ if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
   fi
   exit 0
 fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "ssh" ]; then
+  is_ls=false
+  for arg in "$@"; do
+    if [ "$arg" = "ls" ]; then is_ls=true; fi
+  done
+  if [ "$is_ls" = "true" ]; then
+    printf 'process-codespace.log\n'
+    exit 0
+  fi
+  tmpdir=$(mktemp -d)
+  mkdir -p "$tmpdir/.copilot/logs" "$tmpdir/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$tmpdir/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$tmpdir/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<'EOF'
+cwd: /tmp/codespace-repo
+EOF
+  tar czf - -C "$tmpdir" .copilot/logs .copilot/session-state
+  rm -rf "$tmpdir"
+  exit 0
+fi
 if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
   stage=""
   for arg in "$@"; do
@@ -209,6 +233,59 @@ set -eu
 counter_dir="${GH_COUNTER_DIR:-}"
 if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
   printf '[{"name":"cs1","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs2","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs3","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs4","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"}]'
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "ssh" ]; then
+  cs=""
+  prev=""
+  is_ls=false
+  for arg in "$@"; do
+    if [ "$prev" = "-c" ]; then
+      cs="$arg"
+    fi
+    if [ "$arg" = "ls" ]; then is_ls=true; fi
+    prev="$arg"
+  done
+  if [ "$is_ls" = "true" ]; then
+    printf 'process-codespace.log\n'
+    exit 0
+  fi
+  lock=""
+  if [ -n "$counter_dir" ]; then
+    mkdir -p "$counter_dir"
+    lock="$counter_dir/lock"
+    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+    active="$(cat "$counter_dir/active" 2>/dev/null || echo 0)"
+    active=$((active + 1))
+    echo "$active" > "$counter_dir/active"
+    max="$(cat "$counter_dir/max" 2>/dev/null || echo 0)"
+    if [ "$active" -gt "$max" ]; then
+      echo "$active" > "$counter_dir/max"
+    fi
+    rmdir "$lock"
+  fi
+  sleep 0.4
+  tmpdir=$(mktemp -d)
+  mkdir -p "$tmpdir/.copilot/logs" "$tmpdir/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$tmpdir/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$tmpdir/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<EOF
+cwd: /tmp/${cs}-repo
+EOF
+  tar czf - -C "$tmpdir" .copilot/logs .copilot/session-state
+  rm -rf "$tmpdir"
+  if [ -n "$counter_dir" ]; then
+    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+    active="$(cat "$counter_dir/active" 2>/dev/null || echo 1)"
+    active=$((active - 1))
+    if [ "$active" -lt 0 ]; then active=0; fi
+    echo "$active" > "$counter_dir/active"
+    rmdir "$lock"
+  fi
   exit 0
 fi
 if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
@@ -315,7 +392,7 @@ func TestSyncCodespacesToDBWithFakeGH(t *testing.T) {
 
 	second := syncCodespacesToDB(db, false, false)
 	if second != 0 {
-		t.Fatalf("second sync should skip unchanged codespace, got %d", second)
+		t.Fatalf("second sync should skip (all log files already synced), got %d", second)
 	}
 }
 
@@ -335,6 +412,101 @@ func TestSyncCodespacesToDBIncludeStopped(t *testing.T) {
 	}
 	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs2'") != 1 {
 		t.Fatalf("expected one cs2 record")
+	}
+}
+
+func TestCodespaceSkipHeuristic(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+	db := initDB(filepath.Join(t.TempDir(), "skip-heuristic.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Seed sync state: both cs1 and cs2 have matching lastUsedAt
+	upsertCodespaceSyncState(db, "cs1", "2026-02-18T00:00:00Z")
+	upsertCodespaceSyncState(db, "cs2", "2026-02-17T00:00:00Z")
+
+	// includeStopped=true so both cs1 (Available) and cs2 (Shutdown) are listed
+	inserted := syncCodespacesToDB(db, true, false)
+
+	// cs1 is Available → must re-sync even though lastUsedAt matches
+	// cs2 is Shutdown with unchanged lastUsedAt → should be skipped
+	if inserted != 1 {
+		t.Fatalf("expected 1 (Available re-synced, Shutdown skipped), got %d", inserted)
+	}
+
+	// Verify cs1 (Available) was synced
+	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs1'") < 1 {
+		t.Fatalf("Available codespace cs1 should have been synced")
+	}
+
+	// Now change cs2's lastUsedAt in sync state to something different
+	upsertCodespaceSyncState(db, "cs2", "2020-01-01T00:00:00Z")
+	inserted2 := syncCodespacesToDB(db, true, false)
+	// cs1 (Available) skipped (all log files already synced) + cs2 (Shutdown, changed lastUsedAt) synced = 1
+	if inserted2 != 1 {
+		t.Fatalf("expected 1 (Available skipped, Shutdown with changed lastUsedAt synced), got %d", inserted2)
+	}
+}
+
+func TestRemoteDiffSkipsAlreadySyncedFiles(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+	db := initDB(filepath.Join(t.TempDir(), "remote-diff.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-seed parsed_logs so cs1's only log file is already known
+	markLogParsed(db, "process-codespace.log", 100.0, 1, "codespace:cs1")
+
+	// cs1 (Available): all remote files already synced → skip copy
+	inserted := syncCodespacesToDB(db, false, false)
+	if inserted != 0 {
+		t.Fatalf("expected 0 (all files already synced), got %d", inserted)
+	}
+
+	// Verify no new api_calls were created
+	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs1'") != 0 {
+		t.Fatalf("expected no api_calls since copy was skipped")
+	}
+}
+
+func TestRemoteDiffProceedsWithNewFiles(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+	db := initDB(filepath.Join(t.TempDir(), "remote-diff-new.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-seed parsed_logs with a DIFFERENT filename than what the remote has
+	markLogParsed(db, "process-other.log", 100.0, 1, "codespace:cs1")
+
+	// cs1 (Available): remote has "process-codespace.log" which is not in parsed_logs → proceed
+	inserted := syncCodespacesToDB(db, false, false)
+	if inserted != 1 {
+		t.Fatalf("expected 1 (new file triggers copy), got %d", inserted)
+	}
+
+	// Verify api_calls were synced
+	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs1'") != 1 {
+		t.Fatalf("expected 1 api_call after sync")
+	}
+}
+
+func TestRemoteDiffForceBypassesCheck(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+	db := initDB(filepath.Join(t.TempDir(), "remote-diff-force.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-seed parsed_logs so cs1's only log file is already known
+	markLogParsed(db, "process-codespace.log", 100.0, 1, "codespace:cs1")
+
+	// force=true should bypass the remote diff check
+	inserted := syncCodespacesToDB(db, false, true)
+	if inserted != 1 {
+		t.Fatalf("expected 1 (force bypasses remote diff check), got %d", inserted)
 	}
 }
 
@@ -368,6 +540,88 @@ func TestSyncCodespacesToDBCopiesInParallel(t *testing.T) {
 	}
 	if maxParallel < 2 {
 		t.Fatalf("expected parallel copy concurrency >=2, got %d", maxParallel)
+	}
+}
+
+func writeFakeGHSshFails(t *testing.T, dir string) {
+	t.Helper()
+	script := `#!/bin/sh
+set -eu
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
+  printf '[{"name":"cs1","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"}]'
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "ssh" ]; then
+  exit 1
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
+  stage=""
+  for arg in "$@"; do
+    stage="$arg"
+  done
+  mkdir -p "$stage/.copilot/logs" "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$stage/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<'EOF'
+cwd: /tmp/codespace-repo
+EOF
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "stop" ]; then
+  exit 0
+fi
+exit 1
+`
+	path := filepath.Join(dir, "gh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh ssh-fails: %v", err)
+	}
+}
+
+func TestCopyCodespaceDataSshTarFallback(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGHSshFails(t, binDir)
+	withPath(t, binDir)
+
+	cs := codespaceInfo{Name: "cs1", State: "Available", LastUsedAt: "2026-02-18T00:00:00Z"}
+	result := copyCodespaceData(cs, 0, 1)
+	t.Cleanup(func() {
+		if result.TmpDir != "" {
+			os.RemoveAll(result.TmpDir)
+		}
+	})
+	if !result.Copied {
+		t.Fatalf("expected Copied=true after ssh+tar fallback to gh cs cp")
+	}
+	if result.LogsDir == "" {
+		t.Fatalf("expected LogsDir to be set")
+	}
+	if _, err := os.Stat(result.LogsDir); err != nil {
+		t.Fatalf("logs dir not found: %v", err)
+	}
+}
+
+func TestCopyCodespaceDataSshTarSuccess(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+
+	cs := codespaceInfo{Name: "cs1", State: "Available", LastUsedAt: "2026-02-18T00:00:00Z"}
+	result := copyCodespaceData(cs, 0, 1)
+	t.Cleanup(func() {
+		if result.TmpDir != "" {
+			os.RemoveAll(result.TmpDir)
+		}
+	})
+	if !result.Copied {
+		t.Fatalf("expected Copied=true via ssh+tar")
+	}
+	if result.LogsDir == "" {
+		t.Fatalf("expected LogsDir to be set")
 	}
 }
 
