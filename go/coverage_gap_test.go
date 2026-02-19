@@ -289,6 +289,36 @@ EOF
   exit 0
 fi
 if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
+  cs=""
+  stage=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "-c" ]; then
+      cs="$arg"
+    fi
+    prev="$arg"
+    stage="$arg"
+  done
+  lock=""
+  if [ -n "$counter_dir" ]; then
+    mkdir -p "$counter_dir"
+    lock="$counter_dir/lock"
+    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+    active="$(cat "$counter_dir/active" 2>/dev/null || echo 0)"
+    active=$((active + 1))
+    echo "$active" > "$counter_dir/active"
+    max="$(cat "$counter_dir/max" 2>/dev/null || echo 0)"
+    if [ "$active" -gt "$max" ]; then
+      echo "$active" > "$counter_dir/max"
+    fi
+    rmdir "$lock"
+  fi
+  sleep 0.4
+  mkdir -p "$stage/.copilot/logs" "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$stage/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
 2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
 EOF
   cat > "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<EOF
@@ -361,8 +391,8 @@ func TestSyncCodespacesToDBWithFakeGH(t *testing.T) {
 	}
 
 	second := syncCodespacesToDB(db, false, false)
-	if second != 1 {
-		t.Fatalf("second sync re-counts Available codespace (INSERT OR IGNORE dedupes), got %d", second)
+	if second != 0 {
+		t.Fatalf("second sync should skip (all log files already synced), got %d", second)
 	}
 }
 
@@ -413,9 +443,70 @@ func TestCodespaceSkipHeuristic(t *testing.T) {
 	// Now change cs2's lastUsedAt in sync state to something different
 	upsertCodespaceSyncState(db, "cs2", "2020-01-01T00:00:00Z")
 	inserted2 := syncCodespacesToDB(db, true, false)
-	// cs1 (Available) re-synced (re-counted) + cs2 (Shutdown, changed lastUsedAt) synced = 2
-	if inserted2 != 2 {
-		t.Fatalf("expected 2 (Available re-synced, Shutdown with changed lastUsedAt synced), got %d", inserted2)
+	// cs1 (Available) skipped (all log files already synced) + cs2 (Shutdown, changed lastUsedAt) synced = 1
+	if inserted2 != 1 {
+		t.Fatalf("expected 1 (Available skipped, Shutdown with changed lastUsedAt synced), got %d", inserted2)
+	}
+}
+
+func TestRemoteDiffSkipsAlreadySyncedFiles(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+	db := initDB(filepath.Join(t.TempDir(), "remote-diff.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-seed parsed_logs so cs1's only log file is already known
+	markLogParsed(db, "process-codespace.log", 100.0, 1, "codespace:cs1")
+
+	// cs1 (Available): all remote files already synced → skip copy
+	inserted := syncCodespacesToDB(db, false, false)
+	if inserted != 0 {
+		t.Fatalf("expected 0 (all files already synced), got %d", inserted)
+	}
+
+	// Verify no new api_calls were created
+	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs1'") != 0 {
+		t.Fatalf("expected no api_calls since copy was skipped")
+	}
+}
+
+func TestRemoteDiffProceedsWithNewFiles(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+	db := initDB(filepath.Join(t.TempDir(), "remote-diff-new.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-seed parsed_logs with a DIFFERENT filename than what the remote has
+	markLogParsed(db, "process-other.log", 100.0, 1, "codespace:cs1")
+
+	// cs1 (Available): remote has "process-codespace.log" which is not in parsed_logs → proceed
+	inserted := syncCodespacesToDB(db, false, false)
+	if inserted != 1 {
+		t.Fatalf("expected 1 (new file triggers copy), got %d", inserted)
+	}
+
+	// Verify api_calls were synced
+	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs1'") != 1 {
+		t.Fatalf("expected 1 api_call after sync")
+	}
+}
+
+func TestRemoteDiffForceBypassesCheck(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+	db := initDB(filepath.Join(t.TempDir(), "remote-diff-force.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Pre-seed parsed_logs so cs1's only log file is already known
+	markLogParsed(db, "process-codespace.log", 100.0, 1, "codespace:cs1")
+
+	// force=true should bypass the remote diff check
+	inserted := syncCodespacesToDB(db, false, true)
+	if inserted != 1 {
+		t.Fatalf("expected 1 (force bypasses remote diff check), got %d", inserted)
 	}
 }
 

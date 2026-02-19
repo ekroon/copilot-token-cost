@@ -1206,6 +1206,42 @@ func dirStats(root string) (int, int64) {
 	return count, total
 }
 
+func listRemoteLogFiles(csName string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "cs", "ssh", "-c", csName, "--",
+		"ls", "/home/vscode/.copilot/logs/")
+	cmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		f := strings.TrimSpace(line)
+		if f != "" {
+			files = append(files, f)
+		}
+	}
+	return files, nil
+}
+
+func getKnownLogFiles(db *sql.DB, source string) map[string]bool {
+	known := map[string]bool{}
+	rows, err := db.Query("SELECT log_file FROM parsed_logs WHERE source = ?", source)
+	if err != nil {
+		return known
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err == nil {
+			known[f] = true
+		}
+	}
+	return known
+}
+
 func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, error) {
 	codespaces := listCodespaces(includeStopped)
 	if codespaces == nil {
@@ -1219,6 +1255,26 @@ func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, e
 		if cs.State != "Available" && cs.LastUsedAt != "" && getCodespaceLastUsed(db, cs.Name) == cs.LastUsedAt {
 			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (shutdown, unchanged lastUsedAt)\n", cs.Name)
 			continue
+		}
+		if !force {
+			source := "codespace:" + cs.Name
+			known := getKnownLogFiles(db, source)
+			if len(known) > 0 {
+				remoteFiles, err := listRemoteLogFiles(cs.Name)
+				if err == nil && len(remoteFiles) > 0 {
+					allKnown := true
+					for _, f := range remoteFiles {
+						if !known[f] {
+							allKnown = false
+							break
+						}
+					}
+					if allKnown {
+						fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s copy: all %d log files already synced\n", cs.Name, len(remoteFiles))
+						continue
+					}
+				}
+			}
 		}
 		pending = append(pending, cs)
 	}
