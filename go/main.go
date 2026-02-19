@@ -1099,29 +1099,60 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 	cpStart := time.Now()
 	cpCtx, cpCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cpCancel()
-	cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
-	cpCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-	var cpErrBuf bytes.Buffer
-	cpCmd.Stdout = io.Discard
-	cpCmd.Stderr = &cpErrBuf
-	cpErr := cpCmd.Run()
-	if cpErr != nil {
-		if cpCtx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out after %.1fs\n", cs.Name, time.Since(cpStart).Seconds())
+
+	// Try ssh+tar first (targeted paths, compressed stream)
+	copied := false
+	sshTarCmd := exec.CommandContext(cpCtx, "gh", "cs", "ssh", "-c", cs.Name, "--",
+		"tar", "czf", "-", "-C", "/home/vscode", ".copilot/logs", ".copilot/session-state")
+	sshTarCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+	var sshErrBuf bytes.Buffer
+	sshTarCmd.Stderr = &sshErrBuf
+	if pipe, pipeErr := sshTarCmd.StdoutPipe(); pipeErr == nil {
+		tarExtract := exec.CommandContext(cpCtx, "tar", "xzf", "-", "-C", stage)
+		tarExtract.Stdin = pipe
+		var tarErrBuf bytes.Buffer
+		tarExtract.Stderr = &tarErrBuf
+		if sshErr := sshTarCmd.Start(); sshErr == nil {
+			if tarErr := tarExtract.Start(); tarErr == nil {
+				tarWaitErr := tarExtract.Wait()
+				sshWaitErr := sshTarCmd.Wait()
+				if sshWaitErr == nil && tarWaitErr == nil {
+					fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
+					copied = true
+				} else {
+					fmt.Fprintf(os.Stderr, "  ⚠️ ssh+tar failed for %s (%.1fs), falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds())
+				}
+			}
+		}
+	}
+
+	// Fallback: gh cs cp (original approach, copies all of .copilot/)
+	if !copied {
+		cpStart = time.Now()
+		cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
+		cpCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+		var cpErrBuf bytes.Buffer
+		cpCmd.Stdout = io.Discard
+		cpCmd.Stderr = &cpErrBuf
+		cpErr := cpCmd.Run()
+		if cpErr != nil {
+			if cpCtx.Err() == context.DeadlineExceeded {
+				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out after %.1fs\n", cs.Name, time.Since(cpStart).Seconds())
+				return res
+			}
+			msg := strings.TrimSpace(cpErrBuf.String())
+			if strings.Contains(msg, "No such file or directory") {
+				fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
+			} else {
+				if msg == "" {
+					msg = "gh cs cp failed"
+				}
+				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s (%.1fs)\n", cs.Name, msg, time.Since(cpStart).Seconds())
+			}
 			return res
 		}
-		msg := strings.TrimSpace(cpErrBuf.String())
-		if strings.Contains(msg, "No such file or directory") {
-			fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
-		} else {
-			if msg == "" {
-				msg = "gh cs cp failed"
-			}
-			fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s (%.1fs)\n", cs.Name, msg, time.Since(cpStart).Seconds())
-		}
-		return res
+		fmt.Fprintf(os.Stderr, "  ✅ Copied %s (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
 	}
-	fmt.Fprintf(os.Stderr, "  ✅ Copied %s (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
 
 	copilotDir := filepath.Join(stage, ".copilot")
 	if _, err := os.Stat(filepath.Join(copilotDir, "logs")); err != nil {

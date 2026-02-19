@@ -174,6 +174,30 @@ if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
   fi
   exit 0
 fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "ssh" ]; then
+  is_ls=false
+  for arg in "$@"; do
+    if [ "$arg" = "ls" ]; then is_ls=true; fi
+  done
+  if [ "$is_ls" = "true" ]; then
+    printf 'process-codespace.log\n'
+    exit 0
+  fi
+  tmpdir=$(mktemp -d)
+  mkdir -p "$tmpdir/.copilot/logs" "$tmpdir/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$tmpdir/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$tmpdir/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<'EOF'
+cwd: /tmp/codespace-repo
+EOF
+  tar czf - -C "$tmpdir" .copilot/logs .copilot/session-state
+  rm -rf "$tmpdir"
+  exit 0
+fi
 if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
   stage=""
   for arg in "$@"; do
@@ -211,17 +235,21 @@ if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
   printf '[{"name":"cs1","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs2","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs3","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs4","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"}]'
   exit 0
 fi
-if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "ssh" ]; then
   cs=""
-  stage=""
   prev=""
+  is_ls=false
   for arg in "$@"; do
     if [ "$prev" = "-c" ]; then
       cs="$arg"
     fi
+    if [ "$arg" = "ls" ]; then is_ls=true; fi
     prev="$arg"
-    stage="$arg"
   done
+  if [ "$is_ls" = "true" ]; then
+    printf 'process-codespace.log\n'
+    exit 0
+  fi
   lock=""
   if [ -n "$counter_dir" ]; then
     mkdir -p "$counter_dir"
@@ -237,11 +265,30 @@ if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
     rmdir "$lock"
   fi
   sleep 0.4
-  mkdir -p "$stage/.copilot/logs" "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
-  cat > "$stage/.copilot/logs/process-codespace.log" <<'EOF'
+  tmpdir=$(mktemp -d)
+  mkdir -p "$tmpdir/.copilot/logs" "$tmpdir/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$tmpdir/.copilot/logs/process-codespace.log" <<'EOF'
 2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
 2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
 2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$tmpdir/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<EOF
+cwd: /tmp/${cs}-repo
+EOF
+  tar czf - -C "$tmpdir" .copilot/logs .copilot/session-state
+  rm -rf "$tmpdir"
+  if [ -n "$counter_dir" ]; then
+    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+    active="$(cat "$counter_dir/active" 2>/dev/null || echo 1)"
+    active=$((active - 1))
+    if [ "$active" -lt 0 ]; then active=0; fi
+    echo "$active" > "$counter_dir/active"
+    rmdir "$lock"
+  fi
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
 2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
 EOF
   cat > "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<EOF
@@ -402,6 +449,88 @@ func TestSyncCodespacesToDBCopiesInParallel(t *testing.T) {
 	}
 	if maxParallel < 2 {
 		t.Fatalf("expected parallel copy concurrency >=2, got %d", maxParallel)
+	}
+}
+
+func writeFakeGHSshFails(t *testing.T, dir string) {
+	t.Helper()
+	script := `#!/bin/sh
+set -eu
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
+  printf '[{"name":"cs1","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"}]'
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "ssh" ]; then
+  exit 1
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
+  stage=""
+  for arg in "$@"; do
+    stage="$arg"
+  done
+  mkdir -p "$stage/.copilot/logs" "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$stage/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<'EOF'
+cwd: /tmp/codespace-repo
+EOF
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "stop" ]; then
+  exit 0
+fi
+exit 1
+`
+	path := filepath.Join(dir, "gh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh ssh-fails: %v", err)
+	}
+}
+
+func TestCopyCodespaceDataSshTarFallback(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGHSshFails(t, binDir)
+	withPath(t, binDir)
+
+	cs := codespaceInfo{Name: "cs1", State: "Available", LastUsedAt: "2026-02-18T00:00:00Z"}
+	result := copyCodespaceData(cs, 0, 1)
+	t.Cleanup(func() {
+		if result.TmpDir != "" {
+			os.RemoveAll(result.TmpDir)
+		}
+	})
+	if !result.Copied {
+		t.Fatalf("expected Copied=true after ssh+tar fallback to gh cs cp")
+	}
+	if result.LogsDir == "" {
+		t.Fatalf("expected LogsDir to be set")
+	}
+	if _, err := os.Stat(result.LogsDir); err != nil {
+		t.Fatalf("logs dir not found: %v", err)
+	}
+}
+
+func TestCopyCodespaceDataSshTarSuccess(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+
+	cs := codespaceInfo{Name: "cs1", State: "Available", LastUsedAt: "2026-02-18T00:00:00Z"}
+	result := copyCodespaceData(cs, 0, 1)
+	t.Cleanup(func() {
+		if result.TmpDir != "" {
+			os.RemoveAll(result.TmpDir)
+		}
+	})
+	if !result.Copied {
+		t.Fatalf("expected Copied=true via ssh+tar")
+	}
+	if result.LogsDir == "" {
+		t.Fatalf("expected LogsDir to be set")
 	}
 }
 
