@@ -700,6 +700,33 @@ func queryProjectStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[s
 	return result
 }
 
+func queryProjectModelStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[string]map[string]*dbModelStats {
+	where, params := buildFilters(dateFrom, dateTo, projectFilter)
+	q := "SELECT COALESCE(sw.cwd, '') AS cwd, a.model_normalized, COUNT(*) AS api_calls, " +
+		"SUM(a.prompt_tokens), SUM(a.completion_tokens), " +
+		"SUM(a.cache_creation_tokens), SUM(a.cache_read_tokens), " +
+		"SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) " +
+		"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id AND a.source = sw.source" + where +
+		" GROUP BY cwd, a.model_normalized"
+	rows, err := db.Query(q, params...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	result := make(map[string]map[string]*dbModelStats)
+	for rows.Next() {
+		var cwd, model string
+		var s dbModelStats
+		rows.Scan(&cwd, &model, &s.APICalls, &s.PromptTokens, &s.CompletionTokens,
+			&s.CacheCreationTokens, &s.CacheReadTokens, &s.UserTurns)
+		if result[cwd] == nil {
+			result[cwd] = make(map[string]*dbModelStats)
+		}
+		result[cwd][model] = &s
+	}
+	return result
+}
+
 func queryRecords(db *sql.DB, dateFrom, dateTo, projectFilter string) []Record {
 	where, params := buildFilters(dateFrom, dateTo, projectFilter)
 	q := "SELECT model, model_normalized, prompt_tokens, completion_tokens, " +

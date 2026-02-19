@@ -684,7 +684,8 @@ func buildRefreshPatch(payload statsPayload) (string, error) {
 
 	var patch strings.Builder
 	appendDatastarOuterPatch(&patch, "#overview-summary", `<p id="overview-summary">`+renderWebOverviewSummary(payload, true)+`</p>`)
-	appendDatastarOuterPatch(&patch, "#sync-status-region", `<div id="sync-status-region">`+renderWebSyncStatusTable(payload, true)+`</div>`)
+	appendDatastarOuterPatch(&patch, "#sync-status-region", `<details id="sync-status-region" class="sync-status-compact">`+renderWebSyncStatusTable(payload, true)+`</details>`)
+	appendDatastarOuterPatch(&patch, "#daily-token-chart-region", `<div id="daily-token-chart-region">`+renderWebDailyTokenChart(payload, true)+`</div>`)
 	appendDatastarOuterPatch(&patch, "#model-summary-region", `<div id="model-summary-region">`+renderWebModelSummaryTable(payload, true)+`</div>`)
 	appendDatastarOuterPatch(&patch, "#project-summary-region", `<div id="project-summary-region">`+renderWebProjectSummaryTable(payload, true)+`</div>`)
 	appendDatastarOuterPatch(&patch, "#daily-totals-region", `<div id="daily-totals-region">`+renderWebDailyTotalsTable(payload, true)+`</div>`)
@@ -700,7 +701,10 @@ type webStatsRow struct {
 type webDailyTotalsRow struct {
 	day              string
 	apiCalls         int
+	promptTokens     int
+	completionTokens int
 	premiumRequests  float64
+	premRequestCost  float64
 	totalCost        float64
 	totalCostNoCache float64
 }
@@ -717,6 +721,13 @@ func sortedWebStatsRows(statsMap map[string]statsPayloadStats) []webStatsRow {
 		return rows[i].stats.Cost > rows[j].stats.Cost
 	})
 	return rows
+}
+
+func fmtAPIPercent(premCost, cost float64) string {
+	if cost == 0 {
+		return "–"
+	}
+	return fmt.Sprintf("%.0f%%", premCost/cost*100)
 }
 
 func webFloat64(value interface{}) float64 {
@@ -746,8 +757,16 @@ func webDailyStatsValue(value interface{}) (statsPayloadStats, bool) {
 		return v, true
 	case map[string]interface{}:
 		return statsPayloadStats{
-			APICalls:        int(webFloat64(v["api_calls"])),
-			PremiumRequests: webFloat64(v["premium_requests"]),
+			APICalls:            int(webFloat64(v["api_calls"])),
+			PromptTokens:        int(webFloat64(v["prompt_tokens"])),
+			CompletionTokens:    int(webFloat64(v["completion_tokens"])),
+			CacheCreationTokens: int(webFloat64(v["cache_creation_tokens"])),
+			CacheReadTokens:     int(webFloat64(v["cache_read_tokens"])),
+			PremiumRequests:     webFloat64(v["premium_requests"]),
+			PremiumRequestCost:  webFloat64(v["premium_request_cost"]),
+			InputUncached:       int(webFloat64(v["input_uncached_tokens"])),
+			Cost:                webFloat64(v["cost"]),
+			CostWithoutCache:    webFloat64(v["cost_without_cache"]),
 		}, true
 	}
 	return statsPayloadStats{}, false
@@ -777,7 +796,10 @@ func buildWebDailyTotalsRows(payload statsPayload) []webDailyTotalsRow {
 				continue
 			}
 			row.apiCalls += stats.APICalls
+			row.promptTokens += stats.PromptTokens
+			row.completionTokens += stats.CompletionTokens
 			row.premiumRequests += stats.PremiumRequests
+			row.premRequestCost += stats.PremiumRequestCost
 		}
 		rows = append(rows, row)
 	}
@@ -794,23 +816,40 @@ func renderWebModelSummaryTable(payload statsPayload, hasSnapshot bool) string {
 	}
 
 	totalPremium := 0.0
+	var totalInput, totalOutput int
 	var b strings.Builder
-	b.WriteString(`<table id="model-summary-table"><thead><tr><th>Model</th><th>Calls</th><th>Premium</th><th>Cost</th><th>Prem Cost</th></tr></thead><tbody>`)
+	b.WriteString(`<table id="model-summary-table"><thead><tr><th>Model</th><th>Calls</th><th>Input</th><th>Output</th><th>Tok/Prem</th><th>Premium</th><th>Cost</th><th>API%</th></tr></thead><tbody>`)
 	for _, row := range rows {
 		totalPremium += row.stats.PremiumRequests
-		fmt.Fprintf(&b, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+		totalInput += row.stats.PromptTokens
+		totalOutput += row.stats.CompletionTokens
+		tokPerPrem := "–"
+		if row.stats.PremiumRequests > 0 {
+			tokPerPrem = fmtTokens(int(float64(row.stats.PromptTokens+row.stats.CompletionTokens) / row.stats.PremiumRequests))
+		}
+		fmt.Fprintf(&b, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
 			html.EscapeString(row.name),
 			commaInt(row.stats.APICalls),
+			fmtTokens(row.stats.PromptTokens),
+			fmtTokens(row.stats.CompletionTokens),
+			tokPerPrem,
 			commaFloat(row.stats.PremiumRequests, 0),
-			fmtCost(row.stats.Cost),
 			fmtCost(row.stats.PremiumRequestCost),
+			fmtAPIPercent(row.stats.PremiumRequestCost, row.stats.Cost),
 		)
 	}
-	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
+	totalTokPerPrem := "–"
+	if totalPremium > 0 {
+		totalTokPerPrem = fmtTokens(int(float64(totalInput+totalOutput) / totalPremium))
+	}
+	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
+		fmtTokens(totalInput),
+		fmtTokens(totalOutput),
+		totalTokPerPrem,
 		commaFloat(totalPremium, 0),
-		fmtCost(payload.TotalCost),
 		fmtCost(payload.TotalPremiumRequestCost),
+		fmtAPIPercent(payload.TotalPremiumRequestCost, payload.TotalCost),
 	)
 	return b.String()
 }
@@ -825,23 +864,57 @@ func renderWebProjectSummaryTable(payload statsPayload, hasSnapshot bool) string
 	}
 
 	totalPremium := 0.0
+	var totalInput, totalOutput int
 	var b strings.Builder
-	b.WriteString(`<table id="project-summary-table"><thead><tr><th>Project</th><th>Calls</th><th>Premium</th><th>Cost</th><th>Prem Cost</th></tr></thead><tbody>`)
-	for _, row := range rows {
-		totalPremium += row.stats.PremiumRequests
-		fmt.Fprintf(&b, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
-			html.EscapeString(row.name),
-			commaInt(row.stats.APICalls),
-			commaFloat(row.stats.PremiumRequests, 0),
-			fmtCost(row.stats.Cost),
-			fmtCost(row.stats.PremiumRequestCost),
-		)
+
+	// Datastar signals div – one boolean per project row
+	b.WriteString(`<div data-signals`)
+	for i := range rows {
+		fmt.Fprintf(&b, `:__p%d="false"`, i)
 	}
-	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
+	b.WriteString(`></div>`)
+
+	b.WriteString(`<table id="project-summary-table"><thead><tr><th>Project</th><th>Calls</th><th>Input</th><th>Output</th><th>Premium</th><th>Cost</th><th>API%</th></tr></thead><tbody>`)
+	for i, row := range rows {
+		totalPremium += row.stats.PremiumRequests
+		totalInput += row.stats.PromptTokens
+		totalOutput += row.stats.CompletionTokens
+		sig := fmt.Sprintf("__p%d", i)
+		fmt.Fprintf(&b, `<tr class="expandable-row" data-on:click="$%s = !$%s">`, sig, sig)
+		fmt.Fprintf(&b, `<td><span data-text="$%s ? '▼ ' : '▶ '">▶ </span>%s</td>`, sig, html.EscapeString(row.name))
+		fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+			commaInt(row.stats.APICalls),
+			fmtTokens(row.stats.PromptTokens),
+			fmtTokens(row.stats.CompletionTokens),
+			commaFloat(row.stats.PremiumRequests, 0),
+			fmtCost(row.stats.PremiumRequestCost),
+			fmtAPIPercent(row.stats.PremiumRequestCost, row.stats.Cost),
+		)
+		b.WriteString(`</tr>`)
+		if models, ok := payload.ProjectModels[row.name]; ok {
+			modelRows := sortedWebStatsRows(models)
+			for _, mr := range modelRows {
+				fmt.Fprintf(&b, `<tr class="project-model-row" data-show="$%s">`, sig)
+				fmt.Fprintf(&b, `<td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+					html.EscapeString(mr.name),
+					commaInt(mr.stats.APICalls),
+					fmtTokens(mr.stats.PromptTokens),
+					fmtTokens(mr.stats.CompletionTokens),
+					commaFloat(mr.stats.PremiumRequests, 0),
+					fmtCost(mr.stats.PremiumRequestCost),
+					fmtAPIPercent(mr.stats.PremiumRequestCost, mr.stats.Cost),
+				)
+				b.WriteString(`</tr>`)
+			}
+		}
+	}
+	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
+		fmtTokens(totalInput),
+		fmtTokens(totalOutput),
 		commaFloat(totalPremium, 0),
-		fmtCost(payload.TotalCost),
 		fmtCost(payload.TotalPremiumRequestCost),
+		fmtAPIPercent(payload.TotalPremiumRequestCost, payload.TotalCost),
 	)
 	return b.String()
 }
@@ -856,22 +929,111 @@ func renderWebDailyTotalsTable(payload statsPayload, hasSnapshot bool) string {
 	}
 
 	totalPremium := 0.0
+	totalPremCost := 0.0
+	var totalInput, totalOutput int
 	var b strings.Builder
-	b.WriteString(`<table id="daily-totals-table"><thead><tr><th>Date</th><th>Calls</th><th>Premium</th><th>Cost</th></tr></thead><tbody>`)
-	for _, row := range rows {
+
+	// Datastar signals div – one boolean per day row
+	b.WriteString(`<div data-signals`)
+	for i := range rows {
+		fmt.Fprintf(&b, `:__d%d="false"`, i)
+	}
+	b.WriteString(`></div>`)
+
+	b.WriteString(`<table id="daily-totals-table"><thead><tr><th>Date</th><th>Calls</th><th>Premium</th><th>Input</th><th>Output</th><th>Cost</th><th>API%</th></tr></thead><tbody>`)
+	for i, row := range rows {
 		totalPremium += row.premiumRequests
-		fmt.Fprintf(&b, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
-			html.EscapeString(row.day),
+		totalPremCost += row.premRequestCost
+		totalInput += row.promptTokens
+		totalOutput += row.completionTokens
+		sig := fmt.Sprintf("__d%d", i)
+		fmt.Fprintf(&b, `<tr class="expandable-row" data-on:click="$%s = !$%s">`, sig, sig)
+		fmt.Fprintf(&b, `<td><span data-text="$%s ? '▼ ' : '▶ '">▶ </span>%s</td>`, sig, html.EscapeString(row.day))
+		fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
 			commaInt(row.apiCalls),
 			commaFloat(row.premiumRequests, 0),
-			fmtCost(row.totalCost),
+			fmtTokens(row.promptTokens),
+			fmtTokens(row.completionTokens),
+			fmtCost(row.premRequestCost),
+			fmtAPIPercent(row.premRequestCost, row.totalCost),
 		)
+		b.WriteString(`</tr>`)
+		dayMap := payload.Daily[row.day]
+		modelNames := make([]string, 0)
+		for key := range dayMap {
+			if !strings.HasPrefix(key, "_") {
+				modelNames = append(modelNames, key)
+			}
+		}
+		sort.Strings(modelNames)
+		for _, model := range modelNames {
+			stats, ok := webDailyStatsValue(dayMap[model])
+			if !ok {
+				continue
+			}
+			fmt.Fprintf(&b, `<tr class="daily-model-row" data-show="$%s">`, sig)
+			fmt.Fprintf(&b, `<td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+				html.EscapeString(model),
+				commaInt(stats.APICalls),
+				commaFloat(stats.PremiumRequests, 0),
+				fmtTokens(stats.PromptTokens),
+				fmtTokens(stats.CompletionTokens),
+				fmtCost(stats.PremiumRequestCost),
+				fmtAPIPercent(stats.PremiumRequestCost, stats.Cost),
+			)
+			b.WriteString(`</tr>`)
+		}
 	}
-	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
+	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
 		commaFloat(totalPremium, 0),
-		fmtCost(payload.TotalCost),
+		fmtTokens(totalInput),
+		fmtTokens(totalOutput),
+		fmtCost(totalPremCost),
+		fmtAPIPercent(totalPremCost, payload.TotalCost),
 	)
+	return b.String()
+}
+
+func syncStatusIcon(code, reason string) string {
+	switch code {
+	case webSyncCodeOK:
+		return "✓"
+	case webSyncCodeSkipped:
+		if reason == webSyncReasonInProgress {
+			return "⏳"
+		}
+		return "–"
+	case webSyncCodeError:
+		return "⚠"
+	case webSyncCodeTimeout:
+		return "⏱"
+	case webSyncCodeStale:
+		return "⚠"
+	default:
+		return "?"
+	}
+}
+
+func renderSyncStatusSummaryLine(payload statsPayload) string {
+	if len(payload.SyncStatus) == 0 {
+		return "Sync: no status"
+	}
+	sources := make([]string, 0, len(payload.SyncStatus))
+	for source := range payload.SyncStatus {
+		sources = append(sources, source)
+	}
+	sort.Strings(sources)
+
+	var b strings.Builder
+	b.WriteString("Sync: ")
+	for i, source := range sources {
+		if i > 0 {
+			b.WriteString(" · ")
+		}
+		status := payload.SyncStatus[source]
+		fmt.Fprintf(&b, "%s %s", html.EscapeString(source), syncStatusIcon(status.Code, status.Reason))
+	}
 	return b.String()
 }
 
@@ -889,7 +1051,10 @@ func renderWebSyncStatusTable(payload statsPayload, hasSnapshot bool) string {
 	}
 	sort.Strings(sources)
 
+	summaryLine := renderSyncStatusSummaryLine(payload)
+
 	var b strings.Builder
+	fmt.Fprintf(&b, `<summary>%s</summary>`, summaryLine)
 	b.WriteString(`<table id="sync-status-table"><thead><tr><th>Source</th><th>Code</th><th>Reason</th><th>Updated</th></tr></thead><tbody>`)
 	for _, source := range sources {
 		status := payload.SyncStatus[source]
@@ -904,6 +1069,92 @@ func renderWebSyncStatusTable(payload statsPayload, hasSnapshot bool) string {
 	return b.String()
 }
 
+func renderWebDailyTokenChart(payload statsPayload, hasSnapshot bool) string {
+	if !hasSnapshot {
+		return "<p>Loading chart…</p>"
+	}
+	days := make([]string, 0, len(payload.Daily))
+	for day := range payload.Daily {
+		days = append(days, day)
+	}
+	sort.Strings(days)
+	if len(days) == 0 {
+		return "<p>No daily data available.</p>"
+	}
+
+	type dayTokens struct {
+		day          string
+		inputTokens  int
+		outputTokens int
+		cachedTokens int
+	}
+	rows := make([]dayTokens, 0, len(days))
+	maxTokens := 0
+	for _, day := range days {
+		dayMap := payload.Daily[day]
+		var dt dayTokens
+		dt.day = day
+		for key, value := range dayMap {
+			if strings.HasPrefix(key, "_") {
+				continue
+			}
+			stats, ok := webDailyStatsValue(value)
+			if !ok {
+				continue
+			}
+			dt.inputTokens += stats.PromptTokens
+			dt.outputTokens += stats.CompletionTokens
+			dt.cachedTokens += stats.CacheReadTokens
+		}
+		if dt.inputTokens > maxTokens {
+			maxTokens = dt.inputTokens
+		}
+		if dt.outputTokens > maxTokens {
+			maxTokens = dt.outputTokens
+		}
+		rows = append(rows, dt)
+	}
+	if maxTokens == 0 {
+		return "<p>No token data available.</p>"
+	}
+
+	var b strings.Builder
+	b.WriteString(`<div class="token-chart">`)
+	for _, dt := range rows {
+		label := dt.day
+		if t, err := time.Parse("2006-01-02", dt.day); err == nil {
+			label = t.Format("Jan 2")
+		}
+		inputPct := float64(dt.inputTokens) / float64(maxTokens) * 100
+		outputPct := float64(dt.outputTokens) / float64(maxTokens) * 100
+		cachedPct := 0.0
+		if dt.inputTokens > 0 {
+			cachedPct = float64(dt.cachedTokens) / float64(dt.inputTokens) * 100
+		}
+		inputTitle := fmt.Sprintf("Input: %s (cached: %s)", fmtTokens(dt.inputTokens), fmtTokens(dt.cachedTokens))
+		outputTitle := fmt.Sprintf("Output: %s", fmtTokens(dt.outputTokens))
+
+		inputLabel := fmtTokens(dt.inputTokens) + " in"
+		outputLabel := fmtTokens(dt.outputTokens) + " out"
+		fmt.Fprintf(&b, `<div class="token-chart-row">`+
+			`<span class="token-chart-label">%s</span>`+
+			`<div class="token-chart-bars">`+
+			`<div class="token-bar-row">`+
+			`<div class="token-bar token-bar-input" style="width: %.1f%%" title="%s">`+
+			`<div class="token-bar-cached" style="width: %.1f%%"></div></div>`+
+			`<span class="token-bar-label">%s</span></div>`+
+			`<div class="token-bar-row">`+
+			`<div class="token-bar token-bar-output" style="width: %.1f%%" title="%s"></div>`+
+			`<span class="token-bar-label">%s</span></div>`+
+			`</div></div>`,
+			html.EscapeString(label), inputPct, html.EscapeString(inputTitle),
+			cachedPct, html.EscapeString(inputLabel),
+			outputPct, html.EscapeString(outputTitle), html.EscapeString(outputLabel))
+	}
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
 func renderWebOverviewSummary(payload statsPayload, hasSnapshot bool) string {
 	if !hasSnapshot {
 		return "Loading stats snapshot…"
@@ -913,20 +1164,25 @@ func renderWebOverviewSummary(payload statsPayload, hasSnapshot bool) string {
 	if payload.DateRange != nil && strings.TrimSpace(*payload.DateRange) != "" {
 		dateRange = fmt.Sprintf(" (%s)", html.EscapeString(*payload.DateRange))
 	}
-	return fmt.Sprintf("Period: %s%s · Log files: %s · API calls: %s · Total cost: %s",
+	apiPct := "–"
+	if payload.TotalCost > 0 {
+		apiPct = fmt.Sprintf("%.0f%%", payload.TotalPremiumRequestCost/payload.TotalCost*100)
+	}
+	return fmt.Sprintf("Period: %s%s · API calls: %s · Cost: %s · API%%: %s",
 		html.EscapeString(payload.Period),
 		dateRange,
-		commaInt(payload.LogFiles),
 		commaInt(payload.APICalls),
-		fmtCost(payload.TotalCost),
+		fmtCost(payload.TotalPremiumRequestCost),
+		apiPct,
 	)
 }
 
 func dashboardOverviewHTML(payload statsPayload, hasSnapshot bool) string {
 	return fmt.Sprintf(`<p id="overview-summary">%s</p>
+  <details id="sync-status-region" class="sync-status-compact">%s</details>
   <section>
-    <h2>Sync status</h2>
-    <div id="sync-status-region">%s</div>
+    <h2>Daily Token Usage</h2>
+    <div id="daily-token-chart-region">%s</div>
   </section>
   <section>
     <h2>Per-model summary</h2>
@@ -942,6 +1198,7 @@ func dashboardOverviewHTML(payload statsPayload, hasSnapshot bool) string {
   </section>`,
 		renderWebOverviewSummary(payload, hasSnapshot),
 		renderWebSyncStatusTable(payload, hasSnapshot),
+		renderWebDailyTokenChart(payload, hasSnapshot),
 		renderWebModelSummaryTable(payload, hasSnapshot),
 		renderWebProjectSummaryTable(payload, hasSnapshot),
 		renderWebDailyTotalsTable(payload, hasSnapshot),
@@ -992,6 +1249,24 @@ func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, re
     tfoot th, tfoot td { background: #f3f4f6; font-weight: 600; }
     #status { color: #b91c1c; margin-bottom: 1rem; }
     #stats-json { display: none; }
+    .sync-status-compact { font-size: 0.82rem; color: #6b7280; margin: 0.3rem 0 0.5rem; }
+    .sync-status-compact summary { cursor: pointer; }
+    .sync-status-compact table { font-size: 0.82rem; margin-top: 0.3rem; }
+    .sync-status-compact th, .sync-status-compact td { padding: 0.2rem 0.4rem; }
+    .expandable-row { cursor: pointer; }
+    .expandable-row:hover { background: #f9fafb; }
+    .daily-model-row td, .project-model-row td { font-size: 0.82rem; color: #6b7280; }
+    .model-indent { padding-left: 1.5rem !important; }
+    .token-chart { margin: 1rem 0; }
+    .token-chart-row { display: flex; align-items: center; gap: 0.5rem; margin: 0.15rem 0; }
+    .token-chart-label { width: 3.5rem; font-size: 0.78rem; text-align: right; color: #6b7280; flex-shrink: 0; }
+    .token-chart-bars { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+    .token-bar { height: 10px; border-radius: 2px; min-width: 2px; position: relative; }
+    .token-bar-input { background: #3b82f6; }
+    .token-bar-cached { background: #93c5fd; height: 100%%; border-radius: 2px; }
+    .token-bar-output { background: #f59e0b; }
+    .token-bar-row { display: flex; align-items: center; gap: 0.4rem; }
+    .token-bar-label { font-size: 0.72rem; color: #6b7280; white-space: nowrap; flex-shrink: 0; }
   </style>
 </head>
 <body data-signals:status-message="''">

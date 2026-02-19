@@ -6,6 +6,7 @@ type aggregatedStats struct {
 	DailyStats        map[string]map[string]*Stats
 	ModelStats        map[string]*Stats
 	ProjectStats      map[string]*Stats
+	ProjectModelStats map[string]map[string]*Stats
 	Records           []Record
 	SessionWorkspaces map[string]string
 	TotalRecords      int
@@ -32,17 +33,18 @@ type syncSourceStatus struct {
 }
 
 type statsPayload struct {
-	Period                  string                            `json:"period"`
-	DateRange               *string                           `json:"date_range"`
-	LogFiles                int                               `json:"log_files"`
-	APICalls                int                               `json:"api_calls"`
-	Models                  map[string]statsPayloadStats      `json:"models"`
-	Daily                   map[string]map[string]interface{} `json:"daily"`
-	Projects                map[string]statsPayloadStats      `json:"projects"`
-	TotalCost               float64                           `json:"total_cost"`
-	TotalCostNoCache        float64                           `json:"total_cost_without_cache"`
-	TotalPremiumRequestCost float64                           `json:"total_premium_request_cost"`
-	SyncStatus              map[string]syncSourceStatus       `json:"sync_status,omitempty"`
+	Period                  string                                  `json:"period"`
+	DateRange               *string                                 `json:"date_range"`
+	LogFiles                int                                     `json:"log_files"`
+	APICalls                int                                     `json:"api_calls"`
+	Models                  map[string]statsPayloadStats            `json:"models"`
+	Daily                   map[string]map[string]interface{}       `json:"daily"`
+	Projects                map[string]statsPayloadStats            `json:"projects"`
+	TotalCost               float64                                 `json:"total_cost"`
+	TotalCostNoCache        float64                                 `json:"total_cost_without_cache"`
+	TotalPremiumRequestCost float64                                 `json:"total_premium_request_cost"`
+	ProjectModels           map[string]map[string]statsPayloadStats `json:"project_models,omitempty"`
+	SyncStatus              map[string]syncSourceStatus             `json:"sync_status,omitempty"`
 }
 
 func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string) statsPayload {
@@ -115,6 +117,7 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 	}
 
 	projCosts := make(map[string][2]float64)
+	projModelCosts := make(map[string]map[string][2]float64)
 	for _, r := range filtered {
 		cwd := ""
 		if r.SessionID != "" {
@@ -131,10 +134,19 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 			CacheCreationTokens: r.CacheCreationTokens,
 			CacheReadTokens:     r.CacheReadTokens,
 		}
+		cost := calcCost(model, rs, r.Timestamp)
+		costNC := calcCostNocache(model, rs, r.Timestamp)
 		c := projCosts[proj]
-		c[0] += calcCost(model, rs, r.Timestamp)
-		c[1] += calcCostNocache(model, rs, r.Timestamp)
+		c[0] += cost
+		c[1] += costNC
 		projCosts[proj] = c
+		if projModelCosts[proj] == nil {
+			projModelCosts[proj] = make(map[string][2]float64)
+		}
+		mc := projModelCosts[proj][model]
+		mc[0] += cost
+		mc[1] += costNC
+		projModelCosts[proj][model] = mc
 	}
 
 	for proj, s := range projectStats {
@@ -150,6 +162,30 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 			InputUncached:       uncachedInput(s),
 			Cost:                roundN(pc[0], 4),
 			CostWithoutCache:    roundN(pc[1], 4),
+		}
+	}
+
+	projectModelStats := aggregated.ProjectModelStats
+	if len(projectModelStats) > 0 {
+		out.ProjectModels = make(map[string]map[string]statsPayloadStats)
+		for proj, models := range projectModelStats {
+			out.ProjectModels[proj] = make(map[string]statsPayloadStats)
+			pmc := projModelCosts[proj]
+			for model, s := range models {
+				mc := pmc[model]
+				out.ProjectModels[proj][model] = statsPayloadStats{
+					APICalls:            s.APICalls,
+					PromptTokens:        s.PromptTokens,
+					CompletionTokens:    s.CompletionTokens,
+					CacheCreationTokens: s.CacheCreationTokens,
+					CacheReadTokens:     s.CacheReadTokens,
+					PremiumRequests:     s.PremiumRequests,
+					PremiumRequestCost:  roundN(s.PremiumRequests*getPremiumRequestCost(""), 4),
+					InputUncached:       uncachedInput(s),
+					Cost:                roundN(mc[0], 4),
+					CostWithoutCache:    roundN(mc[1], 4),
+				}
+			}
 		}
 	}
 
@@ -221,6 +257,28 @@ func buildProjectStatsMap(dbProjectStats map[string]*dbModelStats) map[string]*S
 	return projectStats
 }
 
+func buildProjectModelStatsMap(dbProjectModelStats map[string]map[string]*dbModelStats) map[string]map[string]*Stats {
+	result := make(map[string]map[string]*Stats)
+	for cwd, models := range dbProjectModelStats {
+		proj := "(unknown)"
+		if cwd != "" {
+			proj = projectName(cwd)
+		}
+		if result[proj] == nil {
+			result[proj] = make(map[string]*Stats)
+		}
+		for model, dbs := range models {
+			s := dbStatsToStats(dbs, float64(dbs.UserTurns))
+			if existing, ok := result[proj][model]; ok {
+				mergeStats(existing, s)
+			} else {
+				result[proj][model] = s
+			}
+		}
+	}
+	return result
+}
+
 func countTotalRecords(modelStats map[string]*Stats) int {
 	totalRecords := 0
 	for _, s := range modelStats {
@@ -236,6 +294,7 @@ func loadAggregatedStats(db *sql.DB, dateFrom, dateTo, projectFilter string) agg
 		DailyStats:        dailyStats,
 		ModelStats:        modelStats,
 		ProjectStats:      buildProjectStatsMap(queryProjectStats(db, dateFrom, dateTo, projectFilter)),
+		ProjectModelStats: buildProjectModelStatsMap(queryProjectModelStats(db, dateFrom, dateTo, projectFilter)),
 		Records:           queryRecords(db, dateFrom, dateTo, projectFilter),
 		SessionWorkspaces: querySessionWorkspaces(db),
 		TotalRecords:      countTotalRecords(modelStats),

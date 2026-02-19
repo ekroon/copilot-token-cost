@@ -1011,14 +1011,20 @@ func sampleWebDashboardPayload() statsPayload {
 		Projects: map[string]statsPayloadStats{
 			"token-consumption-copilot": {APICalls: 12, PremiumRequests: 12, Cost: 1.25, PremiumRequestCost: 0.48},
 		},
+		ProjectModels: map[string]map[string]statsPayloadStats{
+			"token-consumption-copilot": {
+				"gpt-5":           {APICalls: 7, PremiumRequests: 7, Cost: 0.9, PremiumRequestCost: 0.28, PromptTokens: 5000, CompletionTokens: 2000},
+				"claude-sonnet-4": {APICalls: 5, PremiumRequests: 5, Cost: 0.35, PremiumRequestCost: 0.2, PromptTokens: 3000, CompletionTokens: 1000},
+			},
+		},
 		Daily: map[string]map[string]interface{}{
 			"2026-02-18": {
-				"gpt-5":                     statsPayloadStats{APICalls: 4, PremiumRequests: 4},
+				"gpt-5":                     statsPayloadStats{APICalls: 4, PremiumRequests: 4, PremiumRequestCost: 0.16, Cost: 0.5, PromptTokens: 2000, CompletionTokens: 800},
 				"_total_cost":               0.5,
 				"_total_cost_without_cache": 0.7,
 			},
 			"2026-02-19": {
-				"claude-sonnet-4":           statsPayloadStats{APICalls: 8, PremiumRequests: 8},
+				"claude-sonnet-4":           statsPayloadStats{APICalls: 8, PremiumRequests: 8, PremiumRequestCost: 0.32, Cost: 0.75, PromptTokens: 6000, CompletionTokens: 2500},
 				"_total_cost":               0.75,
 				"_total_cost_without_cache": 1.1,
 			},
@@ -1037,24 +1043,28 @@ func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 		"id=\"refresh-indicators-region\"",
 		"id=\"overview-summary\"",
 		"id=\"sync-status-region\"",
-		"Sync status",
+		"sync-status-compact",
 		"id=\"sync-status-table\"",
 		"id=\"model-summary-region\"",
 		"Per-model summary",
 		"id=\"model-summary-table\"",
 		"<th>Model</th>",
+		"<th>API%</th>",
 		"gpt-5",
 		"id=\"project-summary-region\"",
 		"Per-project summary",
 		"id=\"project-summary-table\"",
 		"<th>Project</th>",
 		"token-consumption-copilot",
+		"project-model-row",
 		"id=\"daily-totals-region\"",
 		"Daily totals",
 		"id=\"daily-totals-table\"",
 		"<th>Date</th>",
 		"<th>Total</th>",
 		"2026-02-18",
+		"daily-model-row",
+		"model-indent",
 		"id=\"stats-json\"",
 	}
 	for _, needle := range expected {
@@ -1131,15 +1141,16 @@ func TestBuildRefreshPatchPatchesOverviewFragments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRefreshPatch: %v", err)
 	}
-	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 6 {
-		t.Fatalf("patch event count=%d, want=6", got)
+	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 7 {
+		t.Fatalf("patch event count=%d, want=7", got)
 	}
-	if got := strings.Count(patch, "data: mode outer"); got != 6 {
-		t.Fatalf("outer mode count=%d, want=6", got)
+	if got := strings.Count(patch, "data: mode outer"); got != 7 {
+		t.Fatalf("outer mode count=%d, want=7", got)
 	}
 	orderedSelectors := []string{
 		"data: selector #overview-summary",
 		"data: selector #sync-status-region",
+		"data: selector #daily-token-chart-region",
 		"data: selector #model-summary-region",
 		"data: selector #project-summary-region",
 		"data: selector #daily-totals-region",
