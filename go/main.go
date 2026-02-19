@@ -1149,8 +1149,8 @@ func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, e
 	}
 	var pending []codespaceInfo
 	for _, cs := range codespaces {
-		if cs.LastUsedAt != "" && getCodespaceLastUsed(db, cs.Name) == cs.LastUsedAt {
-			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (unchanged lastUsedAt)\n", cs.Name)
+		if cs.State != "Available" && cs.LastUsedAt != "" && getCodespaceLastUsed(db, cs.Name) == cs.LastUsedAt {
+			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (shutdown, unchanged lastUsedAt)\n", cs.Name)
 			continue
 		}
 		pending = append(pending, cs)

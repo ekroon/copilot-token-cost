@@ -314,8 +314,8 @@ func TestSyncCodespacesToDBWithFakeGH(t *testing.T) {
 	}
 
 	second := syncCodespacesToDB(db, false, false)
-	if second != 0 {
-		t.Fatalf("second sync should skip unchanged codespace, got %d", second)
+	if second != 1 {
+		t.Fatalf("second sync re-counts Available codespace (INSERT OR IGNORE dedupes), got %d", second)
 	}
 }
 
@@ -335,6 +335,40 @@ func TestSyncCodespacesToDBIncludeStopped(t *testing.T) {
 	}
 	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs2'") != 1 {
 		t.Fatalf("expected one cs2 record")
+	}
+}
+
+func TestCodespaceSkipHeuristic(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGH(t, binDir, true)
+	withPath(t, binDir)
+	db := initDB(filepath.Join(t.TempDir(), "skip-heuristic.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Seed sync state: both cs1 and cs2 have matching lastUsedAt
+	upsertCodespaceSyncState(db, "cs1", "2026-02-18T00:00:00Z")
+	upsertCodespaceSyncState(db, "cs2", "2026-02-17T00:00:00Z")
+
+	// includeStopped=true so both cs1 (Available) and cs2 (Shutdown) are listed
+	inserted := syncCodespacesToDB(db, true, false)
+
+	// cs1 is Available → must re-sync even though lastUsedAt matches
+	// cs2 is Shutdown with unchanged lastUsedAt → should be skipped
+	if inserted != 1 {
+		t.Fatalf("expected 1 (Available re-synced, Shutdown skipped), got %d", inserted)
+	}
+
+	// Verify cs1 (Available) was synced
+	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs1'") < 1 {
+		t.Fatalf("Available codespace cs1 should have been synced")
+	}
+
+	// Now change cs2's lastUsedAt in sync state to something different
+	upsertCodespaceSyncState(db, "cs2", "2020-01-01T00:00:00Z")
+	inserted2 := syncCodespacesToDB(db, true, false)
+	// cs1 (Available) re-synced (re-counted) + cs2 (Shutdown, changed lastUsedAt) synced = 2
+	if inserted2 != 2 {
+		t.Fatalf("expected 2 (Available re-synced, Shutdown with changed lastUsedAt synced), got %d", inserted2)
 	}
 }
 
