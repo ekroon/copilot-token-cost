@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"os/exec"
@@ -1082,17 +1083,20 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 
 	if shouldStop {
 		defer func() {
+			stopStart := time.Now()
 			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer stopCancel()
 			stopCmd := exec.CommandContext(stopCtx, "gh", "cs", "stop", "-c", cs.Name)
 			stopCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
 			_ = stopCmd.Run()
+			fmt.Fprintf(os.Stderr, "  🛑 Stopping %s... (%.1fs)\n", cs.Name, time.Since(stopStart).Seconds())
 		}()
 	}
 
 	stage := filepath.Join(tmpDir, cs.Name)
 	_ = os.MkdirAll(stage, 0755)
 	fmt.Fprintf(os.Stderr, "  📦 [%d/%d] Copying %s...\n", idx+1, total, cs.Name)
+	cpStart := time.Now()
 	cpCtx, cpCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cpCancel()
 	cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
@@ -1103,7 +1107,7 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 	cpErr := cpCmd.Run()
 	if cpErr != nil {
 		if cpCtx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out\n", cs.Name)
+			fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out after %.1fs\n", cs.Name, time.Since(cpStart).Seconds())
 			return res
 		}
 		msg := strings.TrimSpace(cpErrBuf.String())
@@ -1113,11 +1117,11 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 			if msg == "" {
 				msg = "gh cs cp failed"
 			}
-			fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s\n", cs.Name, msg)
+			fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s (%.1fs)\n", cs.Name, msg, time.Since(cpStart).Seconds())
 		}
 		return res
 	}
-	fmt.Fprintf(os.Stderr, "  ✅ Copied %s\n", cs.Name)
+	fmt.Fprintf(os.Stderr, "  ✅ Copied %s (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
 
 	copilotDir := filepath.Join(stage, ".copilot")
 	if _, err := os.Stat(filepath.Join(copilotDir, "logs")); err != nil {
@@ -1133,10 +1137,42 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 		return res
 	}
 
+	fileCount, totalBytes := dirStats(logsDir)
+	fmt.Fprintf(os.Stderr, "  📊 %s: %d log files, %s copied\n", cs.Name, fileCount, humanSize(totalBytes))
+
 	res.LogsDir = logsDir
 	res.SessionDir = sessionDir
 	res.Copied = true
 	return res
+}
+
+func humanSize(bytes int64) string {
+	switch {
+	case bytes >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(bytes)/float64(1<<30))
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/float64(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+func dirStats(root string) (int, int64) {
+	var count int
+	var total int64
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, e := d.Info(); e == nil {
+			count++
+			total += info.Size()
+		}
+		return nil
+	})
+	return count, total
 }
 
 func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, error) {
