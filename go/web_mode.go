@@ -1683,6 +1683,7 @@ type webDailySpendMetricCard struct {
 
 type webDailySpendData struct {
 	Day                 string
+	WindowDays          int
 	Today               webDailySpendTotals
 	Rolling7DayAverage  webDailySpendAverages
 	TokenTrend          []webDailySpendTokenTrendPoint
@@ -1705,9 +1706,54 @@ func webDailySpendHybridScore(apiSpend float64, inputTokens, outputTokens int) f
 	return 0.7*apiSpend + 0.3*float64(inputTokens+outputTokens)
 }
 
-func buildWebDailySpendData(payload statsPayload, now time.Time) webDailySpendData {
+func webParseDateRangeBounds(dateRange *string) (string, string, bool) {
+	if dateRange == nil {
+		return "", "", false
+	}
+	raw := strings.TrimSpace(*dateRange)
+	if raw == "" {
+		return "", "", false
+	}
+	parts := strings.Split(raw, "→")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	start := strings.TrimSpace(parts[0])
+	end := strings.TrimSpace(parts[1])
+	if _, err := time.Parse("2006-01-02", start); err != nil {
+		return "", "", false
+	}
+	if _, err := time.Parse("2006-01-02", end); err != nil {
+		return "", "", false
+	}
+	if start > end {
+		start, end = end, start
+	}
+	return start, end, true
+}
+
+func webDailySpendWindowDays(payload statsPayload, now time.Time) (string, []string) {
 	day := now.Format("2006-01-02")
 	windowDays := webRecentDayWindow(day, 7)
+	start, end, ok := webParseDateRangeBounds(payload.DateRange)
+	if !ok {
+		return day, windowDays
+	}
+	day = end
+	bounded := make([]string, 0, len(windowDays))
+	for _, windowDay := range webRecentDayWindow(day, 7) {
+		if windowDay >= start {
+			bounded = append(bounded, windowDay)
+		}
+	}
+	if len(bounded) == 0 {
+		return day, []string{day}
+	}
+	return day, bounded
+}
+
+func buildWebDailySpendData(payload statsPayload, now time.Time) webDailySpendData {
+	day, windowDays := webDailySpendWindowDays(payload, now)
 	todayModels := webDailyModelStatsByDay(payload, day)
 	rollingModels := webDailyModelStatsByDays(payload, windowDays)
 	todayProjects := webDailyProjectStatsByDay(payload, day)
@@ -1740,8 +1786,9 @@ func buildWebDailySpendData(payload statsPayload, now time.Time) webDailySpendDa
 		})
 	}
 	return webDailySpendData{
-		Day:   day,
-		Today: todayTotals,
+		Day:        day,
+		WindowDays: len(windowDays),
+		Today:      todayTotals,
 		Rolling7DayAverage: webDailySpendAverages{
 			InputTokens:  float64(rollingTotals.InputTokens) / windowSize,
 			OutputTokens: float64(rollingTotals.OutputTokens) / windowSize,
@@ -2248,9 +2295,39 @@ func renderWebDailySpendRegion(payload statsPayload, hasSnapshot bool, now time.
 		return `<section id="daily-spend-region" class="daily-spend-region"><h2>Today's Spend</h2><p>Loading today's totals…</p></section>`
 	}
 	data := buildWebDailySpendData(payload, now)
+	nowDay := now.Format("2006-01-02")
+	isToday := data.Day == nowDay
+	sectionTitle := "Today's Spend"
+	daySummaryTitle := "Today summary"
+	windowSummaryTitle := "Weekly average (rolling 7 days including today)"
+	topProjectsDayTitle := "Top projects today"
+	topProjectsWindowTitle := "Top projects this week"
+	topModelsDayTitle := "Top models today"
+	topModelsWindowTitle := "Top models this week"
+	emptyStateMessage := "No usage recorded yet for today."
+	if !isToday {
+		sectionTitle = "Daily Spend"
+		daySummaryTitle = "Selected-day summary"
+		topProjectsDayTitle = "Top projects on selected day"
+		topModelsDayTitle = "Top models on selected day"
+		emptyStateMessage = "No usage recorded for the selected day."
+	}
+	if data.WindowDays != 7 || !isToday {
+		windowUnit := "days"
+		if data.WindowDays == 1 {
+			windowUnit = "day"
+		}
+		windowAnchor := "selected day"
+		if isToday {
+			windowAnchor = "today"
+		}
+		windowSummaryTitle = fmt.Sprintf("Rolling average (%d %s including %s)", data.WindowDays, windowUnit, windowAnchor)
+		topProjectsWindowTitle = "Top projects in rolling window"
+		topModelsWindowTitle = "Top models in rolling window"
+	}
 	emptyState := ""
 	if len(webDailyModelStatsByDay(payload, data.Day)) == 0 {
-		emptyState = `<p class="daily-spend-note">No usage recorded yet for today.</p>`
+		emptyState = `<p class="daily-spend-note">` + html.EscapeString(emptyStateMessage) + `</p>`
 	}
 	todayCards := renderWebDailySpendMetricCards([]webDailySpendMetricCard{
 		{ID: "daily-spend-tokens", Label: "Input tokens", Value: fmtTokens(data.Today.InputTokens)},
@@ -2266,30 +2343,37 @@ func renderWebDailySpendRegion(payload statsPayload, hasSnapshot bool, now time.
 	})
 
 	return fmt.Sprintf(`<section id="daily-spend-region" class="daily-spend-region">
-  <h2>Today's Spend</h2>
+  <h2>%s</h2>
   <p class="daily-spend-date">%s</p>
   <div class="daily-spend-top-panels">
-    <section id="daily-spend-today-summary" class="daily-spend-section daily-spend-top-panel"><h3>Today summary</h3>%s</section>
-    <section id="daily-spend-weekly-average" class="daily-spend-section daily-spend-top-panel"><h3>Weekly average (rolling 7 days including today)</h3>%s</section>
+    <section id="daily-spend-today-summary" class="daily-spend-section daily-spend-top-panel"><h3>%s</h3>%s</section>
+    <section id="daily-spend-weekly-average" class="daily-spend-section daily-spend-top-panel"><h3>%s</h3>%s</section>
   </div>
   <div class="daily-spend-trend-panels">
     <section id="daily-spend-token-trend-section" class="daily-spend-section"><h3>Token trend</h3>%s</section>
     <section id="daily-spend-money-trend-section" class="daily-spend-section"><h3>Money trend</h3>%s</section>
   </div>
-  <section id="daily-spend-top-projects-today-section" class="daily-spend-section"><h3>Top projects today</h3>%s</section>
-  <section id="daily-spend-top-projects-week-section" class="daily-spend-section"><h3>Top projects this week</h3>%s</section>
-  <section id="daily-spend-top-models-today-section" class="daily-spend-section"><h3>Top models today</h3>%s</section>
-  <section id="daily-spend-top-models-week-section" class="daily-spend-section"><h3>Top models this week</h3>%s</section>
+  <section id="daily-spend-top-projects-today-section" class="daily-spend-section"><h3>%s</h3>%s</section>
+  <section id="daily-spend-top-projects-week-section" class="daily-spend-section"><h3>%s</h3>%s</section>
+  <section id="daily-spend-top-models-today-section" class="daily-spend-section"><h3>%s</h3>%s</section>
+  <section id="daily-spend-top-models-week-section" class="daily-spend-section"><h3>%s</h3>%s</section>
   %s
 </section>`,
+		html.EscapeString(sectionTitle),
 		html.EscapeString(data.Day),
+		html.EscapeString(daySummaryTitle),
 		todayCards,
+		html.EscapeString(windowSummaryTitle),
 		weeklyCards,
 		renderWebDailySpendTokenTrendTable("daily-spend-token-trend", data.TokenTrend),
 		renderWebDailySpendMoneyTrendTable("daily-spend-money-trend", data.MoneyTrend),
+		html.EscapeString(topProjectsDayTitle),
 		renderWebDailySpendTopListTable("daily-spend-top-projects-today", data.TopProjectsToday),
+		html.EscapeString(topProjectsWindowTitle),
 		renderWebDailySpendTopListTable("daily-spend-top-projects-week", data.TopProjectsRolling7),
+		html.EscapeString(topModelsDayTitle),
 		renderWebDailySpendTopListTable("daily-spend-top-models-today", data.TopModelsToday),
+		html.EscapeString(topModelsWindowTitle),
 		renderWebDailySpendTopListTable("daily-spend-top-models-week", data.TopModelsRolling7),
 		emptyState,
 	)

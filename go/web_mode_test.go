@@ -1378,6 +1378,73 @@ func TestBuildWebDailySpendDataShapesTodayRollingTrendsAndTopRows(t *testing.T) 
 	}
 }
 
+func TestBuildWebDailySpendDataUsesDateRangeEndForHistoricalWindows(t *testing.T) {
+	dateRange := "2026-02-10 → 2026-02-12"
+	payload := statsPayload{
+		DateRange: &dateRange,
+		Daily: map[string]map[string]interface{}{
+			"2026-02-10": {
+				"model-a": statsPayloadStats{PromptTokens: 10, CompletionTokens: 1, PremiumRequestCost: 0.10, Cost: 0.20},
+			},
+			"2026-02-11": {
+				"model-a": statsPayloadStats{PromptTokens: 20, CompletionTokens: 2, PremiumRequestCost: 0.20, Cost: 0.40},
+			},
+			"2026-02-12": {
+				"model-a": statsPayloadStats{PromptTokens: 30, CompletionTokens: 3, PremiumRequestCost: 0.30, Cost: 0.60},
+			},
+		},
+	}
+
+	data := buildWebDailySpendData(payload, time.Date(2026, time.February, 20, 12, 0, 0, 0, time.UTC))
+	if data.Day != "2026-02-12" {
+		t.Fatalf("day=%q, want=2026-02-12", data.Day)
+	}
+	if data.WindowDays != 3 {
+		t.Fatalf("window_days=%d, want=3", data.WindowDays)
+	}
+	if len(data.TokenTrend) != 3 || data.TokenTrend[0].Day != "2026-02-10" || data.TokenTrend[2].Day != "2026-02-12" {
+		t.Fatalf("token trend window=%v, want 2026-02-10..2026-02-12", data.TokenTrend)
+	}
+	if data.Today.InputTokens != 30 || data.Today.OutputTokens != 3 {
+		t.Fatalf("today tokens=%d/%d, want=30/3", data.Today.InputTokens, data.Today.OutputTokens)
+	}
+	assertFloatEqual(t, data.Rolling7DayAverage.InputTokens, 60.0/3.0)
+	assertFloatEqual(t, data.Rolling7DayAverage.OutputTokens, 6.0/3.0)
+	assertFloatEqual(t, data.Rolling7DayAverage.PremiumSpend, 0.60/3.0)
+	assertFloatEqual(t, data.Rolling7DayAverage.APISpend, 1.20/3.0)
+}
+
+func TestRenderWebDailySpendRegionUsesSelectedDayLabelsForHistoricalRange(t *testing.T) {
+	dateRange := "2026-02-10 → 2026-02-12"
+	payload := statsPayload{
+		DateRange: &dateRange,
+		Daily: map[string]map[string]interface{}{
+			"2026-02-11": {
+				"model-a": statsPayloadStats{PromptTokens: 10, CompletionTokens: 1, PremiumRequestCost: 0.10, Cost: 0.20},
+			},
+		},
+	}
+
+	body := renderWebDailySpendRegion(payload, true, time.Date(2026, time.February, 20, 12, 0, 0, 0, time.UTC))
+	for _, needle := range []string{
+		"<h2>Daily Spend</h2>",
+		"Selected-day summary",
+		"Rolling average (3 days including selected day)",
+		"Top projects on selected day",
+		"Top projects in rolling window",
+		"Top models on selected day",
+		"Top models in rolling window",
+		"No usage recorded for the selected day.",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("daily spend body missing %q", needle)
+		}
+	}
+	if strings.Contains(body, "No usage recorded yet for today.") {
+		t.Fatalf("daily spend body should not use today empty-state text for historical range")
+	}
+}
+
 func TestWebDailySpendTopRowsRankByHybridScore(t *testing.T) {
 	assertFloatEqual(t, webDailySpendHybridScore(10, 100, 50), 52)
 
