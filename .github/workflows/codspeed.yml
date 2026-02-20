@@ -26,7 +26,7 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           token: ${{ secrets.CODSPEED_TOKEN }}
-          mode: simulation
+          mode: walltime
           run: cd go && go test -bench '^BenchmarkParseLogFileSynthetic$' -benchtime=30x -count=1
       - name: Run benchmarks without CodSpeed upload
         if: ${{ steps.codspeed.outcome == 'failure' }}
