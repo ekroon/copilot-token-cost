@@ -24,4 +24,4 @@ jobs:
         uses: CodSpeedHQ/action@v4
         with:
           mode: walltime
-          run: cd go && go test -run '^$' -bench '^BenchmarkParseLogFileSynthetic$' -benchtime=30x -count=1
+          run: cd go && go test -bench '^BenchmarkParseLogFileSynthetic$' -benchtime=30x -count=1
