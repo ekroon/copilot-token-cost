@@ -134,6 +134,7 @@ CodSpeed CI benchmark (authoritative performance gate):
 # Workflow: .github/workflows/codspeed.yml
 cd go && go test -bench '^BenchmarkParseLogFileSynthetic$' -benchtime=30x -count=1
 ```
+To upload results to CodSpeed from GitHub Actions, set repository secret `CODSPEED_TOKEN`.
 
 Optional local parser regression ratio check:
 ```bash
