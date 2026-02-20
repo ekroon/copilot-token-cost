@@ -21,12 +21,13 @@ jobs:
         with:
           go-version-file: go/go.mod
       - name: Run benchmarks with CodSpeed
-        if: ${{ secrets.CODSPEED_TOKEN != '' }}
+        id: codspeed
+        continue-on-error: true
         uses: CodSpeedHQ/action@v4
         with:
           token: ${{ secrets.CODSPEED_TOKEN }}
           mode: walltime
           run: cd go && go test -bench '^BenchmarkParseLogFileSynthetic$' -benchtime=30x -count=1
       - name: Run benchmarks without CodSpeed upload
-        if: ${{ secrets.CODSPEED_TOKEN == '' }}
+        if: ${{ steps.codspeed.outcome == 'failure' }}
         run: cd go && go test -bench '^BenchmarkParseLogFileSynthetic$' -benchtime=30x -count=1
