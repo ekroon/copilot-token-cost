@@ -129,7 +129,13 @@ Use `--sync` to force a full re-parse of all log files (useful after updates):
 
 ## Performance Checks
 
-Parser benchmark regression check:
+CodSpeed CI benchmark (authoritative performance gate):
+```bash
+# Workflow: .github/workflows/codspeed.yml
+cd go && go test -run '^$' -bench '^BenchmarkParseLogFileSynthetic$' -benchtime=30x -count=1
+```
+
+Optional local parser regression ratio check:
 ```bash
 ./scripts/check-performance.sh
 ```
