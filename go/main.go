@@ -108,15 +108,17 @@ var (
 	reReasonEffort   = regexp.MustCompile(`:defaultReasoningEffort=\w+`)
 	reDateStamp      = regexp.MustCompile(`-\d{4}-\d{2}-\d{2}$`)
 	reTimestamp      = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})`)
-	reSession        = regexp.MustCompile(`(?:Workspace initialized|Created ACP session|Flushed \d+ events to session)[: ]+([0-9a-f-]{36})`)
-	reInitiator      = regexp.MustCompile(`PremiumRequestProcessor: Setting X-Initiator to '(\w+)'`)
+	reSession        = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^"]*(?:Workspace initialized|Created ACP session|Flushed \d+ events to session)[: ]+([0-9a-f-]{36})\b`)
+	reInitiator      = regexp.MustCompile(`PremiumRequestProcessor: Setting X-Initiator to '([^']*)'`)
 	reModelJSON      = regexp.MustCompile(`"model"\s*:\s*"([^"]+)"`)
 	rePromptTokens   = regexp.MustCompile(`"prompt_tokens"\s*:\s*(\d+)`)
 	reCompTokens     = regexp.MustCompile(`"completion_tokens"\s*:\s*(\d+)`)
 	reCacheCreation  = regexp.MustCompile(`"cache_creation_input_tokens"\s*:\s*(\d+)`)
 	reCacheRead      = regexp.MustCompile(`"cache_read_input_tokens"\s*:\s*(\d+)`)
 	reCachedTokens   = regexp.MustCompile(`"cached_tokens"\s*:\s*(\d+)`)
+	reStatementLine  = regexp.MustCompile(`"statement"\s*:\s*("(?:\\.|[^"\\])*")\s*,?\s*$`)
 	reCwd            = regexp.MustCompile(`cwd:\s*(.+)`)
+	reBranch         = regexp.MustCompile(`branch:\s*(.+)`)
 	reICloudObsidian = regexp.MustCompile(`~/Library/Mobile Documents/iCloud~md~obsidian/Documents/`)
 )
 
@@ -161,12 +163,28 @@ func getPremiumMultiplier(model string, timestamp string) float64 {
 	return 1
 }
 
+func isUserInitiator(initiator string) bool {
+	return strings.EqualFold(strings.TrimSpace(initiator), "user")
+}
+
+func promptTextForStorage(promptText *string) sql.NullString {
+	if promptText == nil {
+		return sql.NullString{}
+	}
+	trimmed := strings.TrimSpace(*promptText)
+	if trimmed == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: trimmed, Valid: true}
+}
+
 // ─── Record & Stats ─────────────────────────────────────────────────────────
 
 type Record struct {
 	Model               string
 	PromptTokens        int
 	CompletionTokens    int
+	PromptText          *string
 	CacheCreationTokens int
 	CacheReadTokens     int
 	IsUserTurn          bool
@@ -178,6 +196,7 @@ type Record struct {
 
 type Stats struct {
 	APICalls            int     `json:"api_calls"`
+	UserTurns           int     `json:"user_turns,omitempty"`
 	PromptTokens        int     `json:"prompt_tokens"`
 	CompletionTokens    int     `json:"completion_tokens"`
 	CacheCreationTokens int     `json:"cache_creation_tokens"`
@@ -194,6 +213,7 @@ func (s *Stats) add(r Record, model string) {
 	s.CacheCreationTokens += r.CacheCreationTokens
 	s.CacheReadTokens += r.CacheReadTokens
 	if r.IsUserTurn {
+		s.UserTurns++
 		s.PremiumRequests += getPremiumMultiplier(model, r.Timestamp)
 	}
 }
@@ -227,6 +247,7 @@ func parseLogContent(content, logPath, minTimestamp, maxTimestamp string) []Reco
 	lastModel := "unknown"
 	var lastTimestamp, lastSession string
 	lastInitiator := "agent"
+	var lastPromptText *string
 
 	for i, line := range lines {
 		if len(line) >= 19 &&
@@ -241,7 +262,7 @@ func parseLogContent(content, logPath, minTimestamp, maxTimestamp string) []Reco
 		}
 		if strings.Contains(line, "PremiumRequestProcessor: Setting X-Initiator") {
 			if m := reInitiator.FindStringSubmatch(line); m != nil {
-				lastInitiator = m[1]
+				lastInitiator = strings.TrimSpace(m[1])
 			}
 		}
 		if strings.Contains(line, `"model"`) {
@@ -251,6 +272,11 @@ func parseLogContent(content, logPath, minTimestamp, maxTimestamp string) []Reco
 					lastModel = candidate
 				}
 			}
+		}
+		if prompt := extractPromptTextFromLine(line); prompt != nil {
+			lastPromptText = prompt
+		} else if prompt := extractPromptTextFromProblemStatementLine(lines, i); prompt != nil {
+			lastPromptText = prompt
 		}
 
 		if !strings.Contains(line, `"completion_tokens"`) {
@@ -341,14 +367,19 @@ func parseLogContent(content, logPath, minTimestamp, maxTimestamp string) []Reco
 
 		promptTokens, _ := strconv.Atoi(promptMatch[1])
 		completionTokens, _ := strconv.Atoi(compMatch[1])
+		promptText := extractPromptTextNearLine(lines, i)
+		if promptText == nil {
+			promptText = lastPromptText
+		}
 
 		records = append(records, Record{
 			Model:               lastModel,
 			PromptTokens:        promptTokens,
 			CompletionTokens:    completionTokens,
+			PromptText:          promptText,
 			CacheCreationTokens: cacheCreation,
 			CacheReadTokens:     cacheReadVal,
-			IsUserTurn:          lastInitiator == "user",
+			IsUserTurn:          isUserInitiator(lastInitiator),
 			Timestamp:           lastTimestamp,
 			SessionID:           lastSession,
 			LogFile:             filepath.Base(logPath),
@@ -356,6 +387,252 @@ func parseLogContent(content, logPath, minTimestamp, maxTimestamp string) []Reco
 		lastInitiator = "agent"
 	}
 	return records
+}
+
+func extractPromptTextNearLine(lines []string, center int) *string {
+	start := center - 20
+	if start < 0 {
+		start = 0
+	}
+	end := center + 6
+	if end > len(lines) {
+		end = len(lines)
+	}
+	for i := center; i >= start; i-- {
+		if prompt := extractPromptTextFromLine(lines[i]); prompt != nil {
+			return prompt
+		}
+		if prompt := extractPromptTextFromProblemStatementLine(lines, i); prompt != nil {
+			return prompt
+		}
+	}
+	for i := center + 1; i < end; i++ {
+		if prompt := extractPromptTextFromLine(lines[i]); prompt != nil {
+			return prompt
+		}
+		if prompt := extractPromptTextFromProblemStatementLine(lines, i); prompt != nil {
+			return prompt
+		}
+	}
+	return nil
+}
+
+func extractPromptTextFromLine(line string) *string {
+	if !containsPromptIndicator(line) {
+		return nil
+	}
+	if prompt := extractPromptTextFromJSONLine(line); prompt != nil {
+		return prompt
+	}
+	if strings.Contains(line, `\"`) {
+		unescaped := strings.ReplaceAll(line, `\"`, `"`)
+		return extractPromptTextFromJSONLine(unescaped)
+	}
+	return nil
+}
+
+func containsPromptIndicator(line string) bool {
+	for _, indicator := range []string{
+		`"user"`,
+		`\"user\"`,
+		`"messages"`,
+		`\"messages\"`,
+		`"prompt"`,
+		`"statement"`,
+		`\"statement\"`,
+	} {
+		if strings.Contains(line, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractPromptTextFromJSONLine(line string) *string {
+	trimmed := strings.TrimSpace(line)
+	candidates := []string{trimmed}
+	if start := strings.IndexByte(trimmed, '{'); start >= 0 {
+		if end := strings.LastIndexByte(trimmed, '}'); end > start {
+			candidates = append(candidates, trimmed[start:end+1])
+		}
+	}
+	for _, candidate := range candidates {
+		var payload interface{}
+		if err := json.Unmarshal([]byte(candidate), &payload); err != nil {
+			continue
+		}
+		if prompt := extractPromptTextFromPayload(payload); prompt != nil {
+			return prompt
+		}
+	}
+	return nil
+}
+
+func extractPromptTextFromStatementLine(line string) *string {
+	matches := reStatementLine.FindStringSubmatch(line)
+	if matches == nil {
+		return nil
+	}
+	unquoted, err := strconv.Unquote(matches[1])
+	if err != nil {
+		return nil
+	}
+	return promptTextPtr(unquoted)
+}
+
+func extractPromptTextFromProblemStatementLine(lines []string, index int) *string {
+	prompt := extractPromptTextFromStatementLine(lines[index])
+	if prompt == nil {
+		return nil
+	}
+	start := index - 6
+	if start < 0 {
+		start = 0
+	}
+	for i := index - 1; i >= start; i-- {
+		if strings.Contains(lines[i], `"problem"`) || strings.Contains(lines[i], `\"problem\"`) {
+			return prompt
+		}
+	}
+	return nil
+}
+
+func extractPromptTextFromPayload(payload interface{}) *string {
+	switch v := payload.(type) {
+	case map[string]interface{}:
+		if hasUserContext(v) {
+			if prompt := promptTextFromContent(v["content"]); prompt != nil {
+				return prompt
+			}
+			if prompt := promptTextFromContent(v["text"]); prompt != nil {
+				return prompt
+			}
+			if prompt := promptTextFromContent(v["prompt"]); prompt != nil {
+				return prompt
+			}
+			if prompt := promptTextFromContent(v["statement"]); prompt != nil {
+				return prompt
+			}
+		}
+		if prompt := promptTextFromContent(v["user_prompt"]); prompt != nil {
+			return prompt
+		}
+		if prompt := promptTextFromContent(v["prompt_text"]); prompt != nil {
+			return prompt
+		}
+		if prompt := promptTextFromContent(v["problem"]); prompt != nil {
+			return prompt
+		}
+		for _, child := range v {
+			if prompt := extractPromptTextFromPayload(child); prompt != nil {
+				return prompt
+			}
+		}
+	case []interface{}:
+		for _, child := range v {
+			if prompt := extractPromptTextFromPayload(child); prompt != nil {
+				return prompt
+			}
+		}
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return nil
+		}
+		if (strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}")) ||
+			(strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]")) {
+			var nested interface{}
+			if err := json.Unmarshal([]byte(trimmed), &nested); err == nil {
+				return extractPromptTextFromPayload(nested)
+			}
+		}
+	}
+	return nil
+}
+
+func hasUserContext(v map[string]interface{}) bool {
+	for _, key := range []string{"role", "author", "speaker", "initiator", "sender", "actor", "origin", "from", "kind", "type"} {
+		if label, ok := v[key].(string); ok && isUserLabel(label) {
+			return true
+		}
+	}
+	for _, key := range []string{"is_user", "isUser"} {
+		if isUser, ok := v[key].(bool); ok && isUser {
+			return true
+		}
+	}
+	return false
+}
+
+func isUserLabel(label string) bool {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "user", "human", "end-user", "end_user":
+		return true
+	default:
+		return false
+	}
+}
+
+func promptTextFromContent(content interface{}) *string {
+	switch v := content.(type) {
+	case string:
+		return promptTextPtr(v)
+	case []interface{}:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if part := promptTextPart(item); part != "" {
+				parts = append(parts, part)
+			}
+		}
+		if len(parts) == 0 {
+			return nil
+		}
+		return promptTextPtr(strings.Join(parts, "\n"))
+	case map[string]interface{}:
+		if prompt := promptTextFromContent(v["text"]); prompt != nil {
+			return prompt
+		}
+		if prompt := promptTextFromContent(v["input_text"]); prompt != nil {
+			return prompt
+		}
+		if prompt := promptTextFromContent(v["statement"]); prompt != nil {
+			return prompt
+		}
+		if prompt := promptTextFromContent(v["content"]); prompt != nil {
+			return prompt
+		}
+	}
+	return nil
+}
+
+func promptTextPart(item interface{}) string {
+	switch v := item.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case map[string]interface{}:
+		if text, ok := v["text"].(string); ok {
+			return strings.TrimSpace(text)
+		}
+		if text, ok := v["input_text"].(string); ok {
+			return strings.TrimSpace(text)
+		}
+		if text, ok := v["statement"].(string); ok {
+			return strings.TrimSpace(text)
+		}
+		if content, ok := v["content"].(string); ok {
+			return strings.TrimSpace(content)
+		}
+	}
+	return ""
+}
+
+func promptTextPtr(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	text := trimmed
+	return &text
 }
 
 func readLogContentForRange(logPath, minTimestamp, maxTimestamp string) (string, bool, error) {
@@ -390,8 +667,13 @@ func readLogContentForRange(logPath, minTimestamp, maxTimestamp string) (string,
 	return string(data), true, nil
 }
 
-func loadSessionWorkspaces(sessionDir string) map[string]string {
-	workspaces := make(map[string]string)
+type workspaceMeta struct {
+	CWD    string
+	Branch string
+}
+
+func loadSessionWorkspaces(sessionDir string) map[string]workspaceMeta {
+	workspaces := make(map[string]workspaceMeta)
 	entries, err := os.ReadDir(sessionDir)
 	if err != nil {
 		return workspaces
@@ -405,9 +687,16 @@ func loadSessionWorkspaces(sessionDir string) map[string]string {
 		if err != nil {
 			continue
 		}
-		if m := reCwd.FindStringSubmatch(string(data)); m != nil {
-			workspaces[entry.Name()] = strings.TrimSpace(m[1])
+		content := string(data)
+		m := reCwd.FindStringSubmatch(content)
+		if m == nil {
+			continue
 		}
+		meta := workspaceMeta{CWD: strings.TrimSpace(m[1])}
+		if m := reBranch.FindStringSubmatch(content); m != nil {
+			meta.Branch = strings.TrimSpace(m[1])
+		}
+		workspaces[entry.Name()] = meta
 	}
 	return workspaces
 }
@@ -421,6 +710,7 @@ CREATE TABLE IF NOT EXISTS api_calls (
     model_normalized TEXT NOT NULL,
     prompt_tokens INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,
+    prompt_text TEXT,
     cache_creation_tokens INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
     is_user_turn INTEGER DEFAULT 0,
@@ -444,6 +734,7 @@ CREATE TABLE IF NOT EXISTS session_workspaces (
     session_id TEXT NOT NULL,
     cwd TEXT NOT NULL,
     source TEXT DEFAULT 'local',
+    branch TEXT,
     PRIMARY KEY (session_id, source)
 );
 
@@ -487,32 +778,95 @@ func initDB(dbPath string) *sql.DB {
 		fmt.Fprintf(os.Stderr, "Error creating schema: %v\n", err)
 		os.Exit(1)
 	}
+	migrateAPICallsSchema(db)
 	migrateSessionWorkspacesSchema(db)
 	return db
 }
 
+func migrateAPICallsSchema(db *sql.DB) {
+	cols := apiCallColumns(db, "main")
+	if !cols["prompt_text"] {
+		_, _ = db.Exec("ALTER TABLE api_calls ADD COLUMN prompt_text TEXT")
+	}
+	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_api_calls_prompt_text ON api_calls(prompt_text)")
+}
+
 func migrateSessionWorkspacesSchema(db *sql.DB) {
+	cols := sessionWorkspaceColumns(db, "main")
 	var pkCols sql.NullString
 	_ = db.QueryRow(
 		"SELECT group_concat(name, ',') FROM (" +
 			"SELECT name FROM pragma_table_info('session_workspaces') WHERE pk > 0 ORDER BY pk" +
 			")",
 	).Scan(&pkCols)
-	if pkCols.Valid && pkCols.String == "session_id,source" {
-		return
-	}
-	_, _ = db.Exec(`
-ALTER TABLE session_workspaces RENAME TO session_workspaces_old;
-CREATE TABLE session_workspaces (
+	if !pkCols.Valid || pkCols.String != "session_id,source" {
+		sourceExpr := "'local'"
+		if cols["source"] {
+			sourceExpr = "COALESCE(source, 'local')"
+		}
+		branchExpr := "NULL"
+		if cols["branch"] {
+			branchExpr = "branch"
+		}
+		_, _ = db.Exec("ALTER TABLE session_workspaces RENAME TO session_workspaces_old")
+		_, _ = db.Exec(`CREATE TABLE session_workspaces (
     session_id TEXT NOT NULL,
     cwd TEXT NOT NULL,
     source TEXT DEFAULT 'local',
+    branch TEXT,
     PRIMARY KEY (session_id, source)
-);
-INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source)
-SELECT session_id, cwd, COALESCE(source, 'local') FROM session_workspaces_old;
-DROP TABLE session_workspaces_old;
-`)
+)`)
+		_, _ = db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source, branch) SELECT session_id, cwd, " + sourceExpr + ", " + branchExpr + " FROM session_workspaces_old")
+		_, _ = db.Exec("DROP TABLE session_workspaces_old")
+		cols = sessionWorkspaceColumns(db, "main")
+	}
+	if !cols["branch"] {
+		_, _ = db.Exec("ALTER TABLE session_workspaces ADD COLUMN branch TEXT")
+	}
+}
+
+func sessionWorkspaceColumns(db *sql.DB, schema string) map[string]bool {
+	cols := make(map[string]bool)
+	pragma := "PRAGMA table_info(session_workspaces)"
+	if schema != "" {
+		pragma = fmt.Sprintf("PRAGMA %s.table_info(session_workspaces)", schema)
+	}
+	rows, err := db.Query(pragma)
+	if err != nil {
+		return cols
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err == nil {
+			cols[name] = true
+		}
+	}
+	return cols
+}
+
+func apiCallColumns(db *sql.DB, schema string) map[string]bool {
+	cols := make(map[string]bool)
+	pragma := "PRAGMA table_info(api_calls)"
+	if schema != "" {
+		pragma = fmt.Sprintf("PRAGMA %s.table_info(api_calls)", schema)
+	}
+	rows, err := db.Query(pragma)
+	if err != nil {
+		return cols
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err == nil {
+			cols[name] = true
+		}
+	}
+	return cols
 }
 
 func isLogParsed(db *sql.DB, logFile string, mtime float64, source string) bool {
@@ -538,9 +892,9 @@ func insertRecords(db *sql.DB, records []Record, source string) {
 	stmt, err := tx.Prepare(
 		"INSERT OR IGNORE INTO api_calls " +
 			"(model, model_normalized, prompt_tokens, completion_tokens, " +
-			"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
+			"prompt_text, cache_creation_tokens, cache_read_tokens, is_user_turn, " +
 			"timestamp, session_id, log_file, source) " +
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		tx.Rollback()
 		return
@@ -551,16 +905,21 @@ func insertRecords(db *sql.DB, records []Record, source string) {
 		if r.IsUserTurn {
 			isUT = 1
 		}
+		promptText := promptTextForStorage(r.PromptText)
 		stmt.Exec(r.Model, normalizeModel(r.Model), r.PromptTokens, r.CompletionTokens,
-			r.CacheCreationTokens, r.CacheReadTokens, isUT,
+			promptText, r.CacheCreationTokens, r.CacheReadTokens, isUT,
 			r.Timestamp, r.SessionID, r.LogFile, source)
 	}
 	tx.Commit()
 }
 
-func upsertSessionWorkspace(db *sql.DB, sessionID, cwd, source string) {
-	db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source) VALUES (?, ?, ?)",
-		sessionID, cwd, source)
+func upsertSessionWorkspace(db *sql.DB, sessionID, cwd, branch, source string) {
+	var branchValue interface{}
+	if strings.TrimSpace(branch) != "" {
+		branchValue = branch
+	}
+	db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source, branch) VALUES (?, ?, ?, ?)",
+		sessionID, cwd, source, branchValue)
 }
 
 func clearSource(db *sql.DB, source string) {
@@ -764,17 +1123,26 @@ func queryRecords(db *sql.DB, dateFrom, dateTo, projectFilter string) []Record {
 	return records
 }
 
-func querySessionWorkspaces(db *sql.DB) map[string]string {
-	rows, err := db.Query("SELECT session_id, cwd, source FROM session_workspaces")
+func querySessionWorkspaces(db *sql.DB) map[string]workspaceMeta {
+	branchExpr := "NULL"
+	if sessionWorkspaceColumns(db, "")["branch"] {
+		branchExpr = "branch"
+	}
+	rows, err := db.Query("SELECT session_id, cwd, source, " + branchExpr + " FROM session_workspaces")
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
-	result := make(map[string]string)
+	result := make(map[string]workspaceMeta)
 	for rows.Next() {
 		var sid, cwd, source string
-		rows.Scan(&sid, &cwd, &source)
-		result[source+"\x1f"+sid] = cwd
+		var branch sql.NullString
+		rows.Scan(&sid, &cwd, &source, &branch)
+		meta := workspaceMeta{CWD: cwd}
+		if branch.Valid {
+			meta.Branch = branch.String
+		}
+		result[source+"\x1f"+sid] = meta
 	}
 	return result
 }
@@ -797,22 +1165,31 @@ func exportJSONL(db *sql.DB, outputPath string) {
 	w := bufio.NewWriter(f)
 	defer w.Flush()
 
+	apiCols := apiCallColumns(db, "main")
+	promptTextExpr := "NULL"
+	if apiCols["prompt_text"] {
+		promptTextExpr = "prompt_text"
+	}
 	rows, _ := db.Query("SELECT model, model_normalized, prompt_tokens, completion_tokens, " +
 		"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
-		"timestamp, session_id, log_file, source FROM api_calls")
+		"timestamp, session_id, log_file, source, " + promptTextExpr + " FROM api_calls")
 	if rows != nil {
 		defer rows.Close()
 		for rows.Next() {
 			var model, modelNorm, source string
 			var pt, ct, cct, crt, isUT int
-			var ts, sid, lf sql.NullString
-			rows.Scan(&model, &modelNorm, &pt, &ct, &cct, &crt, &isUT, &ts, &sid, &lf, &source)
+			var ts, sid, lf, promptText sql.NullString
+			rows.Scan(&model, &modelNorm, &pt, &ct, &cct, &crt, &isUT, &ts, &sid, &lf, &source, &promptText)
+			promptTextValue := interface{}(nil)
+			if promptText.Valid {
+				promptTextValue = promptText.String
+			}
 			rec := map[string]interface{}{
 				"type": "api_call", "model": model, "model_normalized": modelNorm,
 				"prompt_tokens": pt, "completion_tokens": ct,
 				"cache_creation_tokens": cct, "cache_read_tokens": crt,
 				"is_user_turn": isUT, "timestamp": ts.String,
-				"session_id": sid.String, "log_file": lf.String, "source": source,
+				"session_id": sid.String, "log_file": lf.String, "source": source, "prompt_text": promptTextValue,
 			}
 			b, _ := json.Marshal(rec)
 			w.Write(b)
@@ -820,14 +1197,19 @@ func exportJSONL(db *sql.DB, outputPath string) {
 		}
 	}
 
-	rows2, _ := db.Query("SELECT session_id, cwd, source FROM session_workspaces")
+	rows2, _ := db.Query("SELECT session_id, cwd, source, branch FROM session_workspaces")
 	if rows2 != nil {
 		defer rows2.Close()
 		for rows2.Next() {
 			var sid, cwd, source string
-			rows2.Scan(&sid, &cwd, &source)
+			var branch sql.NullString
+			rows2.Scan(&sid, &cwd, &source, &branch)
+			branchValue := interface{}(nil)
+			if branch.Valid {
+				branchValue = branch.String
+			}
 			rec := map[string]interface{}{
-				"type": "session_workspace", "session_id": sid, "cwd": cwd, "source": source,
+				"type": "session_workspace", "session_id": sid, "cwd": cwd, "source": source, "branch": branchValue,
 			}
 			b, _ := json.Marshal(rec)
 			w.Write(b)
@@ -845,6 +1227,8 @@ func importJSONL(db *sql.DB, inputPath, sourceOverride string) int {
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	apiCols := apiCallColumns(db, "main")
+	hasPromptText := apiCols["prompt_text"]
 	count := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -869,18 +1253,38 @@ func importJSONL(db *sql.DB, inputPath, sourceOverride string) int {
 			if v, ok := obj["is_user_turn"].(float64); ok && v != 0 {
 				isUT = 1
 			}
-			db.Exec("INSERT OR IGNORE INTO api_calls "+
-				"(model, model_normalized, prompt_tokens, completion_tokens, "+
-				"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
-				"timestamp, session_id, log_file, source) "+
-				"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				obj["model"], obj["model_normalized"],
-				int(obj["prompt_tokens"].(float64)), int(obj["completion_tokens"].(float64)),
-				int(obj["cache_creation_tokens"].(float64)), int(obj["cache_read_tokens"].(float64)),
-				isUT, obj["timestamp"], obj["session_id"], obj["log_file"], src)
+			var promptText interface{}
+			if v, ok := obj["prompt_text"].(string); ok {
+				promptText = v
+			}
+			if hasPromptText {
+				db.Exec("INSERT OR IGNORE INTO api_calls "+
+					"(model, model_normalized, prompt_tokens, completion_tokens, "+
+					"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
+					"timestamp, session_id, log_file, source, prompt_text) "+
+					"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+					obj["model"], obj["model_normalized"],
+					int(obj["prompt_tokens"].(float64)), int(obj["completion_tokens"].(float64)),
+					int(obj["cache_creation_tokens"].(float64)), int(obj["cache_read_tokens"].(float64)),
+					isUT, obj["timestamp"], obj["session_id"], obj["log_file"], src, promptText)
+			} else {
+				db.Exec("INSERT OR IGNORE INTO api_calls "+
+					"(model, model_normalized, prompt_tokens, completion_tokens, "+
+					"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
+					"timestamp, session_id, log_file, source) "+
+					"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+					obj["model"], obj["model_normalized"],
+					int(obj["prompt_tokens"].(float64)), int(obj["completion_tokens"].(float64)),
+					int(obj["cache_creation_tokens"].(float64)), int(obj["cache_read_tokens"].(float64)),
+					isUT, obj["timestamp"], obj["session_id"], obj["log_file"], src)
+			}
 		} else if rtype == "session_workspace" {
-			db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source) VALUES (?, ?, ?)",
-				obj["session_id"], obj["cwd"], src)
+			var branch interface{}
+			if b, ok := obj["branch"].(string); ok && strings.TrimSpace(b) != "" {
+				branch = b
+			}
+			db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source, branch) VALUES (?, ?, ?, ?)",
+				obj["session_id"], obj["cwd"], src, branch)
 		}
 		count++
 	}
@@ -889,28 +1293,64 @@ func importJSONL(db *sql.DB, inputPath, sourceOverride string) int {
 
 func importSQLiteDB(db *sql.DB, otherDBPath, sourceOverride string) int {
 	db.Exec("ATTACH DATABASE ? AS import_db", otherDBPath)
+	targetAPICallCols := apiCallColumns(db, "main")
+	importAPICallCols := apiCallColumns(db, "import_db")
+	importPromptTextExpr := "NULL"
+	if importAPICallCols["prompt_text"] {
+		importPromptTextExpr = "prompt_text"
+	}
+	importCols := sessionWorkspaceColumns(db, "import_db")
+	sourceExpr := "'local'"
+	if importCols["source"] {
+		sourceExpr = "COALESCE(source, 'local')"
+	}
+	branchExpr := "NULL"
+	if importCols["branch"] {
+		branchExpr = "branch"
+	}
 	var count int64
 	if sourceOverride != "" {
-		db.Exec("INSERT OR IGNORE INTO api_calls "+
-			"(model, model_normalized, prompt_tokens, completion_tokens, "+
-			"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
-			"timestamp, session_id, log_file, source) "+
-			"SELECT model, model_normalized, prompt_tokens, completion_tokens, "+
-			"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
-			"timestamp, session_id, log_file, ? FROM import_db.api_calls", sourceOverride)
-		db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source) "+
-			"SELECT session_id, cwd, ? FROM import_db.session_workspaces", sourceOverride)
+		if targetAPICallCols["prompt_text"] {
+			db.Exec("INSERT OR IGNORE INTO api_calls "+
+				"(model, model_normalized, prompt_tokens, completion_tokens, "+
+				"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
+				"timestamp, session_id, log_file, source, prompt_text) "+
+				"SELECT model, model_normalized, prompt_tokens, completion_tokens, "+
+				"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
+				"timestamp, session_id, log_file, ?, "+importPromptTextExpr+" FROM import_db.api_calls", sourceOverride)
+		} else {
+			db.Exec("INSERT OR IGNORE INTO api_calls "+
+				"(model, model_normalized, prompt_tokens, completion_tokens, "+
+				"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
+				"timestamp, session_id, log_file, source) "+
+				"SELECT model, model_normalized, prompt_tokens, completion_tokens, "+
+				"cache_creation_tokens, cache_read_tokens, is_user_turn, "+
+				"timestamp, session_id, log_file, ? FROM import_db.api_calls", sourceOverride)
+		}
+		db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source, branch) "+
+			"SELECT session_id, cwd, ?, "+branchExpr+" FROM import_db.session_workspaces", sourceOverride)
 		db.Exec("INSERT OR REPLACE INTO parsed_logs (log_file, mtime, source, record_count, parsed_at) "+
 			"SELECT log_file, mtime, ?, record_count, parsed_at FROM import_db.parsed_logs", sourceOverride)
 	} else {
-		db.Exec("INSERT OR IGNORE INTO api_calls " +
-			"(model, model_normalized, prompt_tokens, completion_tokens, " +
-			"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
-			"timestamp, session_id, log_file, source) " +
-			"SELECT model, model_normalized, prompt_tokens, completion_tokens, " +
-			"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
-			"timestamp, session_id, log_file, source FROM import_db.api_calls")
-		db.Exec("INSERT OR REPLACE INTO session_workspaces SELECT * FROM import_db.session_workspaces")
+		if targetAPICallCols["prompt_text"] {
+			db.Exec("INSERT OR IGNORE INTO api_calls " +
+				"(model, model_normalized, prompt_tokens, completion_tokens, " +
+				"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
+				"timestamp, session_id, log_file, source, prompt_text) " +
+				"SELECT model, model_normalized, prompt_tokens, completion_tokens, " +
+				"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
+				"timestamp, session_id, log_file, source, " + importPromptTextExpr + " FROM import_db.api_calls")
+		} else {
+			db.Exec("INSERT OR IGNORE INTO api_calls " +
+				"(model, model_normalized, prompt_tokens, completion_tokens, " +
+				"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
+				"timestamp, session_id, log_file, source) " +
+				"SELECT model, model_normalized, prompt_tokens, completion_tokens, " +
+				"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
+				"timestamp, session_id, log_file, source FROM import_db.api_calls")
+		}
+		db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source, branch) " +
+			"SELECT session_id, cwd, " + sourceExpr + ", " + branchExpr + " FROM import_db.session_workspaces")
 		db.Exec("INSERT OR REPLACE INTO parsed_logs SELECT * FROM import_db.parsed_logs")
 	}
 	db.QueryRow("SELECT changes()").Scan(&count)
@@ -988,11 +1428,18 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 				return 0
 			}
 			insertStmt, err = tx.Prepare(
-				"INSERT OR IGNORE INTO api_calls " +
+				"INSERT INTO api_calls " +
 					"(model, model_normalized, prompt_tokens, completion_tokens, " +
-					"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
+					"prompt_text, cache_creation_tokens, cache_read_tokens, is_user_turn, " +
 					"timestamp, session_id, log_file, source) " +
-					"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+					"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+					"ON CONFLICT(timestamp, model, prompt_tokens, completion_tokens, log_file, source) DO UPDATE SET " +
+					"prompt_text = CASE " +
+					"WHEN COALESCE(api_calls.prompt_text, '') = '' AND COALESCE(excluded.prompt_text, '') <> '' THEN excluded.prompt_text " +
+					"ELSE api_calls.prompt_text END, " +
+					"session_id = CASE " +
+					"WHEN COALESCE(excluded.session_id, '') <> '' THEN excluded.session_id " +
+					"ELSE api_calls.session_id END")
 			if err != nil {
 				_ = tx.Rollback()
 				return 0
@@ -1010,8 +1457,9 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 			if r.IsUserTurn {
 				isUT = 1
 			}
+			promptText := promptTextForStorage(r.PromptText)
 			_, _ = insertStmt.Exec(r.Model, normalizeModel(r.Model), r.PromptTokens, r.CompletionTokens,
-				r.CacheCreationTokens, r.CacheReadTokens, isUT,
+				promptText, r.CacheCreationTokens, r.CacheReadTokens, isUT,
 				r.Timestamp, r.SessionID, r.LogFile, source)
 		}
 		_, _ = parsedStmt.Exec(filename, mtime, source, len(records))
@@ -1032,8 +1480,8 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 
 	if parsedCount > 0 {
 		workspaces := loadSessionWorkspaces(sessionDir)
-		for sessionID, cwd := range workspaces {
-			upsertSessionWorkspace(db, sessionID, cwd, source)
+		for sessionID, meta := range workspaces {
+			upsertSessionWorkspace(db, sessionID, meta.CWD, meta.Branch, source)
 		}
 	}
 
@@ -1096,7 +1544,26 @@ func listCodespaces(includeStopped bool) []codespaceInfo {
 	return filtered
 }
 
-func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
+func isCodespaceStartThrottleError(msg string) bool {
+	if msg == "" {
+		return false
+	}
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "too many codespaces starting") ||
+		(strings.Contains(lower, "http 400") && strings.Contains(lower, "codespaces"))
+}
+
+func codespaceThrottleBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 4 {
+		attempt = 4
+	}
+	return time.Duration(1<<attempt) * time.Second
+}
+
+func copyCodespaceData(cs codespaceInfo, idx, total int, stoppedStartLimiter chan struct{}) codespaceCopyResult {
 	res := codespaceCopyResult{
 		Idx:       idx,
 		Codespace: cs,
@@ -1107,6 +1574,11 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 		return res
 	}
 	res.TmpDir = tmpDir
+
+	if shouldStop && stoppedStartLimiter != nil {
+		stoppedStartLimiter <- struct{}{}
+		defer func() { <-stoppedStartLimiter }()
+	}
 
 	if shouldStop {
 		defer func() {
@@ -1155,19 +1627,36 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 
 	// Fallback: gh cs cp (original approach, copies all of .copilot/)
 	if !copied {
-		cpStart = time.Now()
-		cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
-		cpCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-		var cpErrBuf bytes.Buffer
-		cpCmd.Stdout = io.Discard
-		cpCmd.Stderr = &cpErrBuf
-		cpErr := cpCmd.Run()
-		if cpErr != nil {
+		const maxThrottleRetries = 3
+		for attempt := 1; attempt <= maxThrottleRetries; attempt++ {
+			cpStart = time.Now()
+			cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
+			cpCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+			var cpErrBuf bytes.Buffer
+			cpCmd.Stdout = io.Discard
+			cpCmd.Stderr = &cpErrBuf
+			cpErr := cpCmd.Run()
+			if cpErr == nil {
+				fmt.Fprintf(os.Stderr, "  ✅ Copied %s (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
+				copied = true
+				break
+			}
 			if cpCtx.Err() == context.DeadlineExceeded {
 				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out after %.1fs\n", cs.Name, time.Since(cpStart).Seconds())
 				return res
 			}
 			msg := strings.TrimSpace(cpErrBuf.String())
+			if isCodespaceStartThrottleError(msg) && attempt < maxThrottleRetries {
+				wait := codespaceThrottleBackoff(attempt)
+				fmt.Fprintf(os.Stderr, "  ⏳ Start throttled for %s, retrying copy in %.0fs (%d/%d)\n", cs.Name, wait.Seconds(), attempt+1, maxThrottleRetries)
+				select {
+				case <-time.After(wait):
+					continue
+				case <-cpCtx.Done():
+					fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out while waiting to retry\n", cs.Name)
+					return res
+				}
+			}
 			if strings.Contains(msg, "No such file or directory") {
 				fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
 			} else {
@@ -1178,7 +1667,9 @@ func copyCodespaceData(cs codespaceInfo, idx, total int) codespaceCopyResult {
 			}
 			return res
 		}
-		fmt.Fprintf(os.Stderr, "  ✅ Copied %s (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
+		if !copied {
+			return res
+		}
 	}
 
 	copilotDir := filepath.Join(stage, ".copilot")
@@ -1309,6 +1800,18 @@ func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, e
 		return 0, nil
 	}
 
+	var stoppedPending int
+	for _, cs := range pending {
+		if cs.State == "Shutdown" {
+			stoppedPending++
+		}
+	}
+	var stoppedStartLimiter chan struct{}
+	if stoppedPending > 0 {
+		stoppedStartLimiter = make(chan struct{}, 1)
+		fmt.Fprintf(os.Stderr, "  🧯 Stopped Codespaces startup parallelism: 1 (%d stopped)\n", stoppedPending)
+	}
+
 	workers := 4
 	fmt.Fprintf(os.Stderr, "  🚚 Codespaces copy parallelism: %d workers (%d pending)\n", workers, len(pending))
 	jobs := make(chan int, len(pending))
@@ -1316,7 +1819,7 @@ func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, e
 	for w := 0; w < workers; w++ {
 		go func() {
 			for idx := range jobs {
-				results <- copyCodespaceData(pending[idx], idx, len(pending))
+				results <- copyCodespaceData(pending[idx], idx, len(pending), stoppedStartLimiter)
 			}
 		}()
 	}
@@ -1709,6 +2212,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "                         [--web] [--web-listen ADDR] [--web-refresh-interval DURATION]\n")
 		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-mode manual|auto] [--web-codespaces-interval DURATION]\n\n")
 		fmt.Fprintf(os.Stderr, "Copilot CLI Token Cost Calculator\n\n")
+		fmt.Fprintf(os.Stderr, "Prompt text storage is always-on when prompt text is available; unavailable prompt text is stored as NULL.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost              # last 7 days\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost 30           # last 30 days\n")
@@ -2013,7 +2517,9 @@ func main() {
 		for _, r := range filtered {
 			cwd := ""
 			if r.SessionID != "" {
-				cwd = sessionWorkspaces[r.Source+"\x1f"+r.SessionID]
+				if meta, ok := sessionWorkspaces[r.Source+"\x1f"+r.SessionID]; ok {
+					cwd = meta.CWD
+				}
 			}
 			proj := "(unknown)"
 			if cwd != "" {
@@ -2240,7 +2746,9 @@ func main() {
 	for _, r := range filtered {
 		cwd := ""
 		if r.SessionID != "" {
-			cwd = sessionWorkspaces[r.Source+"\x1f"+r.SessionID]
+			if meta, ok := sessionWorkspaces[r.Source+"\x1f"+r.SessionID]; ok {
+				cwd = meta.CWD
+			}
 		}
 		proj := "(unknown)"
 		if cwd != "" {

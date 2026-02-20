@@ -48,6 +48,9 @@ func TestParseLogFile(t *testing.T) {
 	if !first.IsUserTurn || first.Timestamp != "2025-01-01T10:00:03" || first.SessionID != uuid || first.LogFile != "sample.log" {
 		t.Fatalf("unexpected first record metadata: %+v", first)
 	}
+	if first.PromptText != nil {
+		t.Fatalf("expected nil prompt text when unavailable, got %#v", first.PromptText)
+	}
 
 	second := records[1]
 	if second.Model != "gpt-4.1" || second.PromptTokens != 50 || second.CompletionTokens != 5 {
@@ -59,12 +62,202 @@ func TestParseLogFile(t *testing.T) {
 	if second.IsUserTurn {
 		t.Fatalf("expected second record to be non-user turn: %+v", second)
 	}
+	if second.PromptText != nil {
+		t.Fatalf("expected nil prompt text when unavailable, got %#v", second.PromptText)
+	}
+}
+
+func TestParseLogFileTimestampedWorkspaceInitializedSetsSessionID(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "timestamped-session.log")
+	const sessionID = "123e4567-e89b-12d3-a456-426614174010"
+	content := `2025-01-01T10:00:00 Workspace initialized: ` + sessionID + `
+2025-01-01T10:00:01 {"model":"gpt-4.1"}
+2025-01-01T10:00:02 {"prompt_tokens":10,"completion_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0].SessionID != sessionID {
+		t.Fatalf("expected session id %q, got %q", sessionID, records[0].SessionID)
+	}
+}
+
+func TestParseLogFileIgnoresQuotedWorkspaceInitializedInToolOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "quoted-workspace.log")
+	const realSessionID = "123e4567-e89b-12d3-a456-426614174011"
+	const embeddedSessionID = "123e4567-e89b-12d3-a456-426614174099"
+	content := `2025-01-01T10:00:00 Created ACP session: ` + realSessionID + `
+2025-01-01T10:00:01 {"model":"gpt-4.1"}
+2025-01-01T10:00:02 {"prompt_tokens":10,"completion_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+2025-01-01T10:00:03 {"tool_output":"note: \"Workspace initialized: ` + embeddedSessionID + `\""}
+2025-01-01T10:00:04 {"model":"gpt-4.1"}
+2025-01-01T10:00:05 {"prompt_tokens":11,"completion_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(records))
+	}
+	if records[1].SessionID != realSessionID {
+		t.Fatalf("expected session id to remain %q, got %q", realSessionID, records[1].SessionID)
+	}
+}
+
+func TestParseLogFileExtractsPromptTextWhenAvailable(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "prompt.log")
+	content := `2025-01-01T10:00:00 {"model":"gpt-4.1"}
+2025-01-01T10:00:01 {"messages":[{"role":"user","content":[{"type":"text","text":"  Build a sync parser  "}]}]}
+2025-01-01T10:00:02 {"prompt_tokens":10,"completion_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0].PromptText == nil || *records[0].PromptText != "Build a sync parser" {
+		t.Fatalf("expected extracted prompt text, got %#v", records[0].PromptText)
+	}
+}
+
+func TestParseLogFileExtractsPromptTextFromUserStatement(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "statement-prompt.log")
+	content := "2025-01-01T10:00:00 {\"model\":\"gpt-4.1\"}\n" +
+		"2025-01-01T10:00:01 {\n" +
+		"  \"problem\": {\n" +
+		"    \"statement\": \"  Build this from statement payload  \"\n" +
+		"  }\n" +
+		"}\n"
+	for i := 0; i < 30; i++ {
+		content += "2025-01-01T10:00:01 filler line\n"
+	}
+	content += "2025-01-01T10:00:02 {\"prompt_tokens\":10,\"completion_tokens\":2,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}\n"
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0].PromptText == nil || *records[0].PromptText != "Build this from statement payload" {
+		t.Fatalf("expected extracted statement prompt text, got %#v", records[0].PromptText)
+	}
+}
+
+func TestParseLogFileIgnoresAssistantStatementPromptText(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "assistant-statement.log")
+	content := `2025-01-01T10:00:00 {"model":"gpt-4.1"}
+2025-01-01T10:00:01 {"conversation_item":{"role":"assistant","statement":"this should not be persisted"}}
+2025-01-01T10:00:02 {"prompt_tokens":10,"completion_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0].PromptText != nil {
+		t.Fatalf("expected nil prompt text for assistant statement payload, got %#v", records[0].PromptText)
+	}
+}
+
+func TestParseLogFileIgnoresNonUserInitiatorVariants(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "initiator.log")
+	content := `2025-01-01T10:00:00 PremiumRequestProcessor: Setting X-Initiator to 'user-autopilot'
+2025-01-01T10:00:01 {"model":"gpt-4.1"}
+2025-01-01T10:00:02 {"prompt_tokens":10,"completion_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	if records[0].IsUserTurn {
+		t.Fatalf("expected non-user turn for non-user initiator variant: %+v", records[0])
+	}
 }
 
 func TestParseLogFileMissingFile(t *testing.T) {
 	records := parseLogFile(filepath.Join(t.TempDir(), "missing.log"))
 	if records != nil {
 		t.Fatalf("expected nil records for missing file, got %+v", records)
+	}
+}
+
+func TestPromptTextForStorage(t *testing.T) {
+	if got := promptTextForStorage(nil); got.Valid {
+		t.Fatalf("expected invalid null string for nil prompt, got %+v", got)
+	}
+	blank := "   \n\t"
+	if got := promptTextForStorage(&blank); got.Valid {
+		t.Fatalf("expected invalid null string for blank prompt, got %+v", got)
+	}
+	text := "  hello prompt  "
+	got := promptTextForStorage(&text)
+	if !got.Valid || got.String != "hello prompt" {
+		t.Fatalf("expected trimmed valid prompt text, got %+v", got)
+	}
+}
+
+func TestPromptTextForStorageAlwaysOnNoOptInGate(t *testing.T) {
+	t.Setenv("COPILOT_TOKEN_COST_PROMPT_STORAGE_OPT_IN", "0")
+	text := "persist me"
+	got := promptTextForStorage(&text)
+	if !got.Valid || got.String != "persist me" {
+		t.Fatalf("expected prompt text to persist regardless of opt-in env, got %+v", got)
+	}
+}
+
+func TestContainsPromptIndicator(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{name: "plain user", line: `{"role":"user"}`, want: true},
+		{name: "escaped user", line: `{\"role\":\"user\"}`, want: true},
+		{name: "messages key", line: `{"messages":[]}`, want: true},
+		{name: "escaped messages key", line: `{\"messages\":[]}`, want: true},
+		{name: "prompt key", line: `{"prompt":"build parser"}`, want: true},
+		{name: "statement key", line: `{"statement":"build parser"}`, want: true},
+		{name: "escaped statement key", line: `{\"statement\":\"build parser\"}`, want: true},
+		{name: "escaped prompt key does not match prefilter", line: `{\"prompt\":\"build parser\"}`, want: false},
+		{name: "no indicator", line: `{"role":"assistant","content":"ok"}`, want: false},
+	}
+	for _, tc := range cases {
+		if got := containsPromptIndicator(tc.line); got != tc.want {
+			t.Fatalf("%s: expected %v, got %v", tc.name, tc.want, got)
+		}
+	}
+}
+
+func TestExtractPromptTextFromLineHandlesEscapedUserJSON(t *testing.T) {
+	line := `{\"messages\":[{\"role\":\"user\",\"content\":\"  keep me  \"}]}`
+	got := extractPromptTextFromLine(line)
+	if got == nil || *got != "keep me" {
+		t.Fatalf("expected escaped user JSON prompt extraction, got %#v", got)
 	}
 }
 

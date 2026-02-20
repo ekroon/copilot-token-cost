@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTempDBForDBQuery(t *testing.T, name string) (*sql.DB, string) {
@@ -26,6 +27,20 @@ func TestInitDBCreatesSchema(t *testing.T) {
 	}
 	if count != 4 {
 		t.Fatalf("expected 4 core tables, got %d", count)
+	}
+	var hasPromptText int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('api_calls') WHERE name='prompt_text'").Scan(&hasPromptText); err != nil {
+		t.Fatalf("prompt_text column check: %v", err)
+	}
+	if hasPromptText != 1 {
+		t.Fatalf("expected prompt_text column to exist")
+	}
+	var hasPromptIndex int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_index_list('api_calls') WHERE name='idx_api_calls_prompt_text'").Scan(&hasPromptIndex); err != nil {
+		t.Fatalf("prompt_text index check: %v", err)
+	}
+	if hasPromptIndex != 1 {
+		t.Fatalf("expected idx_api_calls_prompt_text index to exist")
 	}
 }
 
@@ -73,8 +88,8 @@ func seedQueryData(t *testing.T, db *sql.DB) {
 			LogFile:             "b.log",
 		},
 	}, "local")
-	upsertSessionWorkspace(db, "s1", "/proj/alpha", "local")
-	upsertSessionWorkspace(db, "s2", "/proj/beta", "local")
+	upsertSessionWorkspace(db, "s1", "/proj/alpha", "", "local")
+	upsertSessionWorkspace(db, "s2", "/proj/beta", "", "local")
 }
 
 func TestQueryFunctionsWithRealSQLite(t *testing.T) {
@@ -120,10 +135,12 @@ func TestQueryFunctionsWithRealSQLite(t *testing.T) {
 
 func TestExportImportJSONL(t *testing.T) {
 	srcDB, _ := newTempDBForDBQuery(t, "src.db")
+	prompt := "export this prompt"
 	insertRecords(srcDB, []Record{{
 		Model:               "claude-3-5-sonnet",
 		PromptTokens:        8,
 		CompletionTokens:    9,
+		PromptText:          &prompt,
 		CacheCreationTokens: 1,
 		CacheReadTokens:     2,
 		IsUserTurn:          true,
@@ -131,7 +148,7 @@ func TestExportImportJSONL(t *testing.T) {
 		SessionID:           "sx",
 		LogFile:             "x.log",
 	}}, "local")
-	upsertSessionWorkspace(srcDB, "sx", "/proj/export", "local")
+	upsertSessionWorkspace(srcDB, "sx", "/proj/export", "feature/export", "local")
 
 	jsonlPath := filepath.Join(t.TempDir(), "export.jsonl")
 	exportJSONL(srcDB, jsonlPath)
@@ -151,8 +168,15 @@ func TestExportImportJSONL(t *testing.T) {
 		t.Fatalf("unexpected imported records: %#v", records)
 	}
 	ws := querySessionWorkspaces(dstDB)
-	if ws["local\x1fsx"] != "/proj/export" {
+	if ws["local\x1fsx"].CWD != "/proj/export" || ws["local\x1fsx"].Branch != "feature/export" {
 		t.Fatalf("unexpected workspace map: %#v", ws)
+	}
+	var importedPrompt sql.NullString
+	if err := dstDB.QueryRow("SELECT prompt_text FROM api_calls WHERE session_id = 'sx' AND source = 'local'").Scan(&importedPrompt); err != nil {
+		t.Fatalf("read imported prompt_text: %v", err)
+	}
+	if !importedPrompt.Valid || importedPrompt.String != prompt {
+		t.Fatalf("unexpected imported prompt_text: %#v", importedPrompt)
 	}
 
 	overrideDB, _ := newTempDBForDBQuery(t, "override.db")
@@ -164,8 +188,59 @@ func TestExportImportJSONL(t *testing.T) {
 		t.Fatalf("unexpected override records: %#v", overrideRecords)
 	}
 	overrideWS := querySessionWorkspaces(overrideDB)
-	if overrideWS["codespace:unit\x1fsx"] != "/proj/export" {
+	if overrideWS["codespace:unit\x1fsx"].CWD != "/proj/export" || overrideWS["codespace:unit\x1fsx"].Branch != "feature/export" {
 		t.Fatalf("unexpected override workspaces: %#v", overrideWS)
+	}
+}
+
+func TestExportImportJSONLFromLegacySchemaWithoutPromptText(t *testing.T) {
+	legacyDB, _ := newTempDBForDBQuery(t, "legacy-jsonl.db")
+	insertRecords(legacyDB, []Record{{
+		Model:            "gpt-4.1",
+		PromptTokens:     4,
+		CompletionTokens: 2,
+		Timestamp:        "2026-01-03T11:00:00",
+		SessionID:        "legacy-export",
+		LogFile:          "legacy-export.log",
+	}}, "local")
+	if _, err := legacyDB.Exec(`
+ALTER TABLE api_calls RENAME TO api_calls_with_prompt_text;
+CREATE TABLE api_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model TEXT NOT NULL,
+    model_normalized TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    is_user_turn INTEGER DEFAULT 0,
+    timestamp TEXT,
+    session_id TEXT,
+    log_file TEXT,
+    source TEXT DEFAULT 'local',
+    UNIQUE(timestamp, model, prompt_tokens, completion_tokens, log_file, source)
+);
+INSERT INTO api_calls (id, model, model_normalized, prompt_tokens, completion_tokens, cache_creation_tokens, cache_read_tokens, is_user_turn, timestamp, session_id, log_file, source)
+SELECT id, model, model_normalized, prompt_tokens, completion_tokens, cache_creation_tokens, cache_read_tokens, is_user_turn, timestamp, session_id, log_file, source
+FROM api_calls_with_prompt_text;
+DROP TABLE api_calls_with_prompt_text;
+`); err != nil {
+		t.Fatalf("strip prompt_text column: %v", err)
+	}
+
+	jsonlPath := filepath.Join(t.TempDir(), "legacy-export.jsonl")
+	exportJSONL(legacyDB, jsonlPath)
+
+	targetDB, _ := newTempDBForDBQuery(t, "legacy-jsonl-target.db")
+	if imported := importJSONL(targetDB, jsonlPath, ""); imported != 1 {
+		t.Fatalf("expected 1 imported jsonl entry, got %d", imported)
+	}
+	var promptText sql.NullString
+	if err := targetDB.QueryRow("SELECT prompt_text FROM api_calls WHERE session_id='legacy-export' AND source='local'").Scan(&promptText); err != nil {
+		t.Fatalf("query imported prompt_text: %v", err)
+	}
+	if promptText.Valid {
+		t.Fatalf("expected NULL prompt_text for legacy export/import, got %#v", promptText)
 	}
 }
 
@@ -182,7 +257,7 @@ func TestImportSQLiteDBWithOverride(t *testing.T) {
 		SessionID:           "s-import",
 		LogFile:             "import.log",
 	}}, "local")
-	upsertSessionWorkspace(importDB, "s-import", "/proj/import", "local")
+	upsertSessionWorkspace(importDB, "s-import", "/proj/import", "feature/import", "local")
 	markLogParsed(importDB, "import.log", 123.45, 1, "local")
 
 	targetDB, _ := newTempDBForDBQuery(t, "target.db")
@@ -196,7 +271,7 @@ func TestImportSQLiteDBWithOverride(t *testing.T) {
 		t.Fatalf("unexpected imported records: %#v", records)
 	}
 	ws := querySessionWorkspaces(targetDB)
-	if ws["remote\x1fs-import"] != "/proj/import" {
+	if ws["remote\x1fs-import"].CWD != "/proj/import" || ws["remote\x1fs-import"].Branch != "feature/import" {
 		t.Fatalf("unexpected imported workspaces: %#v", ws)
 	}
 
@@ -206,5 +281,270 @@ func TestImportSQLiteDBWithOverride(t *testing.T) {
 	}
 	if parsedCount != 1 {
 		t.Fatalf("expected 1 parsed_log row with override source, got %d", parsedCount)
+	}
+}
+
+func TestMigrateSessionWorkspacesAddsBranchColumn(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	legacyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	_, err = legacyDB.Exec(`
+CREATE TABLE session_workspaces (
+    session_id TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    source TEXT DEFAULT 'local',
+    PRIMARY KEY (session_id, source)
+);
+INSERT INTO session_workspaces (session_id, cwd, source) VALUES ('legacy-sid', '/legacy/cwd', 'local');
+`)
+	if err != nil {
+		t.Fatalf("prepare legacy db: %v", err)
+	}
+	_ = legacyDB.Close()
+
+	db := initDB(dbPath)
+	t.Cleanup(func() { _ = db.Close() })
+
+	var hasBranch int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('session_workspaces') WHERE name='branch'").Scan(&hasBranch); err != nil {
+		t.Fatalf("branch column check: %v", err)
+	}
+	if hasBranch != 1 {
+		t.Fatalf("expected branch column to exist")
+	}
+	var cwd, source string
+	var branch sql.NullString
+	if err := db.QueryRow("SELECT cwd, source, branch FROM session_workspaces WHERE session_id='legacy-sid'").Scan(&cwd, &source, &branch); err != nil {
+		t.Fatalf("read migrated row: %v", err)
+	}
+	if cwd != "/legacy/cwd" || source != "local" || branch.Valid {
+		t.Fatalf("unexpected migrated row cwd=%q source=%q branch=%#v", cwd, source, branch)
+	}
+
+	migrateSessionWorkspacesSchema(db)
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('session_workspaces') WHERE name='branch'").Scan(&hasBranch); err != nil {
+		t.Fatalf("branch column re-check: %v", err)
+	}
+	if hasBranch != 1 {
+		t.Fatalf("expected branch column to remain after re-migration")
+	}
+}
+
+func TestMigrateAPICallsAddsPromptTextColumn(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-api-calls.db")
+	legacyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	_, err = legacyDB.Exec(`
+CREATE TABLE api_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model TEXT NOT NULL,
+    model_normalized TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    is_user_turn INTEGER DEFAULT 0,
+    timestamp TEXT,
+    session_id TEXT,
+    log_file TEXT,
+    source TEXT DEFAULT 'local',
+    UNIQUE(timestamp, model, prompt_tokens, completion_tokens, log_file, source)
+);
+INSERT INTO api_calls (model, model_normalized, prompt_tokens, completion_tokens, timestamp, session_id, log_file, source)
+VALUES ('gpt-4.1', 'gpt-4.1', 2, 1, '2026-01-01T00:00:00', 'legacy', 'legacy.log', 'local');
+`)
+	if err != nil {
+		t.Fatalf("prepare legacy db: %v", err)
+	}
+	_ = legacyDB.Close()
+
+	db := initDB(dbPath)
+	t.Cleanup(func() { _ = db.Close() })
+
+	var hasPromptText int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('api_calls') WHERE name='prompt_text'").Scan(&hasPromptText); err != nil {
+		t.Fatalf("prompt_text column check: %v", err)
+	}
+	if hasPromptText != 1 {
+		t.Fatalf("expected prompt_text column to exist")
+	}
+	var promptText sql.NullString
+	if err := db.QueryRow("SELECT prompt_text FROM api_calls WHERE session_id='legacy'").Scan(&promptText); err != nil {
+		t.Fatalf("read migrated api_call row: %v", err)
+	}
+	if promptText.Valid {
+		t.Fatalf("expected prompt_text to be NULL after migration, got %#v", promptText)
+	}
+
+	migrateAPICallsSchema(db)
+	var hasPromptIndex int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_index_list('api_calls') WHERE name='idx_api_calls_prompt_text'").Scan(&hasPromptIndex); err != nil {
+		t.Fatalf("prompt_text index check: %v", err)
+	}
+	if hasPromptIndex != 1 {
+		t.Fatalf("expected idx_api_calls_prompt_text index to remain after re-migration")
+	}
+}
+
+func TestImportSQLiteDBWithoutBranchColumn(t *testing.T) {
+	importDB, importPath := newTempDBForDBQuery(t, "legacy-import.db")
+	insertRecords(importDB, []Record{{
+		Model:            "gpt-4.1",
+		PromptTokens:     1,
+		CompletionTokens: 2,
+		Timestamp:        "2026-01-05T12:00:00",
+		SessionID:        "legacy-import",
+		LogFile:          "legacy.log",
+	}}, "local")
+	upsertSessionWorkspace(importDB, "legacy-import", "/proj/legacy-import", "legacy/branch", "local")
+	if _, err := importDB.Exec(`
+ALTER TABLE session_workspaces RENAME TO session_workspaces_with_branch;
+CREATE TABLE session_workspaces (
+    session_id TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    source TEXT DEFAULT 'local',
+    PRIMARY KEY (session_id, source)
+);
+INSERT INTO session_workspaces (session_id, cwd, source)
+SELECT session_id, cwd, source FROM session_workspaces_with_branch;
+DROP TABLE session_workspaces_with_branch;
+`); err != nil {
+		t.Fatalf("strip branch column: %v", err)
+	}
+	_ = importDB.Close()
+
+	targetDB, _ := newTempDBForDBQuery(t, "target-no-branch.db")
+	_ = importSQLiteDB(targetDB, importPath, "")
+
+	ws := querySessionWorkspaces(targetDB)
+	if ws["local\x1flegacy-import"].CWD != "/proj/legacy-import" {
+		t.Fatalf("unexpected imported legacy workspace map: %#v", ws)
+	}
+	if ws["local\x1flegacy-import"].Branch != "" {
+		t.Fatalf("expected empty branch for legacy import, got %#v", ws["local\x1flegacy-import"])
+	}
+}
+
+func TestImportSQLiteDBWithoutPromptTextColumn(t *testing.T) {
+	importDB, importPath := newTempDBForDBQuery(t, "legacy-no-prompt.db")
+	insertRecords(importDB, []Record{{
+		Model:            "gpt-4.1",
+		PromptTokens:     1,
+		CompletionTokens: 2,
+		Timestamp:        "2026-01-05T12:00:00",
+		SessionID:        "legacy-no-prompt",
+		LogFile:          "legacy-no-prompt.log",
+	}}, "local")
+	if _, err := importDB.Exec(`
+ALTER TABLE api_calls RENAME TO api_calls_with_prompt_text;
+CREATE TABLE api_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model TEXT NOT NULL,
+    model_normalized TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    is_user_turn INTEGER DEFAULT 0,
+    timestamp TEXT,
+    session_id TEXT,
+    log_file TEXT,
+    source TEXT DEFAULT 'local',
+    UNIQUE(timestamp, model, prompt_tokens, completion_tokens, log_file, source)
+);
+INSERT INTO api_calls (id, model, model_normalized, prompt_tokens, completion_tokens, cache_creation_tokens, cache_read_tokens, is_user_turn, timestamp, session_id, log_file, source)
+SELECT id, model, model_normalized, prompt_tokens, completion_tokens, cache_creation_tokens, cache_read_tokens, is_user_turn, timestamp, session_id, log_file, source
+FROM api_calls_with_prompt_text;
+DROP TABLE api_calls_with_prompt_text;
+`); err != nil {
+		t.Fatalf("strip prompt_text column: %v", err)
+	}
+	_ = importDB.Close()
+
+	targetDB, _ := newTempDBForDBQuery(t, "target-no-prompt-text.db")
+	_ = importSQLiteDB(targetDB, importPath, "")
+
+	var promptText sql.NullString
+	if err := targetDB.QueryRow("SELECT prompt_text FROM api_calls WHERE session_id='legacy-no-prompt' AND source='local'").Scan(&promptText); err != nil {
+		t.Fatalf("query imported prompt_text: %v", err)
+	}
+	if promptText.Valid {
+		t.Fatalf("expected NULL prompt_text for legacy import, got %#v", promptText)
+	}
+}
+
+func TestImportSQLiteDBWithPromptTextColumn(t *testing.T) {
+	importDB, importPath := newTempDBForDBQuery(t, "import-with-prompt.db")
+	if _, err := importDB.Exec(`INSERT INTO api_calls
+	(model, model_normalized, prompt_tokens, completion_tokens, cache_creation_tokens, cache_read_tokens, is_user_turn, timestamp, session_id, log_file, source, prompt_text)
+	VALUES ('gpt-4.1', 'gpt-4.1', 5, 3, 0, 0, 1, '2026-01-05T13:00:00', 'with-prompt', 'with-prompt.log', 'local', 'Write a hello world in Go')`); err != nil {
+		t.Fatalf("insert api_call with prompt_text: %v", err)
+	}
+	_ = importDB.Close()
+
+	targetDB, _ := newTempDBForDBQuery(t, "target-with-prompt-text.db")
+	_ = importSQLiteDB(targetDB, importPath, "")
+
+	var promptText sql.NullString
+	if err := targetDB.QueryRow("SELECT prompt_text FROM api_calls WHERE session_id='with-prompt' AND source='local'").Scan(&promptText); err != nil {
+		t.Fatalf("query imported prompt_text: %v", err)
+	}
+	if !promptText.Valid || promptText.String != "Write a hello world in Go" {
+		t.Fatalf("unexpected imported prompt_text: %#v", promptText)
+	}
+}
+
+func TestSyncLogsToDBWithLegacyWorkspaceSchema(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-sync.db")
+	legacyDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := legacyDB.Exec(`
+CREATE TABLE session_workspaces (
+    session_id TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    source TEXT DEFAULT 'local',
+    PRIMARY KEY (session_id, source)
+);`); err != nil {
+		t.Fatalf("prepare legacy workspace table: %v", err)
+	}
+	_ = legacyDB.Close()
+
+	db := initDB(dbPath)
+	t.Cleanup(func() { _ = db.Close() })
+
+	root := t.TempDir()
+	logsDir := filepath.Join(root, "logs")
+	sessionDir := filepath.Join(root, "session-state")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	sessionID := "123e4567-e89b-12d3-a456-426614174333"
+	workspaceDir := filepath.Join(sessionDir, sessionID)
+	if err := os.MkdirAll(workspaceDir, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspaceDir, "workspace.yaml"), []byte("cwd: /tmp/legacy-sync\nbranch: feature/legacy-sync\n"), 0o644); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+	logPath := filepath.Join(logsDir, "process-legacy.log")
+	logTS := time.Date(2026, 1, 6, 9, 0, 0, 0, time.Local)
+	writeLogFile(t, logPath, logTS, "2026-01-06T09:00:00 Workspace initialized: "+sessionID+"\nPremiumRequestProcessor: Setting X-Initiator to 'user'\n{\"model\":\"gpt-4.1\"}\n{\"prompt_tokens\":6,\"completion_tokens\":2}\n")
+
+	if inserted := syncLogsToDB(db, logsDir, sessionDir, false, "legacy-sync", nil, nil); inserted != 1 {
+		t.Fatalf("syncLogsToDB inserted=%d, want 1", inserted)
+	}
+
+	var branch sql.NullString
+	if err := db.QueryRow("SELECT branch FROM session_workspaces WHERE session_id = ? AND source = ?", sessionID, "legacy-sync").Scan(&branch); err != nil {
+		t.Fatalf("query synced branch: %v", err)
+	}
+	if !branch.Valid || branch.String != "feature/legacy-sync" {
+		t.Fatalf("unexpected synced branch: %#v", branch)
 	}
 }

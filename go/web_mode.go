@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"html"
 	"net"
 	"net/http"
@@ -320,7 +321,7 @@ func (s *webState) rebuildSnapshot() {
 		periodLabel = "all time"
 	}
 	aggregated := loadAggregatedStats(s.db, s.dateFromQuery, s.dateToQuery, "")
-	payload := buildStatsPayload(aggregated, periodLabel, s.dateRange)
+	payload := buildStatsPayload(aggregated, periodLabel, s.dateRange, 0)
 
 	s.snapshotMu.Lock()
 	payload.SyncStatus = cloneSyncStatus(s.syncStatus)
@@ -576,6 +577,8 @@ func writeActionError(w http.ResponseWriter, actionErr *webActionError) {
 }
 
 func appendDatastarOuterPatch(b *strings.Builder, selector, element string) {
+	element = strings.ReplaceAll(strings.ReplaceAll(element, "\r\n", "\n"), "\r", "\n")
+	element = strings.ReplaceAll(element, "\n", "")
 	b.WriteString("event: datastar-patch-elements\n")
 	fmt.Fprintf(b, "data: selector %s\n", selector)
 	b.WriteString("data: mode outer\n")
@@ -668,14 +671,14 @@ func (s *webState) buildRefreshIndicatorsPatch(now time.Time) string {
 }
 
 func (s *webState) buildDashboardPatch(payload statsPayload, now time.Time) (string, error) {
-	patch, err := buildRefreshPatch(payload)
+	patch, err := buildRefreshPatch(payload, now)
 	if err != nil {
 		return "", err
 	}
 	return patch + s.buildRefreshIndicatorsPatch(now), nil
 }
 
-func buildRefreshPatch(payload statsPayload) (string, error) {
+func buildRefreshPatch(payload statsPayload, now time.Time) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to encode refresh payload: %w", err)
@@ -689,8 +692,46 @@ func buildRefreshPatch(payload statsPayload) (string, error) {
 	appendDatastarOuterPatch(&patch, "#model-summary-region", `<div id="model-summary-region">`+renderWebModelSummaryTable(payload, true)+`</div>`)
 	appendDatastarOuterPatch(&patch, "#project-summary-region", `<div id="project-summary-region">`+renderWebProjectSummaryTable(payload, true)+`</div>`)
 	appendDatastarOuterPatch(&patch, "#daily-totals-region", `<div id="daily-totals-region">`+renderWebDailyTotalsTable(payload, true)+`</div>`)
+	appendDatastarOuterPatch(&patch, "#daily-spend-region", renderWebDailySpendRegion(payload, true, now))
 	appendDatastarOuterPatch(&patch, "#stats-json", `<pre id="stats-json">`+escaped+`</pre>`)
 	return patch.String(), nil
+}
+
+func parseWebExpandAction(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildProjectRowTogglePatch(payload statsPayload, rowKey string, expand bool) (string, error) {
+	rows := sortedWebStatsRows(payload.Projects)
+	for _, row := range rows {
+		if webStableRowKey("project", row.name) != rowKey {
+			continue
+		}
+		var patch strings.Builder
+		appendDatastarOuterPatch(&patch, "#"+webProjectSummaryRowID(rowKey), renderWebProjectSummaryRow(row, rowKey, expand))
+		appendDatastarOuterPatch(&patch, "#"+webProjectDetailRowID(rowKey), renderWebProjectDetailRow(payload, row.name, rowKey, expand))
+		return patch.String(), nil
+	}
+	return "", fmt.Errorf("unknown project row key")
+}
+
+func buildDayRowTogglePatch(payload statsPayload, rowKey string, expand bool) (string, error) {
+	rows := buildWebDailyTotalsRows(payload)
+	for _, row := range rows {
+		if webStableRowKey("day", row.day) != rowKey {
+			continue
+		}
+		var patch strings.Builder
+		appendDatastarOuterPatch(&patch, "#"+webDaySummaryRowID(rowKey), renderWebDaySummaryRow(row, rowKey, expand))
+		appendDatastarOuterPatch(&patch, "#"+webDayDetailRowID(rowKey), renderWebDayDetailRow(payload, row.day, rowKey, expand))
+		return patch.String(), nil
+	}
+	return "", fmt.Errorf("unknown day row key")
 }
 
 type webStatsRow struct {
@@ -707,6 +748,46 @@ type webDailyTotalsRow struct {
 	premRequestCost  float64
 	totalCost        float64
 	totalCostNoCache float64
+}
+
+func webStableRowKey(prefix, value string) string {
+	trimmed := strings.TrimSpace(strings.ToLower(value))
+	var slug strings.Builder
+	lastDash := false
+	for _, r := range trimmed {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			slug.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			slug.WriteByte('-')
+			lastDash = true
+		}
+	}
+	base := strings.Trim(slug.String(), "-")
+	if base == "" {
+		base = "row"
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(value))
+	return fmt.Sprintf("%s-%s-%08x", prefix, base, h.Sum32())
+}
+
+func webProjectSummaryRowID(rowKey string) string {
+	return "project-summary-row-" + rowKey
+}
+
+func webProjectDetailRowID(rowKey string) string {
+	return "project-detail-row-" + rowKey
+}
+
+func webDaySummaryRowID(rowKey string) string {
+	return "day-summary-row-" + rowKey
+}
+
+func webDayDetailRowID(rowKey string) string {
+	return "day-detail-row-" + rowKey
 }
 
 func sortedWebStatsRows(statsMap map[string]statsPayloadStats) []webStatsRow {
@@ -758,6 +839,7 @@ func webDailyStatsValue(value interface{}) (statsPayloadStats, bool) {
 	case map[string]interface{}:
 		return statsPayloadStats{
 			APICalls:            int(webFloat64(v["api_calls"])),
+			UserTurns:           int(webFloat64(v["user_turns"])),
 			PromptTokens:        int(webFloat64(v["prompt_tokens"])),
 			CompletionTokens:    int(webFloat64(v["completion_tokens"])),
 			CacheCreationTokens: int(webFloat64(v["cache_creation_tokens"])),
@@ -867,46 +949,14 @@ func renderWebProjectSummaryTable(payload statsPayload, hasSnapshot bool) string
 	var totalInput, totalOutput int
 	var b strings.Builder
 
-	// Datastar signals div – one boolean per project row
-	b.WriteString(`<div data-signals`)
-	for i := range rows {
-		fmt.Fprintf(&b, `:__p%d="false"`, i)
-	}
-	b.WriteString(`></div>`)
-
 	b.WriteString(`<table id="project-summary-table"><thead><tr><th>Project</th><th>Calls</th><th>Input</th><th>Output</th><th>Premium</th><th>Cost</th><th>API%</th></tr></thead><tbody>`)
-	for i, row := range rows {
+	for _, row := range rows {
 		totalPremium += row.stats.PremiumRequests
 		totalInput += row.stats.PromptTokens
 		totalOutput += row.stats.CompletionTokens
-		sig := fmt.Sprintf("__p%d", i)
-		fmt.Fprintf(&b, `<tr class="expandable-row" data-on:click="$%s = !$%s">`, sig, sig)
-		fmt.Fprintf(&b, `<td><span data-text="$%s ? '▼ ' : '▶ '">▶ </span>%s</td>`, sig, html.EscapeString(row.name))
-		fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
-			commaInt(row.stats.APICalls),
-			fmtTokens(row.stats.PromptTokens),
-			fmtTokens(row.stats.CompletionTokens),
-			commaFloat(row.stats.PremiumRequests, 0),
-			fmtCost(row.stats.PremiumRequestCost),
-			fmtAPIPercent(row.stats.PremiumRequestCost, row.stats.Cost),
-		)
-		b.WriteString(`</tr>`)
-		if models, ok := payload.ProjectModels[row.name]; ok {
-			modelRows := sortedWebStatsRows(models)
-			for _, mr := range modelRows {
-				fmt.Fprintf(&b, `<tr class="project-model-row" data-show="$%s">`, sig)
-				fmt.Fprintf(&b, `<td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
-					html.EscapeString(mr.name),
-					commaInt(mr.stats.APICalls),
-					fmtTokens(mr.stats.PromptTokens),
-					fmtTokens(mr.stats.CompletionTokens),
-					commaFloat(mr.stats.PremiumRequests, 0),
-					fmtCost(mr.stats.PremiumRequestCost),
-					fmtAPIPercent(mr.stats.PremiumRequestCost, mr.stats.Cost),
-				)
-				b.WriteString(`</tr>`)
-			}
-		}
+		rowKey := webStableRowKey("project", row.name)
+		b.WriteString(renderWebProjectSummaryRow(row, rowKey, false))
+		b.WriteString(renderWebProjectDetailRow(payload, row.name, rowKey, false))
 	}
 	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
@@ -916,6 +966,53 @@ func renderWebProjectSummaryTable(payload statsPayload, hasSnapshot bool) string
 		fmtCost(payload.TotalPremiumRequestCost),
 		fmtAPIPercent(payload.TotalPremiumRequestCost, payload.TotalCost),
 	)
+	return b.String()
+}
+
+func renderWebProjectSummaryRow(row webStatsRow, rowKey string, expanded bool) string {
+	icon := "▶"
+	expand := "true"
+	if expanded {
+		icon = "▼"
+		expand = "false"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, `<tr id="%s" class="expandable-row" data-row-group="project" data-row-key="%s" data-expand-action="%s" data-on:click="@post('/actions/project-row?row_key=%s&expand=%s')">`,
+		webProjectSummaryRowID(rowKey), rowKey, expand, rowKey, expand)
+	fmt.Fprintf(&b, `<td>%s %s</td>`, icon, html.EscapeString(row.name))
+	fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+		commaInt(row.stats.APICalls),
+		fmtTokens(row.stats.PromptTokens),
+		fmtTokens(row.stats.CompletionTokens),
+		commaFloat(row.stats.PremiumRequests, 0),
+		fmtCost(row.stats.PremiumRequestCost),
+		fmtAPIPercent(row.stats.PremiumRequestCost, row.stats.Cost),
+	)
+	b.WriteString(`</tr>`)
+	return b.String()
+}
+
+func renderWebProjectDetailRow(payload statsPayload, projectName, rowKey string, expanded bool) string {
+	models := payload.ProjectModels[projectName]
+	modelRows := sortedWebStatsRows(models)
+	if !expanded || len(modelRows) == 0 {
+		return fmt.Sprintf(`<tr id="%s"></tr>`, webProjectDetailRowID(rowKey))
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, `<tr id="%s"><td colspan="7"><table class="detail-table"><tbody>`, webProjectDetailRowID(rowKey))
+	for _, mr := range modelRows {
+		fmt.Fprintf(&b, `<tr class="project-model-row"><td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+			html.EscapeString(mr.name),
+			commaInt(mr.stats.APICalls),
+			fmtTokens(mr.stats.PromptTokens),
+			fmtTokens(mr.stats.CompletionTokens),
+			commaFloat(mr.stats.PremiumRequests, 0),
+			fmtCost(mr.stats.PremiumRequestCost),
+			fmtAPIPercent(mr.stats.PremiumRequestCost, mr.stats.Cost),
+		)
+		b.WriteString(`</tr>`)
+	}
+	b.WriteString(`</tbody></table></td></tr>`)
 	return b.String()
 }
 
@@ -933,56 +1030,15 @@ func renderWebDailyTotalsTable(payload statsPayload, hasSnapshot bool) string {
 	var totalInput, totalOutput int
 	var b strings.Builder
 
-	// Datastar signals div – one boolean per day row
-	b.WriteString(`<div data-signals`)
-	for i := range rows {
-		fmt.Fprintf(&b, `:__d%d="false"`, i)
-	}
-	b.WriteString(`></div>`)
-
 	b.WriteString(`<table id="daily-totals-table"><thead><tr><th>Date</th><th>Calls</th><th>Premium</th><th>Input</th><th>Output</th><th>Cost</th><th>API%</th></tr></thead><tbody>`)
-	for i, row := range rows {
+	for _, row := range rows {
 		totalPremium += row.premiumRequests
 		totalPremCost += row.premRequestCost
 		totalInput += row.promptTokens
 		totalOutput += row.completionTokens
-		sig := fmt.Sprintf("__d%d", i)
-		fmt.Fprintf(&b, `<tr class="expandable-row" data-on:click="$%s = !$%s">`, sig, sig)
-		fmt.Fprintf(&b, `<td><span data-text="$%s ? '▼ ' : '▶ '">▶ </span>%s</td>`, sig, html.EscapeString(row.day))
-		fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
-			commaInt(row.apiCalls),
-			commaFloat(row.premiumRequests, 0),
-			fmtTokens(row.promptTokens),
-			fmtTokens(row.completionTokens),
-			fmtCost(row.premRequestCost),
-			fmtAPIPercent(row.premRequestCost, row.totalCost),
-		)
-		b.WriteString(`</tr>`)
-		dayMap := payload.Daily[row.day]
-		modelNames := make([]string, 0)
-		for key := range dayMap {
-			if !strings.HasPrefix(key, "_") {
-				modelNames = append(modelNames, key)
-			}
-		}
-		sort.Strings(modelNames)
-		for _, model := range modelNames {
-			stats, ok := webDailyStatsValue(dayMap[model])
-			if !ok {
-				continue
-			}
-			fmt.Fprintf(&b, `<tr class="daily-model-row" data-show="$%s">`, sig)
-			fmt.Fprintf(&b, `<td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
-				html.EscapeString(model),
-				commaInt(stats.APICalls),
-				commaFloat(stats.PremiumRequests, 0),
-				fmtTokens(stats.PromptTokens),
-				fmtTokens(stats.CompletionTokens),
-				fmtCost(stats.PremiumRequestCost),
-				fmtAPIPercent(stats.PremiumRequestCost, stats.Cost),
-			)
-			b.WriteString(`</tr>`)
-		}
+		rowKey := webStableRowKey("day", row.day)
+		b.WriteString(renderWebDaySummaryRow(row, rowKey, false))
+		b.WriteString(renderWebDayDetailRow(payload, row.day, rowKey, false))
 	}
 	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
@@ -992,6 +1048,68 @@ func renderWebDailyTotalsTable(payload statsPayload, hasSnapshot bool) string {
 		fmtCost(totalPremCost),
 		fmtAPIPercent(totalPremCost, payload.TotalCost),
 	)
+	return b.String()
+}
+
+func renderWebDaySummaryRow(row webDailyTotalsRow, rowKey string, expanded bool) string {
+	icon := "▶"
+	expand := "true"
+	if expanded {
+		icon = "▼"
+		expand = "false"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, `<tr id="%s" class="expandable-row" data-row-group="day" data-row-key="%s" data-expand-action="%s" data-on:click="@post('/actions/day-row?row_key=%s&expand=%s')">`,
+		webDaySummaryRowID(rowKey), rowKey, expand, rowKey, expand)
+	fmt.Fprintf(&b, `<td>%s %s</td>`, icon, html.EscapeString(row.day))
+	fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+		commaInt(row.apiCalls),
+		commaFloat(row.premiumRequests, 0),
+		fmtTokens(row.promptTokens),
+		fmtTokens(row.completionTokens),
+		fmtCost(row.premRequestCost),
+		fmtAPIPercent(row.premRequestCost, row.totalCost),
+	)
+	b.WriteString(`</tr>`)
+	return b.String()
+}
+
+func sortedWebDailyModelNames(dayMap map[string]interface{}) []string {
+	modelNames := make([]string, 0)
+	for key := range dayMap {
+		if !strings.HasPrefix(key, "_") {
+			modelNames = append(modelNames, key)
+		}
+	}
+	sort.Strings(modelNames)
+	return modelNames
+}
+
+func renderWebDayDetailRow(payload statsPayload, day, rowKey string, expanded bool) string {
+	dayMap := payload.Daily[day]
+	modelNames := sortedWebDailyModelNames(dayMap)
+	if !expanded || len(modelNames) == 0 {
+		return fmt.Sprintf(`<tr id="%s"></tr>`, webDayDetailRowID(rowKey))
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, `<tr id="%s"><td colspan="7"><table class="detail-table"><tbody>`, webDayDetailRowID(rowKey))
+	for _, model := range modelNames {
+		stats, ok := webDailyStatsValue(dayMap[model])
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(&b, `<tr class="daily-model-row"><td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+			html.EscapeString(model),
+			commaInt(stats.APICalls),
+			commaFloat(stats.PremiumRequests, 0),
+			fmtTokens(stats.PromptTokens),
+			fmtTokens(stats.CompletionTokens),
+			fmtCost(stats.PremiumRequestCost),
+			fmtAPIPercent(stats.PremiumRequestCost, stats.Cost),
+		)
+		b.WriteString(`</tr>`)
+	}
+	b.WriteString(`</tbody></table></td></tr>`)
 	return b.String()
 }
 
@@ -1066,6 +1184,74 @@ func renderWebSyncStatusTable(payload statsPayload, hasSnapshot bool) string {
 		)
 	}
 	b.WriteString("</tbody></table>")
+	return b.String()
+}
+
+func renderWebHourlyUsageTable(payload statsPayload, hasSnapshot bool) string {
+	if !hasSnapshot {
+		return "<p>Loading hourly usage…</p>"
+	}
+	if len(payload.Hourly) == 0 {
+		return "<p>No hourly usage available.</p>"
+	}
+
+	type hourlyCell struct {
+		hour     string
+		requests int
+		tokens   int
+		cost     float64
+	}
+	cells := make([]hourlyCell, 0, 24)
+	maxRequests, maxTokens := 0, 0
+	maxCost := 0.0
+	for hour := 0; hour < 24; hour++ {
+		key := fmt.Sprintf("%02d", hour)
+		stats := payload.Hourly[key]
+		tokens := stats.PromptTokens + stats.CompletionTokens
+		cells = append(cells, hourlyCell{hour: key, requests: stats.APICalls, tokens: tokens, cost: stats.Cost})
+		if stats.APICalls > maxRequests {
+			maxRequests = stats.APICalls
+		}
+		if tokens > maxTokens {
+			maxTokens = tokens
+		}
+		if stats.Cost > maxCost {
+			maxCost = stats.Cost
+		}
+	}
+	if maxRequests == 0 && maxTokens == 0 && maxCost == 0 {
+		return "<p>No hourly usage available.</p>"
+	}
+
+	var b strings.Builder
+	b.WriteString(`<div id="hourly-heatmap" data-hourly-heatmap data-metric-index="0">`)
+	b.WriteString(`<div id="hourly-heatmap-grid" class="hourly-heatmap-grid">`)
+	for _, cell := range cells {
+		tokensPct := 0.0
+		if maxTokens > 0 {
+			tokensPct = float64(cell.tokens) / float64(maxTokens) * 100
+		}
+		requestsPct := 0.0
+		if maxRequests > 0 {
+			requestsPct = float64(cell.requests) / float64(maxRequests) * 100
+		}
+		costPct := 0.0
+		if maxCost > 0 {
+			costPct = cell.cost / maxCost * 100
+		}
+		hour := html.EscapeString(cell.hour)
+		tokensLabel := html.EscapeString(fmtTokens(cell.tokens))
+		requestsLabel := html.EscapeString(commaInt(cell.requests))
+		costLabel := html.EscapeString(fmtCost(cell.cost))
+		fmt.Fprintf(&b, `<div class="hourly-heatmap-cell" data-hourly-heatmap-cell data-hour="%s" data-pct-tokens="%.2f" data-pct-requests="%.2f" data-pct-cost="%.2f" data-tokens-label="%s" data-requests-label="%s" data-cost-label="%s" style="--heat: %.4f;" title="%s:00 · Tokens: %s"><span class="hourly-heatmap-hour">%s</span></div>`,
+			hour,
+			tokensPct, requestsPct, costPct,
+			tokensLabel, requestsLabel, costLabel,
+			tokensPct/100,
+			hour, tokensLabel, hour,
+		)
+	}
+	b.WriteString(`</div></div>`)
 	return b.String()
 }
 
@@ -1213,8 +1399,97 @@ func dashboardShellHTML(payload statsPayload, hasSnapshot bool) string {
 	return dashboardShellHTMLWithIndicators(payload, hasSnapshot, placeholderIndicators)
 }
 
+func renderWebExpansionReplayScript() string {
+	return `<script>
+  (function () {
+    const storageKeys = {
+      project: 'copilot-token-cost:web:expanded-project-rows',
+      day: 'copilot-token-cost:web:expanded-day-rows'
+    };
+    const actionPaths = {
+      project: '/actions/project-row',
+      day: '/actions/day-row'
+    };
+
+    function readStoredRowKeys(group) {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(storageKeys[group]) || '[]');
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter((value) => typeof value === 'string' && value.trim() !== '');
+      } catch (_err) {
+        return [];
+      }
+    }
+
+    function writeStoredRowKeys(group, rowKeys) {
+      try {
+        localStorage.setItem(storageKeys[group], JSON.stringify(Array.from(new Set(rowKeys))));
+      } catch (_err) {
+      }
+    }
+
+    function rememberExpansionState(group, rowKey, shouldExpand) {
+      const rowKeys = new Set(readStoredRowKeys(group));
+      if (shouldExpand) {
+        rowKeys.add(rowKey);
+      } else {
+        rowKeys.delete(rowKey);
+      }
+      writeStoredRowKeys(group, Array.from(rowKeys));
+    }
+
+    function applyPatchElements(patch) {
+      for (const frame of patch.split('\n\n')) {
+        let selector = '';
+        let elements = '';
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data: selector ')) {
+            selector = line.slice('data: selector '.length).trim();
+          } else if (line.startsWith('data: elements ')) {
+            elements = line.slice('data: elements '.length);
+          }
+        }
+        if (!selector || !elements) continue;
+        const target = document.querySelector(selector);
+        if (target) {
+          target.outerHTML = elements;
+        }
+      }
+    }
+
+    async function replayGroup(group) {
+      const rowKeys = readStoredRowKeys(group);
+      for (const rowKey of rowKeys) {
+        const actionURL = actionPaths[group] + '?row_key=' + encodeURIComponent(rowKey) + '&expand=true';
+        try {
+          const response = await fetch(actionURL, { method: 'POST', headers: { 'Accept': 'text/event-stream' } });
+          if (!response.ok) continue;
+          applyPatchElements(await response.text());
+        } catch (_err) {
+        }
+      }
+    }
+
+    document.addEventListener('click', function (evt) {
+      if (!(evt.target instanceof Element)) return;
+      const row = evt.target.closest('tr.expandable-row[data-row-group][data-row-key][data-expand-action]');
+      if (!row) return;
+      const group = row.getAttribute('data-row-group');
+      const rowKey = row.getAttribute('data-row-key');
+      if (!group || !rowKey) return;
+      rememberExpansionState(group, rowKey, row.getAttribute('data-expand-action') === 'true');
+    }, true);
+
+    void replayGroup('project').then(function () {
+      return replayGroup('day');
+    });
+  })();
+  </script>`
+}
+
 func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, refreshIndicatorsHTML string) string {
 	overviewHTML := dashboardOverviewHTML(payload, hasSnapshot)
+	replayScript := renderWebExpansionReplayScript()
 	statsJSON := "Loading…"
 	if hasSnapshot {
 		body, err := json.MarshalIndent(payload, "", "  ")
@@ -1237,6 +1512,7 @@ func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, re
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 1.5rem; }
     #dashboard-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 1rem; }
     #dashboard-header h1 { margin: 0; }
+    #dashboard-header p { margin: 0.35rem 0 0; }
     .refresh-indicators { font-size: 0.78rem; border: 1px solid #d1d5db; background: #f9fafb; border-radius: 0.4rem; padding: 0.3rem 0.5rem; min-width: 13rem; }
     .refresh-indicator-row { display: flex; justify-content: space-between; gap: 0.5rem; white-space: nowrap; }
     .refresh-indicator-row + .refresh-indicator-row { margin-top: 0.2rem; }
@@ -1253,8 +1529,13 @@ func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, re
     .sync-status-compact summary { cursor: pointer; }
     .sync-status-compact table { font-size: 0.82rem; margin-top: 0.3rem; }
     .sync-status-compact th, .sync-status-compact td { padding: 0.2rem 0.4rem; }
+    .hourly-heatmap-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 0.35rem; max-width: 40rem; }
+    .hourly-heatmap-cell { aspect-ratio: 1 / 1; border: 1px solid #d1d5db; border-radius: 0.35rem; background: rgba(99, 102, 241, calc(0.08 + var(--heat, 0) * 0.82)); color: #1f2937; display: flex; align-items: flex-end; justify-content: flex-end; padding: 0.2rem; box-sizing: border-box; }
+    .hourly-heatmap-hour { font-size: 0.68rem; line-height: 1; }
     .expandable-row { cursor: pointer; }
     .expandable-row:hover { background: #f9fafb; }
+    .detail-table { margin: 0; width: 100%%; }
+    .detail-table td { border: 0; padding: 0.2rem 0.3rem; }
     .daily-model-row td, .project-model-row td { font-size: 0.82rem; color: #6b7280; }
     .model-indent { padding-left: 1.5rem !important; }
     .token-chart { margin: 1rem 0; }
@@ -1271,12 +1552,16 @@ func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, re
 </head>
 <body data-signals:status-message="''">
   <header id="dashboard-header">
-    <h1>Copilot Token Cost Dashboard</h1>
+    <div>
+      <h1>Copilot Token Cost Dashboard</h1>
+      <p><a href="/daily-spend">View today's spend</a></p>
+    </div>
     %s
   </header>
   <div id="status" data-text="$statusMessage"></div>
   <main id="dashboard-overview">%s</main>
   <pre id="stats-json">%s</pre>
+  %s
   <div data-init="@get('/events')"></div>
   <div data-on:datastar-fetch="
          evt.detail.type === 'started' && ($statusMessage = '');
@@ -1284,7 +1569,804 @@ func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, re
         "></div>
   <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0-RC.7/bundles/datastar.js"></script>
 </body>
-</html>`, refreshIndicatorsHTML, overviewHTML, html.EscapeString(statsJSON))
+</html>`, refreshIndicatorsHTML, overviewHTML, html.EscapeString(statsJSON), replayScript)
+}
+
+func findWebDailyTotalsRow(payload statsPayload, day string) (webDailyTotalsRow, bool) {
+	for _, row := range buildWebDailyTotalsRows(payload) {
+		if row.day == day {
+			return row, true
+		}
+	}
+	return webDailyTotalsRow{day: day}, false
+}
+
+func webCurrentDailyUsageStreak(rows []webDailyTotalsRow, day string) int {
+	if _, err := time.Parse("2006-01-02", day); err != nil {
+		return 0
+	}
+	byDay := make(map[string]int, len(rows))
+	for _, row := range rows {
+		byDay[row.day] = row.apiCalls
+	}
+	streak := 0
+	for cursor := day; ; {
+		calls, ok := byDay[cursor]
+		if !ok || calls <= 0 {
+			break
+		}
+		streak++
+		parsed, err := time.Parse("2006-01-02", cursor)
+		if err != nil {
+			break
+		}
+		cursor = parsed.AddDate(0, 0, -1).Format("2006-01-02")
+	}
+	return streak
+}
+
+func webDailySpendTierAndProgress(spend float64) (string, string, float64) {
+	tiers := []struct {
+		name     string
+		minSpend float64
+	}{
+		{name: "Starter", minSpend: 0},
+		{name: "Bronze", minSpend: 0.10},
+		{name: "Silver", minSpend: 0.25},
+		{name: "Gold", minSpend: 0.50},
+		{name: "Platinum", minSpend: 1.00},
+	}
+	currentIdx := 0
+	for i := 0; i < len(tiers); i++ {
+		if spend >= tiers[i].minSpend {
+			currentIdx = i
+		}
+	}
+	if currentIdx == len(tiers)-1 {
+		return tiers[currentIdx].name, "Max", 100
+	}
+	nextIdx := currentIdx + 1
+	progressRange := tiers[nextIdx].minSpend - tiers[currentIdx].minSpend
+	progress := 0.0
+	if progressRange > 0 {
+		progress = (spend - tiers[currentIdx].minSpend) / progressRange * 100
+	}
+	if progress < 0 {
+		progress = 0
+	}
+	if progress > 100 {
+		progress = 100
+	}
+	return tiers[currentIdx].name, tiers[nextIdx].name, progress
+}
+
+type webDailySpendTotals struct {
+	InputTokens  int
+	OutputTokens int
+	PremiumSpend float64
+	APISpend     float64
+}
+
+type webDailySpendAverages struct {
+	InputTokens  float64
+	OutputTokens float64
+	PremiumSpend float64
+	APISpend     float64
+}
+
+type webDailySpendTokenTrendPoint struct {
+	Day          string
+	InputTokens  int
+	OutputTokens int
+}
+
+type webDailySpendMoneyTrendPoint struct {
+	Day          string
+	PremiumSpend float64
+	APISpend     float64
+}
+
+type webDailySpendTopRow struct {
+	Name         string
+	InputTokens  int
+	OutputTokens int
+	PremiumSpend float64
+	APISpend     float64
+	PromptCount  int
+}
+
+type webDailySpendMetricCard struct {
+	ID    string
+	Label string
+	Value string
+}
+
+type webDailySpendData struct {
+	Day                 string
+	Today               webDailySpendTotals
+	Rolling7DayAverage  webDailySpendAverages
+	TokenTrend          []webDailySpendTokenTrendPoint
+	MoneyTrend          []webDailySpendMoneyTrendPoint
+	TopModelsToday      []webDailySpendTopRow
+	TopModelsRolling7   []webDailySpendTopRow
+	TopProjectsToday    []webDailySpendTopRow
+	TopProjectsRolling7 []webDailySpendTopRow
+}
+
+type webDailySpendTopAccumulator struct {
+	inputTokens  float64
+	outputTokens float64
+	premiumSpend float64
+	apiSpend     float64
+	promptCount  float64
+}
+
+func webDailySpendHybridScore(apiSpend float64, inputTokens, outputTokens int) float64 {
+	return 0.7*apiSpend + 0.3*float64(inputTokens+outputTokens)
+}
+
+func buildWebDailySpendData(payload statsPayload, now time.Time) webDailySpendData {
+	day := now.Format("2006-01-02")
+	windowDays := webRecentDayWindow(day, 7)
+	todayModels := webDailyModelStatsByDay(payload, day)
+	rollingModels := webDailyModelStatsByDays(payload, windowDays)
+	todayProjects := webDailyProjectStatsByDay(payload, day)
+	rollingProjects := webDailyProjectStatsByDays(payload, windowDays)
+	if len(todayProjects) == 0 {
+		todayProjects = webDailySpendTopProjectStatsFromModelWeights(payload, todayModels)
+	}
+	if len(rollingProjects) == 0 {
+		rollingProjects = webDailySpendTopProjectStatsFromModelWeights(payload, rollingModels)
+	}
+	todayTotals := webDailySpendTotalsFromStatsMap(todayModels)
+	rollingTotals := webDailySpendTotalsFromStatsMap(rollingModels)
+	windowSize := float64(len(windowDays))
+	if windowSize == 0 {
+		windowSize = 1
+	}
+	tokenTrend := make([]webDailySpendTokenTrendPoint, 0, len(windowDays))
+	moneyTrend := make([]webDailySpendMoneyTrendPoint, 0, len(windowDays))
+	for _, dayKey := range windowDays {
+		totals := webDailySpendTotalsFromStatsMap(webDailyModelStatsByDay(payload, dayKey))
+		tokenTrend = append(tokenTrend, webDailySpendTokenTrendPoint{
+			Day:          dayKey,
+			InputTokens:  totals.InputTokens,
+			OutputTokens: totals.OutputTokens,
+		})
+		moneyTrend = append(moneyTrend, webDailySpendMoneyTrendPoint{
+			Day:          dayKey,
+			PremiumSpend: totals.PremiumSpend,
+			APISpend:     totals.APISpend,
+		})
+	}
+	return webDailySpendData{
+		Day:   day,
+		Today: todayTotals,
+		Rolling7DayAverage: webDailySpendAverages{
+			InputTokens:  float64(rollingTotals.InputTokens) / windowSize,
+			OutputTokens: float64(rollingTotals.OutputTokens) / windowSize,
+			PremiumSpend: rollingTotals.PremiumSpend / windowSize,
+			APISpend:     rollingTotals.APISpend / windowSize,
+		},
+		TokenTrend:          tokenTrend,
+		MoneyTrend:          moneyTrend,
+		TopModelsToday:      webDailySpendTopRowsFromStatsMap(todayModels),
+		TopModelsRolling7:   webDailySpendTopRowsFromStatsMap(rollingModels),
+		TopProjectsToday:    webDailySpendTopRowsFromStatsMap(todayProjects),
+		TopProjectsRolling7: webDailySpendTopRowsFromStatsMap(rollingProjects),
+	}
+}
+
+func webRecentDayWindow(day string, size int) []string {
+	if size <= 0 {
+		return nil
+	}
+	parsedDay, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		return []string{day}
+	}
+	window := make([]string, 0, size)
+	for i := size - 1; i >= 0; i-- {
+		window = append(window, parsedDay.AddDate(0, 0, -i).Format("2006-01-02"))
+	}
+	return window
+}
+
+func webDailyModelStatsByDay(payload statsPayload, day string) map[string]statsPayloadStats {
+	dayMap, ok := payload.Daily[day]
+	if !ok {
+		return map[string]statsPayloadStats{}
+	}
+	out := make(map[string]statsPayloadStats)
+	for key, value := range dayMap {
+		if strings.HasPrefix(key, "_") {
+			continue
+		}
+		stats, ok := webDailyStatsValue(value)
+		if !ok {
+			continue
+		}
+		out[key] = stats
+	}
+	return out
+}
+
+func webDailyModelStatsByDays(payload statsPayload, days []string) map[string]statsPayloadStats {
+	out := make(map[string]statsPayloadStats)
+	for _, day := range days {
+		for model, stats := range webDailyModelStatsByDay(payload, day) {
+			acc := out[model]
+			webMergeDailySpendStats(&acc, stats)
+			out[model] = acc
+		}
+	}
+	return out
+}
+
+func webDailyProjectStatsByDay(payload statsPayload, day string) map[string]statsPayloadStats {
+	if len(payload.DailyProjects) == 0 {
+		return map[string]statsPayloadStats{}
+	}
+	dayMap, ok := payload.DailyProjects[day]
+	if !ok {
+		return map[string]statsPayloadStats{}
+	}
+	out := make(map[string]statsPayloadStats, len(dayMap))
+	for project, stats := range dayMap {
+		out[project] = stats
+	}
+	return out
+}
+
+func webDailyProjectStatsByDays(payload statsPayload, days []string) map[string]statsPayloadStats {
+	out := make(map[string]statsPayloadStats)
+	for _, day := range days {
+		for project, stats := range webDailyProjectStatsByDay(payload, day) {
+			acc := out[project]
+			webMergeDailySpendStats(&acc, stats)
+			out[project] = acc
+		}
+	}
+	return out
+}
+
+func webMergeDailySpendStats(acc *statsPayloadStats, stats statsPayloadStats) {
+	acc.APICalls += stats.APICalls
+	acc.UserTurns += stats.UserTurns
+	acc.PromptTokens += stats.PromptTokens
+	acc.CompletionTokens += stats.CompletionTokens
+	acc.CacheCreationTokens += stats.CacheCreationTokens
+	acc.CacheReadTokens += stats.CacheReadTokens
+	acc.PremiumRequests += stats.PremiumRequests
+	acc.PremiumRequestCost += stats.PremiumRequestCost
+	acc.InputUncached += stats.InputUncached
+	acc.Cost += stats.Cost
+	acc.CostWithoutCache += stats.CostWithoutCache
+}
+
+func webDailySpendTotalsFromStatsMap(statsMap map[string]statsPayloadStats) webDailySpendTotals {
+	totals := webDailySpendTotals{}
+	for _, stats := range statsMap {
+		totals.InputTokens += stats.PromptTokens
+		totals.OutputTokens += stats.CompletionTokens
+		totals.PremiumSpend += stats.PremiumRequestCost
+		totals.APISpend += stats.Cost
+	}
+	return totals
+}
+
+func webDailySpendTopRowsFromStatsMap(statsMap map[string]statsPayloadStats) []webDailySpendTopRow {
+	rows := make([]webDailySpendTopRow, 0, len(statsMap))
+	for name, stats := range statsMap {
+		rows = append(rows, webDailySpendTopRow{
+			Name:         name,
+			InputTokens:  stats.PromptTokens,
+			OutputTokens: stats.CompletionTokens,
+			PremiumSpend: stats.PremiumRequestCost,
+			APISpend:     stats.Cost,
+			PromptCount:  stats.UserTurns,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		iScore := webDailySpendHybridScore(rows[i].APISpend, rows[i].InputTokens, rows[i].OutputTokens)
+		jScore := webDailySpendHybridScore(rows[j].APISpend, rows[j].InputTokens, rows[j].OutputTokens)
+		if iScore == jScore {
+			return rows[i].Name < rows[j].Name
+		}
+		return iScore > jScore
+	})
+	if len(rows) > 3 {
+		rows = rows[:3]
+	}
+	return rows
+}
+
+func webDailySpendTopProjectStatsFromModelWeights(payload statsPayload, modelStats map[string]statsPayloadStats) map[string]statsPayloadStats {
+	projectWeights := webDailySpendProjectWeightsByModel(payload)
+	if len(projectWeights) == 0 {
+		return payload.Projects
+	}
+	projectAcc := make(map[string]webDailySpendTopAccumulator)
+	for model, stats := range modelStats {
+		weights := projectWeights[model]
+		if len(weights) == 0 {
+			weights = map[string]float64{"(unknown)": 1}
+		}
+		for project, weight := range weights {
+			if weight <= 0 {
+				continue
+			}
+			acc := projectAcc[project]
+			acc.inputTokens += float64(stats.PromptTokens) * weight
+			acc.outputTokens += float64(stats.CompletionTokens) * weight
+			acc.premiumSpend += stats.PremiumRequestCost * weight
+			acc.apiSpend += stats.Cost * weight
+			acc.promptCount += float64(stats.UserTurns) * weight
+			projectAcc[project] = acc
+		}
+	}
+	statsMap := make(map[string]statsPayloadStats, len(projectAcc))
+	for project, acc := range projectAcc {
+		statsMap[project] = statsPayloadStats{
+			APICalls:           0,
+			UserTurns:          webRoundPositiveInt(acc.promptCount),
+			PromptTokens:       webRoundPositiveInt(acc.inputTokens),
+			CompletionTokens:   webRoundPositiveInt(acc.outputTokens),
+			PremiumRequestCost: acc.premiumSpend,
+			Cost:               acc.apiSpend,
+		}
+	}
+	return statsMap
+}
+
+func webDailySpendTopProjectRows(payload statsPayload, modelStats map[string]statsPayloadStats) []webDailySpendTopRow {
+	return webDailySpendTopRowsFromStatsMap(webDailySpendTopProjectStatsFromModelWeights(payload, modelStats))
+}
+
+func webDailySpendProjectWeightsByModel(payload statsPayload) map[string]map[string]float64 {
+	weights := make(map[string]map[string]float64)
+	for project, modelMap := range payload.ProjectModels {
+		for model, stats := range modelMap {
+			weight := stats.PremiumRequestCost
+			if weight <= 0 {
+				weight = float64(stats.APICalls)
+			}
+			if weight <= 0 {
+				weight = float64(stats.PromptTokens + stats.CompletionTokens)
+			}
+			if weight <= 0 {
+				weight = 1
+			}
+			if _, ok := weights[model]; !ok {
+				weights[model] = make(map[string]float64)
+			}
+			weights[model][project] += weight
+		}
+	}
+	for model, modelWeights := range weights {
+		sum := 0.0
+		for _, weight := range modelWeights {
+			sum += weight
+		}
+		if sum <= 0 {
+			continue
+		}
+		for project, weight := range modelWeights {
+			modelWeights[project] = weight / sum
+		}
+		weights[model] = modelWeights
+	}
+	return weights
+}
+
+func webRoundPositiveInt(value float64) int {
+	if value <= 0 {
+		return 0
+	}
+	return int(value + 0.5)
+}
+
+func renderWebDailySpendMetricCards(cards []webDailySpendMetricCard) string {
+	var b strings.Builder
+	b.WriteString(`<div class="daily-spend-metrics">`)
+	for _, card := range cards {
+		valueID := ""
+		if strings.TrimSpace(card.ID) != "" {
+			valueID = fmt.Sprintf(` id="%s"`, card.ID)
+		}
+		fmt.Fprintf(&b, `<article class="daily-spend-metric"><h4>%s</h4><p%s>%s</p></article>`,
+			html.EscapeString(card.Label),
+			valueID,
+			html.EscapeString(card.Value),
+		)
+	}
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+type webDailySpendLineSeries struct {
+	Label  string
+	Stroke string
+	Axis   string
+	Values []float64
+}
+
+func renderWebDailySpendLineChart(id string, points []string, series []webDailySpendLineSeries, formatY func(float64) string) string {
+	if len(points) == 0 || len(series) == 0 {
+		return fmt.Sprintf(`<div id="%s" class="daily-spend-chart-empty">No data yet.</div>`, id)
+	}
+	leftMaxValue := 0.0
+	rightMaxValue := 0.0
+	hasRightAxis := false
+	seriesAxis := func(item webDailySpendLineSeries) string {
+		if strings.EqualFold(strings.TrimSpace(item.Axis), "right") {
+			return "right"
+		}
+		return "left"
+	}
+	for _, item := range series {
+		axis := seriesAxis(item)
+		if axis == "right" {
+			hasRightAxis = true
+		}
+		for _, value := range item.Values {
+			if axis == "right" {
+				if value > rightMaxValue {
+					rightMaxValue = value
+				}
+				continue
+			}
+			if value > leftMaxValue {
+				leftMaxValue = value
+			}
+		}
+	}
+	if leftMaxValue <= 0 {
+		leftMaxValue = 1
+	}
+	if rightMaxValue <= 0 {
+		rightMaxValue = leftMaxValue
+	}
+	const (
+		svgWidth  = 640.0
+		svgHeight = 220.0
+		leftPad   = 44.0
+		topPad    = 12.0
+		bottomPad = 28.0
+	)
+	rightPad := 12.0
+	if hasRightAxis {
+		rightPad = 44
+	}
+	plotWidth := svgWidth - leftPad - rightPad
+	plotHeight := svgHeight - topPad - bottomPad
+	xAt := func(index int) float64 {
+		if len(points) <= 1 {
+			return leftPad + plotWidth/2
+		}
+		return leftPad + float64(index)*plotWidth/float64(len(points)-1)
+	}
+	yAt := func(value, maxValue float64) float64 {
+		return topPad + (1-value/maxValue)*plotHeight
+	}
+	buildPath := func(values []float64, maxValue float64) string {
+		if len(values) == 0 {
+			return ""
+		}
+		var path strings.Builder
+		for index, value := range values {
+			if index == 0 {
+				fmt.Fprintf(&path, "M %.2f %.2f", xAt(index), yAt(value, maxValue))
+				continue
+			}
+			fmt.Fprintf(&path, " L %.2f %.2f", xAt(index), yAt(value, maxValue))
+		}
+		return path.String()
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, `<figure id="%s" class="daily-spend-chart"><svg viewBox="0 0 %.0f %.0f" role="img" aria-label="Daily spend trend chart">`,
+		id, svgWidth, svgHeight)
+	for _, ratio := range []float64{0, 0.5, 1} {
+		y := topPad + ratio*plotHeight
+		leftValue := leftMaxValue * (1 - ratio)
+		fmt.Fprintf(&b, `<line x1="%.2f" y1="%.2f" x2="%.2f" y2="%.2f" stroke="#e5e7eb" stroke-width="1"/>`,
+			leftPad, y, leftPad+plotWidth, y)
+		fmt.Fprintf(&b, `<text x="4" y="%.2f" font-size="10" fill="#6b7280">%s</text>`,
+			y+3, html.EscapeString(formatY(leftValue)))
+		if hasRightAxis {
+			rightValue := rightMaxValue * (1 - ratio)
+			fmt.Fprintf(&b, `<text x="%.2f" y="%.2f" font-size="10" fill="#6b7280" text-anchor="end">%s</text>`,
+				svgWidth-4, y+3, html.EscapeString(formatY(rightValue)))
+		}
+	}
+	fmt.Fprintf(&b, `<line x1="%.2f" y1="%.2f" x2="%.2f" y2="%.2f" stroke="#9ca3af" stroke-width="1"/>`,
+		leftPad, topPad+plotHeight, leftPad+plotWidth, topPad+plotHeight)
+	for _, item := range series {
+		maxValue := leftMaxValue
+		if seriesAxis(item) == "right" {
+			maxValue = rightMaxValue
+		}
+		path := buildPath(item.Values, maxValue)
+		if path == "" {
+			continue
+		}
+		fmt.Fprintf(&b, `<path d="%s" fill="none" stroke="%s" stroke-width="2"/>`,
+			html.EscapeString(path),
+			html.EscapeString(item.Stroke),
+		)
+		for index, value := range item.Values {
+			fmt.Fprintf(&b, `<circle cx="%.2f" cy="%.2f" r="2.5" fill="%s"/>`,
+				xAt(index),
+				yAt(value, maxValue),
+				html.EscapeString(item.Stroke),
+			)
+		}
+	}
+	firstLabel := html.EscapeString(webDailySpendShortDayLabel(points[0]))
+	lastLabel := html.EscapeString(webDailySpendShortDayLabel(points[len(points)-1]))
+	fmt.Fprintf(&b, `<text x="%.2f" y="%.2f" font-size="10" fill="#6b7280" text-anchor="start">%s</text>`,
+		xAt(0), svgHeight-8, firstLabel)
+	fmt.Fprintf(&b, `<text x="%.2f" y="%.2f" font-size="10" fill="#6b7280" text-anchor="end">%s</text>`,
+		xAt(len(points)-1), svgHeight-8, lastLabel)
+	b.WriteString(`</svg><figcaption class="daily-spend-chart-legend">`)
+	for _, item := range series {
+		fmt.Fprintf(&b, `<span><span class="daily-spend-chart-swatch" style="background:%s"></span>%s</span>`,
+			html.EscapeString(item.Stroke),
+			html.EscapeString(item.Label),
+		)
+	}
+	b.WriteString(`</figcaption></figure>`)
+	return b.String()
+}
+
+func webDailySpendShortDayLabel(day string) string {
+	parsed, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		return day
+	}
+	return parsed.Format("01-02")
+}
+
+func renderWebDailySpendTokenTrendTable(id string, points []webDailySpendTokenTrendPoint) string {
+	dayLabels := make([]string, 0, len(points))
+	inputValues := make([]float64, 0, len(points))
+	outputValues := make([]float64, 0, len(points))
+	for _, point := range points {
+		dayLabels = append(dayLabels, point.Day)
+		inputValues = append(inputValues, float64(point.InputTokens))
+		outputValues = append(outputValues, float64(point.OutputTokens))
+	}
+	return renderWebDailySpendLineChart(id, dayLabels, []webDailySpendLineSeries{
+		{Label: "Input tokens (left axis)", Stroke: "#2563eb", Axis: "left", Values: inputValues},
+		{Label: "Output tokens (right axis)", Stroke: "#14b8a6", Axis: "right", Values: outputValues},
+	}, func(value float64) string { return fmtTokens(webRoundPositiveInt(value)) })
+}
+
+func renderWebDailySpendMoneyTrendTable(id string, points []webDailySpendMoneyTrendPoint) string {
+	dayLabels := make([]string, 0, len(points))
+	premiumValues := make([]float64, 0, len(points))
+	apiValues := make([]float64, 0, len(points))
+	for _, point := range points {
+		dayLabels = append(dayLabels, point.Day)
+		premiumValues = append(premiumValues, point.PremiumSpend)
+		apiValues = append(apiValues, point.APISpend)
+	}
+	return renderWebDailySpendLineChart(id, dayLabels, []webDailySpendLineSeries{
+		{Label: "Premium spend", Stroke: "#7c3aed", Values: premiumValues},
+		{Label: "API spend", Stroke: "#f97316", Values: apiValues},
+	}, func(value float64) string { return fmtCost(value) })
+}
+
+func renderWebDailySpendTopListTable(id string, rows []webDailySpendTopRow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, `<table id="%s" class="daily-spend-table"><thead><tr><th>Name</th><th>Input tokens</th><th>Output tokens</th><th>Premium spend</th><th>API spend</th><th>Prompt count</th></tr></thead><tbody>`, id)
+	if len(rows) == 0 {
+		b.WriteString(`<tr><td colspan="6">No data yet.</td></tr>`)
+	} else {
+		for _, row := range rows {
+			fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`,
+				html.EscapeString(row.Name),
+				html.EscapeString(fmtTokens(row.InputTokens)),
+				html.EscapeString(fmtTokens(row.OutputTokens)),
+				html.EscapeString(fmtCost(row.PremiumSpend)),
+				html.EscapeString(fmtCost(row.APISpend)),
+				html.EscapeString(commaInt(row.PromptCount)),
+			)
+		}
+	}
+	b.WriteString(`</tbody></table>`)
+	return b.String()
+}
+
+func renderWebDailyLeaderboardList(id string, rows []webStatsRow) string {
+	if len(rows) == 0 {
+		return fmt.Sprintf(`<ol id="%s" class="daily-spend-leaderboard"><li>No data yet.</li></ol>`, id)
+	}
+	maxItems := 3
+	if len(rows) < maxItems {
+		maxItems = len(rows)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, `<ol id="%s" class="daily-spend-leaderboard">`, id)
+	for i := 0; i < maxItems; i++ {
+		row := rows[i]
+		fmt.Fprintf(&b, `<li><span class="daily-spend-leaderboard-name">%s</span><span class="daily-spend-leaderboard-value">%s</span></li>`,
+			html.EscapeString(row.name),
+			fmtCost(row.stats.PremiumRequestCost),
+		)
+	}
+	b.WriteString(`</ol>`)
+	return b.String()
+}
+
+func webDailyCacheTokens(payload statsPayload, day string) (int, int) {
+	dayMap, ok := payload.Daily[day]
+	if !ok {
+		return 0, 0
+	}
+	promptTokens := 0
+	cacheReadTokens := 0
+	for key, value := range dayMap {
+		if strings.HasPrefix(key, "_") {
+			continue
+		}
+		stats, ok := webDailyStatsValue(value)
+		if !ok {
+			continue
+		}
+		promptTokens += stats.PromptTokens
+		cacheReadTokens += stats.CacheReadTokens
+	}
+	return promptTokens, cacheReadTokens
+}
+
+func webDailyCacheEfficiencyTrend(rows []webDailyTotalsRow, day string, currentPct float64) string {
+	for idx, row := range rows {
+		if row.day != day || idx == 0 {
+			continue
+		}
+		prev := rows[idx-1]
+		prevPct := 0.0
+		if prev.totalCostNoCache > 0 {
+			prevPct = (prev.totalCostNoCache - prev.totalCost) / prev.totalCostNoCache * 100
+		}
+		delta := currentPct - prevPct
+		if delta > 0.1 {
+			return fmt.Sprintf("↑ %+.1fpp vs previous day", delta)
+		}
+		if delta < -0.1 {
+			return fmt.Sprintf("↓ %+.1fpp vs previous day", delta)
+		}
+		return fmt.Sprintf("→ %+.1fpp vs previous day", delta)
+	}
+	return "No previous-day trend yet."
+}
+
+func renderWebDailySpendRegion(payload statsPayload, hasSnapshot bool, now time.Time) string {
+	if !hasSnapshot {
+		return `<section id="daily-spend-region" class="daily-spend-region"><h2>Today's Spend</h2><p>Loading today's totals…</p></section>`
+	}
+	data := buildWebDailySpendData(payload, now)
+	emptyState := ""
+	if len(webDailyModelStatsByDay(payload, data.Day)) == 0 {
+		emptyState = `<p class="daily-spend-note">No usage recorded yet for today.</p>`
+	}
+	todayCards := renderWebDailySpendMetricCards([]webDailySpendMetricCard{
+		{ID: "daily-spend-tokens", Label: "Input tokens", Value: fmtTokens(data.Today.InputTokens)},
+		{ID: "daily-spend-output-tokens", Label: "Output tokens", Value: fmtTokens(data.Today.OutputTokens)},
+		{ID: "daily-spend-cost", Label: "Premium spend", Value: fmtCost(data.Today.PremiumSpend)},
+		{ID: "daily-spend-api-spend", Label: "API spend", Value: fmtCost(data.Today.APISpend)},
+	})
+	weeklyCards := renderWebDailySpendMetricCards([]webDailySpendMetricCard{
+		{ID: "daily-spend-weekly-input-tokens", Label: "Input tokens", Value: fmtTokens(webRoundPositiveInt(data.Rolling7DayAverage.InputTokens))},
+		{ID: "daily-spend-weekly-output-tokens", Label: "Output tokens", Value: fmtTokens(webRoundPositiveInt(data.Rolling7DayAverage.OutputTokens))},
+		{ID: "daily-spend-weekly-premium-spend", Label: "Premium spend", Value: fmtCost(data.Rolling7DayAverage.PremiumSpend)},
+		{ID: "daily-spend-weekly-api-spend", Label: "API spend", Value: fmtCost(data.Rolling7DayAverage.APISpend)},
+	})
+
+	return fmt.Sprintf(`<section id="daily-spend-region" class="daily-spend-region">
+  <h2>Today's Spend</h2>
+  <p class="daily-spend-date">%s</p>
+  <div class="daily-spend-top-panels">
+    <section id="daily-spend-today-summary" class="daily-spend-section daily-spend-top-panel"><h3>Today summary</h3>%s</section>
+    <section id="daily-spend-weekly-average" class="daily-spend-section daily-spend-top-panel"><h3>Weekly average (rolling 7 days including today)</h3>%s</section>
+  </div>
+  <div class="daily-spend-trend-panels">
+    <section id="daily-spend-token-trend-section" class="daily-spend-section"><h3>Token trend</h3>%s</section>
+    <section id="daily-spend-money-trend-section" class="daily-spend-section"><h3>Money trend</h3>%s</section>
+  </div>
+  <section id="daily-spend-top-projects-today-section" class="daily-spend-section"><h3>Top projects today</h3>%s</section>
+  <section id="daily-spend-top-projects-week-section" class="daily-spend-section"><h3>Top projects this week</h3>%s</section>
+  <section id="daily-spend-top-models-today-section" class="daily-spend-section"><h3>Top models today</h3>%s</section>
+  <section id="daily-spend-top-models-week-section" class="daily-spend-section"><h3>Top models this week</h3>%s</section>
+  %s
+</section>`,
+		html.EscapeString(data.Day),
+		todayCards,
+		weeklyCards,
+		renderWebDailySpendTokenTrendTable("daily-spend-token-trend", data.TokenTrend),
+		renderWebDailySpendMoneyTrendTable("daily-spend-money-trend", data.MoneyTrend),
+		renderWebDailySpendTopListTable("daily-spend-top-projects-today", data.TopProjectsToday),
+		renderWebDailySpendTopListTable("daily-spend-top-projects-week", data.TopProjectsRolling7),
+		renderWebDailySpendTopListTable("daily-spend-top-models-today", data.TopModelsToday),
+		renderWebDailySpendTopListTable("daily-spend-top-models-week", data.TopModelsRolling7),
+		emptyState,
+	)
+}
+
+func dailySpendShellHTML(payload statsPayload, hasSnapshot bool, now time.Time) string {
+	placeholderIndicators := `<div id="refresh-indicators-region"><div id="refresh-indicators" class="refresh-indicators">` +
+		renderRefreshIndicatorRow("Local", "Idle", "") +
+		renderRefreshIndicatorRow("Codespaces", "Idle", "") +
+		`</div></div>`
+	return dailySpendShellHTMLWithIndicators(payload, hasSnapshot, now, placeholderIndicators)
+}
+
+func dailySpendShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, now time.Time, refreshIndicatorsHTML string) string {
+	if strings.TrimSpace(refreshIndicatorsHTML) == "" {
+		refreshIndicatorsHTML = `<div id="refresh-indicators-region"></div>`
+	}
+	return fmt.Sprintf(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Copilot Daily Spend</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 1.5rem; }
+    #dashboard-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 1rem; }
+    #dashboard-header h1 { margin: 0; }
+    #dashboard-header p { margin: 0.35rem 0 0; }
+    .refresh-indicators { font-size: 0.78rem; border: 1px solid #d1d5db; background: #f9fafb; border-radius: 0.4rem; padding: 0.3rem 0.5rem; min-width: 13rem; }
+    .refresh-indicator-row { display: flex; justify-content: space-between; gap: 0.5rem; white-space: nowrap; }
+    .refresh-indicator-row + .refresh-indicator-row { margin-top: 0.2rem; }
+    .refresh-indicator-name { font-weight: 600; }
+    .refresh-indicator-countdown { color: #4b5563; }
+    #status { color: #b91c1c; margin-bottom: 1rem; }
+    .daily-spend-region { max-width: 72rem; }
+    .daily-spend-date { margin: 0.4rem 0 1rem; color: #4b5563; font-weight: 600; }
+    .daily-spend-top-panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+    .daily-spend-trend-panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+    .daily-spend-top-panel { margin-top: 0; }
+    .daily-spend-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; }
+    .daily-spend-metric { border: 1px solid #d1d5db; border-radius: 0.6rem; padding: 0.8rem; background: #f9fafb; min-height: 6.2rem; display: flex; flex-direction: column; justify-content: flex-start; gap: 0.35rem; }
+    .daily-spend-metric h4 { margin: 0; font-size: 0.95rem; color: #4b5563; }
+    .daily-spend-metric p { margin: 0; font-size: 1.55rem; font-weight: 700; line-height: 1.1; }
+    .daily-spend-section { margin-top: 1rem; }
+    .daily-spend-section h3 { margin: 0 0 0.6rem; color: #374151; font-size: 1rem; }
+    .daily-spend-chart { margin: 0; border: 1px solid #d1d5db; border-radius: 0.4rem; background: #fff; padding: 0.5rem; }
+    .daily-spend-chart svg { display: block; width: 100%%; height: auto; }
+    .daily-spend-chart-legend { margin-top: 0.4rem; display: flex; flex-wrap: wrap; gap: 0.75rem; color: #4b5563; font-size: 0.82rem; }
+    .daily-spend-chart-legend > span { display: inline-flex; align-items: center; gap: 0.35rem; }
+    .daily-spend-chart-swatch { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 999px; }
+    .daily-spend-chart-empty { border: 1px solid #d1d5db; border-radius: 0.4rem; background: #fff; padding: 0.9rem; color: #6b7280; font-size: 0.84rem; }
+    .daily-spend-table { width: 100%%; border-collapse: collapse; background: #fff; border: 1px solid #d1d5db; border-radius: 0.4rem; overflow: hidden; }
+    .daily-spend-table th, .daily-spend-table td { text-align: left; padding: 0.45rem 0.55rem; border-bottom: 1px solid #e5e7eb; font-size: 0.84rem; }
+    .daily-spend-table th { background: #f9fafb; color: #374151; }
+    .daily-spend-table tr:last-child td { border-bottom: none; }
+    .daily-spend-note { margin: 0.9rem 0 0; color: #6b7280; }
+    @media (max-width: 60rem) { .daily-spend-top-panels, .daily-spend-trend-panels { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body data-signals:status-message="''">
+  <header id="dashboard-header">
+    <div>
+      <h1>Today's Copilot Spend</h1>
+      <p><a href="/">Back to dashboard</a></p>
+    </div>
+    %s
+  </header>
+  <div id="status" data-text="$statusMessage"></div>
+  <main id="daily-spend-main">%s</main>
+  <div data-init="@get('/events')"></div>
+  <div data-on:datastar-fetch="
+         evt.detail.type === 'started' && ($statusMessage = '');
+         evt.detail.type === 'error' && ($statusMessage = String(evt.detail.error || 'request failed'));
+        "></div>
+  <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0-RC.7/bundles/datastar.js"></script>
+</body>
+</html>`, refreshIndicatorsHTML, renderWebDailySpendRegion(payload, hasSnapshot, now))
 }
 
 func newWebMux(state *webState) *http.ServeMux {
@@ -1302,6 +2384,18 @@ func newWebMux(state *webState) *http.ServeMux {
 		page := dashboardShellHTMLWithIndicators(payload, hasSnapshot, state.renderRefreshIndicators(time.Now()))
 		if _, err := w.Write([]byte(page)); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write / response: %v\n", err)
+		}
+	})
+	mux.HandleFunc("/daily-spend", func(w http.ResponseWriter, r *http.Request) {
+		if !handleMethod(w, r, http.MethodGet) {
+			return
+		}
+		payload, hasSnapshot := state.getSnapshot()
+		now := time.Now()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		page := dailySpendShellHTMLWithIndicators(payload, hasSnapshot, now, state.renderRefreshIndicators(now))
+		if _, err := w.Write([]byte(page)); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write /daily-spend response: %v\n", err)
 		}
 	})
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
@@ -1376,6 +2470,82 @@ func newWebMux(state *webState) *http.ServeMux {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		if _, err := w.Write([]byte("ok\n")); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write /healthz response: %v\n", err)
+		}
+	})
+	mux.HandleFunc("/actions/project-row", func(w http.ResponseWriter, r *http.Request) {
+		if !handleMethod(w, r, http.MethodPost) {
+			return
+		}
+		rowKey := strings.TrimSpace(r.URL.Query().Get("row_key"))
+		if rowKey == "" {
+			writeActionError(w, &webActionError{
+				status:  http.StatusBadRequest,
+				reason:  "row_key_required",
+				message: "project row action failed: row_key is required",
+			})
+			return
+		}
+		payload, ok := state.getSnapshot()
+		if !ok {
+			writeActionError(w, &webActionError{
+				status:  http.StatusServiceUnavailable,
+				reason:  "snapshot_unavailable",
+				message: "project row action failed: snapshot unavailable",
+			})
+			return
+		}
+		patch, err := buildProjectRowTogglePatch(payload, rowKey, parseWebExpandAction(r.URL.Query().Get("expand")))
+		if err != nil {
+			writeActionError(w, &webActionError{
+				status:  http.StatusNotFound,
+				reason:  "project_row_not_found",
+				message: "project row action failed: unknown row_key",
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		if _, err := w.Write([]byte(patch)); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write /actions/project-row response: %v\n", err)
+		}
+	})
+	mux.HandleFunc("/actions/day-row", func(w http.ResponseWriter, r *http.Request) {
+		if !handleMethod(w, r, http.MethodPost) {
+			return
+		}
+		rowKey := strings.TrimSpace(r.URL.Query().Get("row_key"))
+		if rowKey == "" {
+			writeActionError(w, &webActionError{
+				status:  http.StatusBadRequest,
+				reason:  "row_key_required",
+				message: "day row action failed: row_key is required",
+			})
+			return
+		}
+		payload, ok := state.getSnapshot()
+		if !ok {
+			writeActionError(w, &webActionError{
+				status:  http.StatusServiceUnavailable,
+				reason:  "snapshot_unavailable",
+				message: "day row action failed: snapshot unavailable",
+			})
+			return
+		}
+		patch, err := buildDayRowTogglePatch(payload, rowKey, parseWebExpandAction(r.URL.Query().Get("expand")))
+		if err != nil {
+			writeActionError(w, &webActionError{
+				status:  http.StatusNotFound,
+				reason:  "day_row_not_found",
+				message: "day row action failed: unknown row_key",
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		if _, err := w.Write([]byte(patch)); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write /actions/day-row response: %v\n", err)
 		}
 	})
 	mux.HandleFunc("/actions/sync-codespaces", func(w http.ResponseWriter, r *http.Request) {

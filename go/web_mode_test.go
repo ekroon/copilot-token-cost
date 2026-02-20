@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -548,12 +549,17 @@ func TestRebuildSnapshotBroadcastsPatchToSubscribers(t *testing.T) {
 
 	state.rebuildSnapshot()
 	patch := waitForPatch(t, updates, "rebuild snapshot patch")
+	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 9 {
+		t.Fatalf("patch event count=%d, want=9", got)
+	}
 	for _, selector := range []string{
 		"data: selector #overview-summary",
 		"data: selector #sync-status-region",
+		"data: selector #daily-token-chart-region",
 		"data: selector #model-summary-region",
 		"data: selector #project-summary-region",
 		"data: selector #daily-totals-region",
+		"data: selector #daily-spend-region",
 		"data: selector #stats-json",
 		"data: selector #refresh-indicators-region",
 	} {
@@ -727,6 +733,31 @@ func TestWebMuxEndpointAvailability(t *testing.T) {
 	if !strings.Contains(homeRec.Body.String(), "Copilot Token Cost Dashboard") {
 		t.Fatalf("GET / body missing dashboard title")
 	}
+	if !strings.Contains(homeRec.Body.String(), `<a href="/daily-spend">View today's spend</a>`) {
+		t.Fatalf("GET / body missing daily spend link")
+	}
+
+	dailySpendRec := httptest.NewRecorder()
+	mux.ServeHTTP(dailySpendRec, httptest.NewRequest(http.MethodGet, "/daily-spend", nil))
+	if dailySpendRec.Code != http.StatusOK {
+		t.Fatalf("GET /daily-spend status=%d", dailySpendRec.Code)
+	}
+	if ct := dailySpendRec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("GET /daily-spend content-type=%q", ct)
+	}
+	for _, needle := range []string{
+		"Today's Copilot Spend",
+		`id="daily-spend-region"`,
+		`id="daily-spend-tokens"`,
+		`id="daily-spend-cost"`,
+		`id="daily-spend-weekly-average"`,
+		`id="daily-spend-token-trend"`,
+		`data-init="@get('/events')"`,
+	} {
+		if !strings.Contains(dailySpendRec.Body.String(), needle) {
+			t.Fatalf("GET /daily-spend body missing %q", needle)
+		}
+	}
 
 	statsRec := httptest.NewRecorder()
 	mux.ServeHTTP(statsRec, httptest.NewRequest(http.MethodGet, "/api/stats", nil))
@@ -804,6 +835,63 @@ func TestWebMuxEventsEndpointStreamsBroadcastPatch(t *testing.T) {
 	second := readSSEFrameContaining(t, reader, "events patch #2", "data: selector #overview-summary")
 	if !strings.Contains(second, "event: datastar-patch-elements") {
 		t.Fatalf("/events second frame missing datastar patch event: %q", second)
+	}
+}
+
+func TestWebMuxEventsEndpointStreamsDailySpendPatchWithValidSSELines(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	server := httptest.NewServer(newWebMux(state))
+	defer server.Close()
+
+	client := server.Client()
+	client.Timeout = 3 * time.Second
+	resp, err := client.Get(server.URL + "/events")
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	reader := bufio.NewReader(resp.Body)
+	state.rebuildSnapshot()
+
+	frame := readSSEFrameContaining(t, reader, "events daily spend patch", "data: selector #daily-spend-region")
+	if !strings.Contains(frame, "event: datastar-patch-elements") {
+		t.Fatalf("/events daily spend frame missing datastar patch event: %q", frame)
+	}
+	if !strings.Contains(frame, "data: mode outer") {
+		t.Fatalf("/events daily spend frame missing outer patch mode: %q", frame)
+	}
+	if got := strings.Count(frame, "data: selector #daily-spend-region"); got != 1 {
+		t.Fatalf("/events daily spend selector count=%d, want=1", got)
+	}
+	for _, line := range strings.Split(frame, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "event: ") && !strings.HasPrefix(line, "data: ") {
+			t.Fatalf("/events daily spend frame contains non-SSE line %q", line)
+		}
+	}
+	for _, needle := range []string{
+		`id="daily-spend-today-summary"`,
+		`id="daily-spend-weekly-average"`,
+		`class="daily-spend-top-panels"`,
+		`class="daily-spend-trend-panels"`,
+		`<figure id="daily-spend-token-trend" class="daily-spend-chart"><svg`,
+		`<figure id="daily-spend-money-trend" class="daily-spend-chart"><svg`,
+		`id="daily-spend-top-models-week-section"`,
+	} {
+		if !strings.Contains(frame, needle) {
+			t.Fatalf("/events daily spend frame missing redesigned content %q", needle)
+		}
+	}
+	for _, legacy := range []string{
+		`<table id="daily-spend-token-trend"`,
+		`<table id="daily-spend-money-trend"`,
+	} {
+		if strings.Contains(frame, legacy) {
+			t.Fatalf("/events daily spend frame unexpectedly contains legacy trend table %q", legacy)
+		}
 	}
 }
 
@@ -926,6 +1014,8 @@ func TestWebMuxRefreshActionEndpointNotAvailable(t *testing.T) {
 }
 
 func TestWebMuxSyncCodespacesActionBehaviorAndValidation(t *testing.T) {
+	setTestPricing(t)
+
 	root := t.TempDir()
 	logsDir := filepath.Join(root, "logs")
 	if err := os.MkdirAll(logsDir, 0o755); err != nil {
@@ -970,12 +1060,17 @@ func TestWebMuxSyncCodespacesActionBehaviorAndValidation(t *testing.T) {
 	if !strings.Contains(syncRec.Body.String(), "event: datastar-patch-elements") {
 		t.Fatalf("POST /actions/sync-codespaces missing datastar patch event")
 	}
+	if got := strings.Count(syncRec.Body.String(), "event: datastar-patch-elements"); got != 9 {
+		t.Fatalf("POST /actions/sync-codespaces patch event count=%d, want=9", got)
+	}
 	for _, selector := range []string{
 		"data: selector #overview-summary",
 		"data: selector #sync-status-region",
+		"data: selector #daily-token-chart-region",
 		"data: selector #model-summary-region",
 		"data: selector #project-summary-region",
 		"data: selector #daily-totals-region",
+		"data: selector #daily-spend-region",
 		"data: selector #stats-json",
 		"data: selector #refresh-indicators-region",
 	} {
@@ -992,6 +1087,130 @@ func TestWebMuxSyncCodespacesActionBehaviorAndValidation(t *testing.T) {
 	}
 }
 
+func TestWebMuxProjectRowActionBehaviorAndValidation(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.snapshotMu.Lock()
+	state.snapshot = sampleWebDashboardPayload()
+	state.hasData = true
+	state.snapshotMu.Unlock()
+	mux := newWebMux(state)
+
+	methodRec := httptest.NewRecorder()
+	mux.ServeHTTP(methodRec, httptest.NewRequest(http.MethodGet, "/actions/project-row", nil))
+	if methodRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /actions/project-row status=%d, want=%d", methodRec.Code, http.StatusMethodNotAllowed)
+	}
+
+	missingKeyRec := httptest.NewRecorder()
+	mux.ServeHTTP(missingKeyRec, httptest.NewRequest(http.MethodPost, "/actions/project-row", nil))
+	if missingKeyRec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /actions/project-row missing key status=%d, want=%d", missingKeyRec.Code, http.StatusBadRequest)
+	}
+
+	notFoundRec := httptest.NewRecorder()
+	mux.ServeHTTP(notFoundRec, httptest.NewRequest(http.MethodPost, "/actions/project-row?row_key=missing&expand=true", nil))
+	if notFoundRec.Code != http.StatusNotFound {
+		t.Fatalf("POST /actions/project-row unknown key status=%d, want=%d", notFoundRec.Code, http.StatusNotFound)
+	}
+
+	rowKey := webStableRowKey("project", "token-consumption-copilot")
+	expandRec := httptest.NewRecorder()
+	mux.ServeHTTP(expandRec, httptest.NewRequest(http.MethodPost, "/actions/project-row?row_key="+rowKey+"&expand=true", nil))
+	if expandRec.Code != http.StatusOK {
+		t.Fatalf("POST /actions/project-row expand status=%d, want=%d", expandRec.Code, http.StatusOK)
+	}
+	if ct := expandRec.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("POST /actions/project-row expand content-type=%q", ct)
+	}
+	for _, needle := range []string{
+		"event: datastar-patch-elements",
+		"data: selector #" + webProjectSummaryRowID(rowKey),
+		"data: selector #" + webProjectDetailRowID(rowKey),
+		"project-model-row",
+		`data-row-group="project"`,
+		`data-expand-action="false"`,
+		"/actions/project-row?row_key=" + rowKey + "&expand=false",
+	} {
+		if !strings.Contains(expandRec.Body.String(), needle) {
+			t.Fatalf("POST /actions/project-row expand missing %q", needle)
+		}
+	}
+
+	collapseRec := httptest.NewRecorder()
+	mux.ServeHTTP(collapseRec, httptest.NewRequest(http.MethodPost, "/actions/project-row?row_key="+rowKey+"&expand=false", nil))
+	if collapseRec.Code != http.StatusOK {
+		t.Fatalf("POST /actions/project-row collapse status=%d, want=%d", collapseRec.Code, http.StatusOK)
+	}
+	if !strings.Contains(collapseRec.Body.String(), "/actions/project-row?row_key="+rowKey+"&expand=true") {
+		t.Fatalf("POST /actions/project-row collapse missing next expand action")
+	}
+	if !strings.Contains(collapseRec.Body.String(), `data-expand-action="true"`) {
+		t.Fatalf("POST /actions/project-row collapse missing data-expand-action=true")
+	}
+}
+
+func TestWebMuxDayRowActionBehaviorAndValidation(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.snapshotMu.Lock()
+	state.snapshot = sampleWebDashboardPayload()
+	state.hasData = true
+	state.snapshotMu.Unlock()
+	mux := newWebMux(state)
+
+	methodRec := httptest.NewRecorder()
+	mux.ServeHTTP(methodRec, httptest.NewRequest(http.MethodGet, "/actions/day-row", nil))
+	if methodRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /actions/day-row status=%d, want=%d", methodRec.Code, http.StatusMethodNotAllowed)
+	}
+
+	missingKeyRec := httptest.NewRecorder()
+	mux.ServeHTTP(missingKeyRec, httptest.NewRequest(http.MethodPost, "/actions/day-row", nil))
+	if missingKeyRec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /actions/day-row missing key status=%d, want=%d", missingKeyRec.Code, http.StatusBadRequest)
+	}
+
+	notFoundRec := httptest.NewRecorder()
+	mux.ServeHTTP(notFoundRec, httptest.NewRequest(http.MethodPost, "/actions/day-row?row_key=missing&expand=true", nil))
+	if notFoundRec.Code != http.StatusNotFound {
+		t.Fatalf("POST /actions/day-row unknown key status=%d, want=%d", notFoundRec.Code, http.StatusNotFound)
+	}
+
+	rowKey := webStableRowKey("day", "2026-02-18")
+	expandRec := httptest.NewRecorder()
+	mux.ServeHTTP(expandRec, httptest.NewRequest(http.MethodPost, "/actions/day-row?row_key="+rowKey+"&expand=true", nil))
+	if expandRec.Code != http.StatusOK {
+		t.Fatalf("POST /actions/day-row expand status=%d, want=%d", expandRec.Code, http.StatusOK)
+	}
+	if ct := expandRec.Header().Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		t.Fatalf("POST /actions/day-row expand content-type=%q", ct)
+	}
+	for _, needle := range []string{
+		"event: datastar-patch-elements",
+		"data: selector #" + webDaySummaryRowID(rowKey),
+		"data: selector #" + webDayDetailRowID(rowKey),
+		"daily-model-row",
+		`data-row-group="day"`,
+		`data-expand-action="false"`,
+		"/actions/day-row?row_key=" + rowKey + "&expand=false",
+	} {
+		if !strings.Contains(expandRec.Body.String(), needle) {
+			t.Fatalf("POST /actions/day-row expand missing %q", needle)
+		}
+	}
+
+	collapseRec := httptest.NewRecorder()
+	mux.ServeHTTP(collapseRec, httptest.NewRequest(http.MethodPost, "/actions/day-row?row_key="+rowKey+"&expand=false", nil))
+	if collapseRec.Code != http.StatusOK {
+		t.Fatalf("POST /actions/day-row collapse status=%d, want=%d", collapseRec.Code, http.StatusOK)
+	}
+	if !strings.Contains(collapseRec.Body.String(), "/actions/day-row?row_key="+rowKey+"&expand=true") {
+		t.Fatalf("POST /actions/day-row collapse missing next expand action")
+	}
+	if !strings.Contains(collapseRec.Body.String(), `data-expand-action="true"`) {
+		t.Fatalf("POST /actions/day-row collapse missing data-expand-action=true")
+	}
+}
+
 func sampleWebDashboardPayload() statsPayload {
 	return statsPayload{
 		Period:                  "last 7 days",
@@ -1005,35 +1224,282 @@ func sampleWebDashboardPayload() statsPayload {
 			"codespaces": {Code: webSyncCodeSkipped, Reason: webSyncReasonManualMode, UpdatedAt: "2026-02-19T12:00:01Z"},
 		},
 		Models: map[string]statsPayloadStats{
-			"gpt-5":           {APICalls: 7, PremiumRequests: 7, Cost: 0.9, CostWithoutCache: 1.2, PremiumRequestCost: 0.28},
-			"claude-sonnet-4": {APICalls: 5, PremiumRequests: 5, Cost: 0.35, CostWithoutCache: 0.6, PremiumRequestCost: 0.2},
+			"gpt-5":           {APICalls: 7, UserTurns: 7, PremiumRequests: 7, Cost: 0.9, CostWithoutCache: 1.2, PremiumRequestCost: 0.28},
+			"claude-sonnet-4": {APICalls: 5, UserTurns: 5, PremiumRequests: 5, Cost: 0.35, CostWithoutCache: 0.6, PremiumRequestCost: 0.2},
 		},
 		Projects: map[string]statsPayloadStats{
-			"token-consumption-copilot": {APICalls: 12, PremiumRequests: 12, Cost: 1.25, PremiumRequestCost: 0.48},
+			"token-consumption-copilot": {APICalls: 12, UserTurns: 12, PremiumRequests: 12, Cost: 1.25, PremiumRequestCost: 0.48},
 		},
 		ProjectModels: map[string]map[string]statsPayloadStats{
 			"token-consumption-copilot": {
-				"gpt-5":           {APICalls: 7, PremiumRequests: 7, Cost: 0.9, PremiumRequestCost: 0.28, PromptTokens: 5000, CompletionTokens: 2000},
-				"claude-sonnet-4": {APICalls: 5, PremiumRequests: 5, Cost: 0.35, PremiumRequestCost: 0.2, PromptTokens: 3000, CompletionTokens: 1000},
+				"gpt-5":           {APICalls: 7, UserTurns: 7, PremiumRequests: 7, Cost: 0.9, PremiumRequestCost: 0.28, PromptTokens: 5000, CompletionTokens: 2000},
+				"claude-sonnet-4": {APICalls: 5, UserTurns: 5, PremiumRequests: 5, Cost: 0.35, PremiumRequestCost: 0.2, PromptTokens: 3000, CompletionTokens: 1000},
 			},
 		},
 		Daily: map[string]map[string]interface{}{
 			"2026-02-18": {
-				"gpt-5":                     statsPayloadStats{APICalls: 4, PremiumRequests: 4, PremiumRequestCost: 0.16, Cost: 0.5, PromptTokens: 2000, CompletionTokens: 800},
+				"gpt-5":                     statsPayloadStats{APICalls: 4, UserTurns: 4, PremiumRequests: 4, PremiumRequestCost: 0.16, Cost: 0.5, PromptTokens: 2000, CompletionTokens: 800},
 				"_total_cost":               0.5,
 				"_total_cost_without_cache": 0.7,
 			},
 			"2026-02-19": {
-				"claude-sonnet-4":           statsPayloadStats{APICalls: 8, PremiumRequests: 8, PremiumRequestCost: 0.32, Cost: 0.75, PromptTokens: 6000, CompletionTokens: 2500},
+				"claude-sonnet-4":           statsPayloadStats{APICalls: 8, UserTurns: 8, PremiumRequests: 8, PremiumRequestCost: 0.32, Cost: 0.75, PromptTokens: 6000, CompletionTokens: 2500},
 				"_total_cost":               0.75,
 				"_total_cost_without_cache": 1.1,
 			},
 		},
+		Hourly: map[string]statsPayloadStats{
+			"09": {APICalls: 5, PromptTokens: 2000, CompletionTokens: 500},
+			"15": {APICalls: 8, PromptTokens: 1200, CompletionTokens: 800},
+		},
+	}
+}
+
+func TestBuildWebDailySpendDataShapesTodayRollingTrendsAndTopRows(t *testing.T) {
+	payload := statsPayload{
+		Projects: map[string]statsPayloadStats{
+			"proj-alpha": {PremiumRequestCost: 0.65, Cost: 0.92},
+			"proj-beta":  {PremiumRequestCost: 1.20, Cost: 1.60},
+			"proj-gamma": {PremiumRequestCost: 0.05, Cost: 0.10},
+			"proj-delta": {PremiumRequestCost: 0.60, Cost: 0.70},
+		},
+		ProjectModels: map[string]map[string]statsPayloadStats{
+			"proj-alpha": {"model-a": {PremiumRequestCost: 1}},
+			"proj-beta":  {"model-b": {PremiumRequestCost: 1}},
+			"proj-gamma": {"model-c": {PremiumRequestCost: 1}},
+			"proj-delta": {"model-d": {PremiumRequestCost: 1}},
+		},
+		Daily: map[string]map[string]interface{}{
+			"2026-02-12": {
+				"model-z": statsPayloadStats{
+					APICalls:           99,
+					PromptTokens:       999,
+					CompletionTokens:   999,
+					PremiumRequestCost: 9.99,
+					Cost:               9.99,
+					CostWithoutCache:   9.99,
+				},
+			},
+			"2026-02-13": {
+				"model-a": statsPayloadStats{APICalls: 1, UserTurns: 1, PromptTokens: 10, CompletionTokens: 1, PremiumRequestCost: 0.10, Cost: 0.20, CostWithoutCache: 0.30},
+			},
+			"2026-02-14": {
+				"model-b": statsPayloadStats{APICalls: 2, UserTurns: 1, PromptTokens: 20, CompletionTokens: 2, PremiumRequestCost: 0.20, Cost: 0.30, CostWithoutCache: 0.40},
+			},
+			"2026-02-15": {
+				"model-c": statsPayloadStats{APICalls: 3, UserTurns: 0, PromptTokens: 30, CompletionTokens: 3, PremiumRequestCost: 0.05, Cost: 0.10, CostWithoutCache: 0.15},
+			},
+			"2026-02-16": {
+				"model-a": statsPayloadStats{APICalls: 4, UserTurns: 2, PromptTokens: 40, CompletionTokens: 4, PremiumRequestCost: 0.40, Cost: 0.50, CostWithoutCache: 0.60},
+			},
+			"2026-02-17": {
+				"model-b": statsPayloadStats{APICalls: 5, UserTurns: 2, PromptTokens: 50, CompletionTokens: 5, PremiumRequestCost: 0.30, Cost: 0.40, CostWithoutCache: 0.45},
+			},
+			"2026-02-18": {
+				"model-d": statsPayloadStats{APICalls: 6, UserTurns: 4, PromptTokens: 60, CompletionTokens: 6, PremiumRequestCost: 0.60, Cost: 0.70, CostWithoutCache: 0.80},
+			},
+			"2026-02-19": {
+				"model-b": statsPayloadStats{APICalls: 7, UserTurns: 3, PromptTokens: 70, CompletionTokens: 7, PremiumRequestCost: 0.70, Cost: 0.90, CostWithoutCache: 1.10},
+				"model-a": statsPayloadStats{APICalls: 1, UserTurns: 1, PromptTokens: 15, CompletionTokens: 5, PremiumRequestCost: 0.15, Cost: 0.22, CostWithoutCache: 0.30},
+			},
+		},
+	}
+
+	data := buildWebDailySpendData(payload, time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
+	if data.Day != "2026-02-19" {
+		t.Fatalf("day=%q, want=2026-02-19", data.Day)
+	}
+
+	if data.Today.InputTokens != 85 || data.Today.OutputTokens != 12 {
+		t.Fatalf("today tokens=%d/%d, want=85/12", data.Today.InputTokens, data.Today.OutputTokens)
+	}
+	assertFloatEqual(t, data.Today.PremiumSpend, 0.85)
+	assertFloatEqual(t, data.Today.APISpend, 1.12)
+	if math.Abs(data.Today.APISpend-1.40) < 1e-9 {
+		t.Fatalf("today api spend incorrectly matched no-cache total: got=%v", data.Today.APISpend)
+	}
+
+	assertFloatEqual(t, data.Rolling7DayAverage.InputTokens, 295.0/7.0)
+	assertFloatEqual(t, data.Rolling7DayAverage.OutputTokens, 33.0/7.0)
+	assertFloatEqual(t, data.Rolling7DayAverage.PremiumSpend, 2.5/7.0)
+	assertFloatEqual(t, data.Rolling7DayAverage.APISpend, 3.32/7.0)
+
+	if len(data.TokenTrend) != 7 || len(data.MoneyTrend) != 7 {
+		t.Fatalf("trend lengths=%d/%d, want=7/7", len(data.TokenTrend), len(data.MoneyTrend))
+	}
+	if data.TokenTrend[0].Day != "2026-02-13" || data.TokenTrend[6].Day != "2026-02-19" {
+		t.Fatalf("token trend days=%q..%q, want=2026-02-13..2026-02-19", data.TokenTrend[0].Day, data.TokenTrend[6].Day)
+	}
+	assertFloatEqual(t, data.MoneyTrend[6].APISpend, 1.12)
+	assertFloatEqual(t, data.MoneyTrend[6].PremiumSpend, 0.85)
+
+	if len(data.TopModelsToday) != 2 {
+		t.Fatalf("top models today len=%d, want=2", len(data.TopModelsToday))
+	}
+	if data.TopModelsToday[0].Name != "model-b" || data.TopModelsToday[1].Name != "model-a" {
+		t.Fatalf("top models today order=%v, want=[model-b model-a]", []string{data.TopModelsToday[0].Name, data.TopModelsToday[1].Name})
+	}
+	if data.TopModelsToday[0].PromptCount != 3 || data.TopModelsToday[0].InputTokens != 70 || data.TopModelsToday[0].OutputTokens != 7 {
+		t.Fatalf("top model today row=%+v", data.TopModelsToday[0])
+	}
+	assertFloatEqual(t, data.TopModelsToday[0].PremiumSpend, 0.70)
+	assertFloatEqual(t, data.TopModelsToday[0].APISpend, 0.90)
+	if math.Abs(data.TopModelsToday[0].APISpend-1.10) < 1e-9 {
+		t.Fatalf("top model today api spend incorrectly matched no-cache value: got=%v", data.TopModelsToday[0].APISpend)
+	}
+
+	if len(data.TopModelsRolling7) != 3 {
+		t.Fatalf("top models rolling len=%d, want=3", len(data.TopModelsRolling7))
+	}
+	if got := []string{data.TopModelsRolling7[0].Name, data.TopModelsRolling7[1].Name, data.TopModelsRolling7[2].Name}; got[0] != "model-b" || got[1] != "model-a" || got[2] != "model-d" {
+		t.Fatalf("top models rolling order=%v, want=[model-b model-a model-d]", got)
+	}
+
+	if len(data.TopProjectsToday) != 2 {
+		t.Fatalf("top projects today len=%d, want=2", len(data.TopProjectsToday))
+	}
+	if data.TopProjectsToday[0].Name != "proj-beta" || data.TopProjectsToday[1].Name != "proj-alpha" {
+		t.Fatalf("top projects today order=%v, want=[proj-beta proj-alpha]", []string{data.TopProjectsToday[0].Name, data.TopProjectsToday[1].Name})
+	}
+	assertFloatEqual(t, data.TopProjectsToday[0].PremiumSpend, 0.70)
+	assertFloatEqual(t, data.TopProjectsToday[0].APISpend, 0.90)
+	if math.Abs(data.TopProjectsToday[0].APISpend-1.10) < 1e-9 {
+		t.Fatalf("top project today api spend incorrectly matched no-cache value: got=%v", data.TopProjectsToday[0].APISpend)
+	}
+	if data.TopProjectsToday[0].PromptCount != 3 {
+		t.Fatalf("top project today prompt_count=%d, want=3", data.TopProjectsToday[0].PromptCount)
+	}
+
+	if len(data.TopProjectsRolling7) != 3 {
+		t.Fatalf("top projects rolling len=%d, want=3", len(data.TopProjectsRolling7))
+	}
+	if got := []string{data.TopProjectsRolling7[0].Name, data.TopProjectsRolling7[1].Name, data.TopProjectsRolling7[2].Name}; got[0] != "proj-beta" || got[1] != "proj-alpha" || got[2] != "proj-delta" {
+		t.Fatalf("top projects rolling order=%v, want=[proj-beta proj-alpha proj-delta]", got)
+	}
+}
+
+func TestWebDailySpendTopRowsRankByHybridScore(t *testing.T) {
+	assertFloatEqual(t, webDailySpendHybridScore(10, 100, 50), 52)
+
+	modelRows := webDailySpendTopRowsFromStatsMap(map[string]statsPayloadStats{
+		"high-premium": {PremiumRequestCost: 10, Cost: 1, PromptTokens: 10, CompletionTokens: 0},
+		"high-tokens":  {PremiumRequestCost: 1, Cost: 2, PromptTokens: 100, CompletionTokens: 0},
+	})
+	if len(modelRows) < 2 {
+		t.Fatalf("model rows len=%d, want>=2", len(modelRows))
+	}
+	if modelRows[0].Name != "high-tokens" {
+		t.Fatalf("top model=%q, want=%q", modelRows[0].Name, "high-tokens")
+	}
+
+	projectRows := webDailySpendTopProjectRows(
+		statsPayload{
+			ProjectModels: map[string]map[string]statsPayloadStats{
+				"project-high-premium": {"model-a": {PremiumRequestCost: 1}},
+				"project-high-tokens":  {"model-b": {PremiumRequestCost: 1}},
+			},
+		},
+		map[string]statsPayloadStats{
+			"model-a": {APICalls: 1, PremiumRequestCost: 10, Cost: 1, PromptTokens: 10, CompletionTokens: 0},
+			"model-b": {APICalls: 1, PremiumRequestCost: 1, Cost: 2, PromptTokens: 100, CompletionTokens: 0},
+		},
+	)
+	if len(projectRows) < 2 {
+		t.Fatalf("project rows len=%d, want>=2", len(projectRows))
+	}
+	if projectRows[0].Name != "project-high-tokens" {
+		t.Fatalf("top project=%q, want=%q", projectRows[0].Name, "project-high-tokens")
+	}
+}
+
+func TestBuildWebDailySpendDataGraphHopperWeeklyVisibilityAndPromptCounts(t *testing.T) {
+	payload := statsPayload{
+		ProjectModels: map[string]map[string]statsPayloadStats{
+			"proj-alpha":   {"model-a": {PremiumRequestCost: 1}},
+			"graph-hopper": {"model-gh": {PremiumRequestCost: 1}},
+			"proj-beta":    {"model-b": {PremiumRequestCost: 1}},
+			"proj-ignored": {"model-z": {PremiumRequestCost: 1}},
+		},
+		Daily: map[string]map[string]interface{}{
+			"2026-02-19": {
+				"model-a":  statsPayloadStats{APICalls: 100, UserTurns: 9, PromptTokens: 0, CompletionTokens: 0, PremiumRequestCost: 0.4, Cost: 100},
+				"model-gh": statsPayloadStats{APICalls: 20, UserTurns: 0, PromptTokens: 200, CompletionTokens: 0, PremiumRequestCost: 0.2, Cost: 10},
+				"model-b":  statsPayloadStats{APICalls: 80, UserTurns: 7, PromptTokens: 0, CompletionTokens: 0, PremiumRequestCost: 0.3, Cost: 80},
+				"model-z":  statsPayloadStats{APICalls: 70, UserTurns: 5, PromptTokens: 0, CompletionTokens: 0, PremiumRequestCost: 0.3, Cost: 70},
+			},
+		},
+	}
+
+	data := buildWebDailySpendData(payload, time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
+	if len(data.TopProjectsRolling7) != 3 {
+		t.Fatalf("top projects rolling len=%d, want=3", len(data.TopProjectsRolling7))
+	}
+	if got := []string{data.TopProjectsRolling7[0].Name, data.TopProjectsRolling7[1].Name, data.TopProjectsRolling7[2].Name}; got[0] != "proj-alpha" || got[1] != "graph-hopper" || got[2] != "proj-beta" {
+		t.Fatalf("top projects rolling order=%v, want=[proj-alpha graph-hopper proj-beta]", got)
+	}
+	if len(data.TopModelsRolling7) < 2 {
+		t.Fatalf("top models rolling len=%d, want>=2", len(data.TopModelsRolling7))
+	}
+	if data.TopModelsRolling7[1].Name != "model-gh" {
+		t.Fatalf("top models rolling second=%q, want=model-gh", data.TopModelsRolling7[1].Name)
+	}
+	if data.TopModelsRolling7[1].PromptCount != 0 {
+		t.Fatalf("autopilot model prompt_count=%d, want=0", data.TopModelsRolling7[1].PromptCount)
+	}
+	if data.TopProjectsRolling7[1].PromptCount != 0 {
+		t.Fatalf("graph-hopper prompt_count=%d, want=0", data.TopProjectsRolling7[1].PromptCount)
+	}
+}
+
+func TestBuildWebDailySpendDataUsesProjectScopedDailyAggregation(t *testing.T) {
+	payload := statsPayload{
+		ProjectModels: map[string]map[string]statsPayloadStats{
+			"MainVault": {"model-x": {PremiumRequestCost: 99}},
+			"Scratch":   {"model-x": {PremiumRequestCost: 1}},
+		},
+		Daily: map[string]map[string]interface{}{
+			"2026-02-18": {
+				"model-x": statsPayloadStats{APICalls: 1, UserTurns: 1, PromptTokens: 100, CompletionTokens: 0, PremiumRequestCost: 0.10, Cost: 1.00},
+			},
+			"2026-02-19": {
+				"model-x": statsPayloadStats{APICalls: 1, UserTurns: 1, PromptTokens: 1000, CompletionTokens: 0, PremiumRequestCost: 1.00, Cost: 10.00},
+			},
+		},
+		DailyProjects: map[string]map[string]statsPayloadStats{
+			"2026-02-18": {
+				"MainVault": {APICalls: 1, UserTurns: 1, PromptTokens: 100, CompletionTokens: 0, PremiumRequestCost: 0.10, Cost: 1.00},
+			},
+			"2026-02-19": {
+				"Scratch": {APICalls: 1, UserTurns: 1, PromptTokens: 1000, CompletionTokens: 0, PremiumRequestCost: 1.00, Cost: 10.00},
+			},
+		},
+	}
+
+	data := buildWebDailySpendData(payload, time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
+	if len(data.TopProjectsToday) != 1 {
+		t.Fatalf("top projects today len=%d, want=1", len(data.TopProjectsToday))
+	}
+	if data.TopProjectsToday[0].Name != "Scratch" {
+		t.Fatalf("top project today=%q, want=Scratch", data.TopProjectsToday[0].Name)
+	}
+	if data.TopProjectsToday[0].InputTokens != 1000 || data.TopProjectsToday[0].PromptCount != 1 {
+		t.Fatalf("top project today row=%+v", data.TopProjectsToday[0])
+	}
+	assertFloatEqual(t, data.TopProjectsToday[0].APISpend, 10.00)
+	assertFloatEqual(t, data.TopProjectsToday[0].PremiumSpend, 1.00)
+
+	if len(data.TopProjectsRolling7) != 2 {
+		t.Fatalf("top projects rolling len=%d, want=2", len(data.TopProjectsRolling7))
+	}
+	if got := []string{data.TopProjectsRolling7[0].Name, data.TopProjectsRolling7[1].Name}; got[0] != "Scratch" || got[1] != "MainVault" {
+		t.Fatalf("top projects rolling order=%v, want=[Scratch MainVault]", got)
 	}
 }
 
 func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 	payload := sampleWebDashboardPayload()
+	projectKey := webStableRowKey("project", "token-consumption-copilot")
+	dayKey := webStableRowKey("day", "2026-02-18")
 
 	body := dashboardShellHTML(payload, true)
 	expected := []string{
@@ -1041,6 +1507,7 @@ func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 		"data-on:datastar-fetch=",
 		"datastar.js",
 		"id=\"refresh-indicators-region\"",
+		`<a href="/daily-spend">View today's spend</a>`,
 		"id=\"overview-summary\"",
 		"id=\"sync-status-region\"",
 		"sync-status-compact",
@@ -1056,14 +1523,26 @@ func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 		"id=\"project-summary-table\"",
 		"<th>Project</th>",
 		"token-consumption-copilot",
-		"project-model-row",
+		`id="` + webProjectSummaryRowID(projectKey) + `"`,
+		`data-row-group="project"`,
+		`data-expand-action="true"`,
+		"/actions/project-row?row_key=" + projectKey + "&expand=true",
 		"id=\"daily-totals-region\"",
 		"Daily totals",
 		"id=\"daily-totals-table\"",
+		`id="daily-token-chart-region"`,
 		"<th>Date</th>",
 		"<th>Total</th>",
 		"2026-02-18",
-		"daily-model-row",
+		`id="` + webDaySummaryRowID(dayKey) + `"`,
+		`data-row-group="day"`,
+		"/actions/day-row?row_key=" + dayKey + "&expand=true",
+		"copilot-token-cost:web:expanded-project-rows",
+		"copilot-token-cost:web:expanded-day-rows",
+		"tr.expandable-row[data-row-group][data-row-key][data-expand-action]",
+		"/actions/project-row",
+		"/actions/day-row",
+		"&expand=true",
 		"model-indent",
 		"id=\"stats-json\"",
 	}
@@ -1077,6 +1556,217 @@ func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 	}
 	if strings.Contains(body, "/actions/refresh") {
 		t.Fatalf("dashboard body unexpectedly contains /actions/refresh control")
+	}
+	if strings.Contains(body, `id="hourly-usage-table"`) {
+		t.Fatalf("dashboard body unexpectedly contains legacy hourly table")
+	}
+	for _, needle := range []string{`id="hourly-heatmap"`, `id="hourly-heatmap-grid"`, "data-hourly-heatmap"} {
+		if strings.Contains(body, needle) {
+			t.Fatalf("dashboard body unexpectedly contains hourly heatmap hook %q", needle)
+		}
+	}
+	if strings.Contains(body, "data-signals:__p") || strings.Contains(body, "data-signals:__d") {
+		t.Fatalf("dashboard body unexpectedly contains ephemeral row toggle signals")
+	}
+	if strings.Contains(body, "data-show=\"$__") {
+		t.Fatalf("dashboard body unexpectedly contains signal-based row visibility toggles")
+	}
+}
+
+func TestRenderWebDailySpendTokenTrendTableUsesDistinctDualAxisScales(t *testing.T) {
+	body := renderWebDailySpendTokenTrendTable("daily-spend-token-trend", []webDailySpendTokenTrendPoint{
+		{Day: "2026-02-18", InputTokens: 3000, OutputTokens: 30},
+		{Day: "2026-02-19", InputTokens: 1500, OutputTokens: 15},
+	})
+	for _, needle := range []string{
+		`<figure id="daily-spend-token-trend" class="daily-spend-chart"><svg`,
+		"Input tokens (left axis)",
+		"Output tokens (right axis)",
+		`<text x="4" y="15.00" font-size="10" fill="#6b7280">3.0K</text>`,
+		`<text x="4" y="105.00" font-size="10" fill="#6b7280">1.5K</text>`,
+		`<text x="636.00" y="15.00" font-size="10" fill="#6b7280" text-anchor="end">30</text>`,
+		`<text x="636.00" y="105.00" font-size="10" fill="#6b7280" text-anchor="end">15</text>`,
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("token trend chart missing dual-axis marker %q", needle)
+		}
+	}
+	for _, wrongScale := range []string{
+		`<text x="636.00" y="15.00" font-size="10" fill="#6b7280" text-anchor="end">3.0K</text>`,
+		`<text x="636.00" y="105.00" font-size="10" fill="#6b7280" text-anchor="end">1.5K</text>`,
+	} {
+		if strings.Contains(body, wrongScale) {
+			t.Fatalf("token trend chart unexpectedly reused left-axis scale on right axis %q", wrongScale)
+		}
+	}
+}
+
+func TestRenderWebDailySpendMoneyTrendTableRemainsSingleAxis(t *testing.T) {
+	body := renderWebDailySpendMoneyTrendTable("daily-spend-money-trend", []webDailySpendMoneyTrendPoint{
+		{Day: "2026-02-18", PremiumSpend: 0.75, APISpend: 1.25},
+		{Day: "2026-02-19", PremiumSpend: 0.25, APISpend: 0.50},
+	})
+	for _, needle := range []string{
+		`<figure id="daily-spend-money-trend" class="daily-spend-chart"><svg`,
+		"Premium spend",
+		"API spend",
+		`<text x="4" y="15.00" font-size="10" fill="#6b7280">$1.25</text>`,
+		`<text x="4" y="105.00" font-size="10" fill="#6b7280">$0.625</text>`,
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("money trend chart missing expected single-axis content %q", needle)
+		}
+	}
+	for _, unexpected := range []string{
+		"Input tokens (left axis)",
+		"Output tokens (right axis)",
+		`text-anchor="end">$`,
+	} {
+		if strings.Contains(body, unexpected) {
+			t.Fatalf("money trend chart unexpectedly changed %q", unexpected)
+		}
+	}
+}
+
+func TestDailySpendShellHTMLRendersCoreSections(t *testing.T) {
+	payload := sampleWebDashboardPayload()
+	body := dailySpendShellHTML(payload, true, time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
+	for _, needle := range []string{
+		"Today's Copilot Spend",
+		`id="daily-spend-region"`,
+		`id="daily-spend-tokens"`,
+		`id="daily-spend-output-tokens"`,
+		`id="daily-spend-cost"`,
+		`id="daily-spend-api-spend"`,
+		`id="daily-spend-weekly-average"`,
+		`id="daily-spend-weekly-input-tokens"`,
+		`id="daily-spend-weekly-output-tokens"`,
+		`id="daily-spend-weekly-premium-spend"`,
+		`id="daily-spend-weekly-api-spend"`,
+		`class="daily-spend-top-panels"`,
+		`id="daily-spend-token-trend"`,
+		`id="daily-spend-money-trend"`,
+		`id="daily-spend-top-projects-today"`,
+		`id="daily-spend-top-projects-week"`,
+		`id="daily-spend-top-models-today"`,
+		`id="daily-spend-top-models-week"`,
+		"Today summary",
+		"Weekly average (rolling 7 days including today)",
+		"Token trend",
+		"Input tokens (left axis)",
+		"Output tokens (right axis)",
+		"Money trend",
+		"Top projects today",
+		"Top projects this week",
+		"Top models today",
+		"Top models this week",
+		"6.0K",
+		"2.5K",
+		"$0.320",
+		"$0.750",
+		"1.1K",
+		"471",
+		"$0.069",
+		"$0.179",
+		"gpt-5",
+		"token-consumption-copilot",
+		"<th>Name</th><th>Input tokens</th><th>Output tokens</th><th>Premium spend</th><th>API spend</th><th>Prompt count</th>",
+		"<tr><td>token-consumption-copilot</td><td>6.0K</td><td>2.5K</td><td>$0.320</td><td>$0.750</td><td>8</td></tr>",
+		"<tr><td>gpt-5</td><td>2.0K</td><td>800</td><td>$0.160</td><td>$0.500</td><td>4</td></tr>",
+		`data-init="@get('/events')"`,
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("daily spend body missing %q", needle)
+		}
+	}
+	if got := strings.Count(body, `class="daily-spend-metrics"`); got != 2 {
+		t.Fatalf("daily spend metric grid count=%d, want=2", got)
+	}
+	if got := strings.Count(body, `<article class="daily-spend-metric">`); got != 8 {
+		t.Fatalf("daily spend metric card count=%d, want=8", got)
+	}
+	for _, needle := range []string{
+		`.daily-spend-top-panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }`,
+		`.daily-spend-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; }`,
+		`.daily-spend-metric { border: 1px solid #d1d5db; border-radius: 0.6rem; padding: 0.8rem; background: #f9fafb; min-height: 6.2rem;`,
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("daily spend body missing compact card layout CSS %q", needle)
+		}
+	}
+	for _, needle := range []string{
+		`<figure id="daily-spend-token-trend" class="daily-spend-chart"><svg`,
+		`<figure id="daily-spend-money-trend" class="daily-spend-chart"><svg`,
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("daily spend body missing chart markup %q", needle)
+		}
+	}
+	for _, legacy := range []string{
+		`<table id="daily-spend-token-trend"`,
+		`<table id="daily-spend-money-trend"`,
+	} {
+		if strings.Contains(body, legacy) {
+			t.Fatalf("daily spend body unexpectedly contains legacy trend table %q", legacy)
+		}
+	}
+	orderedTodayCards := []string{
+		`id="daily-spend-tokens"`,
+		`id="daily-spend-output-tokens"`,
+		`id="daily-spend-cost"`,
+		`id="daily-spend-api-spend"`,
+	}
+	last := -1
+	for _, cardID := range orderedTodayCards {
+		idx := strings.Index(body, cardID)
+		if idx == -1 {
+			t.Fatalf("daily spend body missing today card %q", cardID)
+		}
+		if idx < last {
+			t.Fatalf("today cards order incorrect at %q", cardID)
+		}
+		last = idx
+	}
+	orderedWeeklyCards := []string{
+		`id="daily-spend-weekly-input-tokens"`,
+		`id="daily-spend-weekly-output-tokens"`,
+		`id="daily-spend-weekly-premium-spend"`,
+		`id="daily-spend-weekly-api-spend"`,
+	}
+	last = -1
+	for _, cardID := range orderedWeeklyCards {
+		idx := strings.Index(body, cardID)
+		if idx == -1 {
+			t.Fatalf("daily spend body missing weekly card %q", cardID)
+		}
+		if idx < last {
+			t.Fatalf("weekly cards order incorrect at %q", cardID)
+		}
+		last = idx
+	}
+	orderedSections := []string{
+		`id="daily-spend-today-summary"`,
+		`id="daily-spend-weekly-average"`,
+		`id="daily-spend-token-trend-section"`,
+		`id="daily-spend-money-trend-section"`,
+		`id="daily-spend-top-projects-today-section"`,
+		`id="daily-spend-top-projects-week-section"`,
+		`id="daily-spend-top-models-today-section"`,
+		`id="daily-spend-top-models-week-section"`,
+	}
+	last = -1
+	for _, sectionID := range orderedSections {
+		idx := strings.Index(body, sectionID)
+		if idx == -1 {
+			t.Fatalf("daily spend body missing section %q", sectionID)
+		}
+		if idx < last {
+			t.Fatalf("daily spend section order incorrect at %q", sectionID)
+		}
+		last = idx
+	}
+	if strings.Contains(body, `id="daily-spend-gamification"`) {
+		t.Fatalf("daily spend body unexpectedly contains gamification layout")
 	}
 }
 
@@ -1137,15 +1827,15 @@ func TestBuildDashboardPatchIncludesRefreshIndicatorsPatch(t *testing.T) {
 }
 
 func TestBuildRefreshPatchPatchesOverviewFragments(t *testing.T) {
-	patch, err := buildRefreshPatch(sampleWebDashboardPayload())
+	patch, err := buildRefreshPatch(sampleWebDashboardPayload(), time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("buildRefreshPatch: %v", err)
 	}
-	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 7 {
-		t.Fatalf("patch event count=%d, want=7", got)
+	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 8 {
+		t.Fatalf("patch event count=%d, want=8", got)
 	}
-	if got := strings.Count(patch, "data: mode outer"); got != 7 {
-		t.Fatalf("outer mode count=%d, want=7", got)
+	if got := strings.Count(patch, "data: mode outer"); got != 8 {
+		t.Fatalf("outer mode count=%d, want=8", got)
 	}
 	orderedSelectors := []string{
 		"data: selector #overview-summary",
@@ -1154,6 +1844,7 @@ func TestBuildRefreshPatchPatchesOverviewFragments(t *testing.T) {
 		"data: selector #model-summary-region",
 		"data: selector #project-summary-region",
 		"data: selector #daily-totals-region",
+		"data: selector #daily-spend-region",
 		"data: selector #stats-json",
 	}
 	last := -1
@@ -1172,6 +1863,7 @@ func TestBuildRefreshPatchPatchesOverviewFragments(t *testing.T) {
 		`<table id="model-summary-table">`,
 		`<table id="project-summary-table">`,
 		`<table id="daily-totals-table">`,
+		`id="daily-spend-region"`,
 		"&#34;period&#34;",
 	} {
 		if !strings.Contains(patch, needle) {
@@ -1180,5 +1872,61 @@ func TestBuildRefreshPatchPatchesOverviewFragments(t *testing.T) {
 	}
 	if strings.Contains(patch, "No-Cache") {
 		t.Fatalf("patch unexpectedly contains No-Cache column")
+	}
+	if strings.Contains(patch, "hourly-heatmap") || strings.Contains(patch, "data-hourly-heatmap") {
+		t.Fatalf("patch unexpectedly contains hourly heatmap hooks")
+	}
+}
+
+func TestBuildRefreshPatchDailySpendFrameUsesValidSSELines(t *testing.T) {
+	patch, err := buildRefreshPatch(sampleWebDashboardPayload(), time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("buildRefreshPatch: %v", err)
+	}
+	var dailySpendFrame string
+	for _, frame := range strings.Split(patch, "\n\n") {
+		if strings.Contains(frame, "data: selector #daily-spend-region") {
+			dailySpendFrame = frame
+			break
+		}
+	}
+	if dailySpendFrame == "" {
+		t.Fatalf("patch missing daily spend frame")
+	}
+	for _, line := range strings.Split(dailySpendFrame, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "event: ") && !strings.HasPrefix(line, "data: ") {
+			t.Fatalf("daily spend frame contains non-SSE line %q", line)
+		}
+	}
+	for _, needle := range []string{
+		`class="daily-spend-top-panels"`,
+		`id="daily-spend-weekly-average"`,
+		`id="daily-spend-money-trend-section"`,
+		`id="daily-spend-top-projects-week-section"`,
+		`id="daily-spend-cost"`,
+		`id="daily-spend-weekly-input-tokens"`,
+		`id="daily-spend-weekly-api-spend"`,
+		`id="daily-spend-today-summary"`,
+		`id="daily-spend-top-models-week-section"`,
+		`class="daily-spend-trend-panels"`,
+		`<figure id="daily-spend-token-trend" class="daily-spend-chart"><svg`,
+		`<figure id="daily-spend-money-trend" class="daily-spend-chart"><svg`,
+		`<tr><td>token-consumption-copilot</td><td>8.0K</td><td>3.3K</td><td>$0.480</td><td>$1.25</td><td>12</td></tr>`,
+		`<tr><td>claude-sonnet-4</td><td>6.0K</td><td>2.5K</td><td>$0.320</td><td>$0.750</td><td>8</td></tr>`,
+	} {
+		if !strings.Contains(dailySpendFrame, needle) {
+			t.Fatalf("daily spend frame missing redesigned content %q", needle)
+		}
+	}
+	for _, legacy := range []string{
+		`<table id="daily-spend-token-trend"`,
+		`<table id="daily-spend-money-trend"`,
+	} {
+		if strings.Contains(dailySpendFrame, legacy) {
+			t.Fatalf("daily spend frame unexpectedly contains legacy trend table %q", legacy)
+		}
 	}
 }

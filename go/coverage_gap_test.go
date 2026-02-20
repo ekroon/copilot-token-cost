@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func captureStdout(t *testing.T, fn func()) string {
@@ -138,7 +139,7 @@ func TestClearSourceAndCodespaceState(t *testing.T) {
 		LogFile:          "a.log",
 	}}, "codespace:test")
 	markLogParsed(db, "a.log", 123.0, 1, "codespace:test")
-	upsertSessionWorkspace(db, "s", "/tmp/proj", "codespace:test")
+	upsertSessionWorkspace(db, "s", "/tmp/proj", "", "codespace:test")
 	upsertCodespaceSyncState(db, "cs", "2026-02-18T00:00:00Z")
 	if got := getCodespaceLastUsed(db, "cs"); got != "2026-02-18T00:00:00Z" {
 		t.Fatalf("last used=%q", got)
@@ -368,6 +369,36 @@ func TestListCodespacesFilters(t *testing.T) {
 	}
 }
 
+func TestCodespaceThrottleDetectionAndBackoff(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{"Too many codespaces starting right now", true},
+		{"HTTP 400 while reaching Codespaces endpoint", true},
+		{"http 400 bad request", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isCodespaceStartThrottleError(tc.msg); got != tc.want {
+			t.Fatalf("isCodespaceStartThrottleError(%q)=%v, want %v", tc.msg, got, tc.want)
+		}
+	}
+
+	if got := codespaceThrottleBackoff(0); got != 2*time.Second {
+		t.Fatalf("codespaceThrottleBackoff(0)=%s, want 2s", got)
+	}
+	if got := codespaceThrottleBackoff(2); got != 4*time.Second {
+		t.Fatalf("codespaceThrottleBackoff(2)=%s, want 4s", got)
+	}
+	if got := codespaceThrottleBackoff(4); got != 16*time.Second {
+		t.Fatalf("codespaceThrottleBackoff(4)=%s, want 16s", got)
+	}
+	if got := codespaceThrottleBackoff(99); got != 16*time.Second {
+		t.Fatalf("codespaceThrottleBackoff(99)=%s, want 16s", got)
+	}
+}
+
 func TestSyncCodespacesToDBWithFakeGH(t *testing.T) {
 	binDir := t.TempDir()
 	writeFakeGH(t, binDir, true)
@@ -543,6 +574,182 @@ func TestSyncCodespacesToDBCopiesInParallel(t *testing.T) {
 	}
 }
 
+func writeFakeGHThrottleRetry(t *testing.T, dir string) {
+	t.Helper()
+	script := `#!/bin/sh
+set -eu
+counter_dir="${GH_COUNTER_DIR:-}"
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
+  printf '[{"name":"cs1","state":"Available","lastUsedAt":"2026-02-18T00:00:00Z"}]'
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "ssh" ]; then
+  exit 1
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
+  stage=""
+  for arg in "$@"; do
+    stage="$arg"
+  done
+  mkdir -p "$counter_dir"
+  attempts_file="$counter_dir/attempts"
+  attempts="$(cat "$attempts_file" 2>/dev/null || echo 0)"
+  attempts=$((attempts + 1))
+  echo "$attempts" > "$attempts_file"
+  if [ "$attempts" -eq 1 ]; then
+    echo "Too many codespaces starting right now (HTTP 400)" >&2
+    exit 1
+  fi
+  mkdir -p "$stage/.copilot/logs" "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$stage/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<'EOF'
+cwd: /tmp/codespace-repo
+EOF
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "stop" ]; then
+  exit 0
+fi
+exit 1
+`
+	path := filepath.Join(dir, "gh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh throttle-retry: %v", err)
+	}
+}
+
+func TestCopyCodespaceDataRetriesOnThrottle(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGHThrottleRetry(t, binDir)
+	withPath(t, binDir)
+
+	counterDir := filepath.Join(t.TempDir(), "counter")
+	oldCounter := os.Getenv("GH_COUNTER_DIR")
+	if err := os.Setenv("GH_COUNTER_DIR", counterDir); err != nil {
+		t.Fatalf("set GH_COUNTER_DIR: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Setenv("GH_COUNTER_DIR", oldCounter) })
+
+	cs := codespaceInfo{Name: "cs1", State: "Available", LastUsedAt: "2026-02-18T00:00:00Z"}
+	result := copyCodespaceData(cs, 0, 1, nil)
+	t.Cleanup(func() {
+		if result.TmpDir != "" {
+			_ = os.RemoveAll(result.TmpDir)
+		}
+	})
+	if !result.Copied {
+		t.Fatalf("expected Copied=true after throttled retry")
+	}
+
+	attemptsBytes, err := os.ReadFile(filepath.Join(counterDir, "attempts"))
+	if err != nil {
+		t.Fatalf("read attempts: %v", err)
+	}
+	attempts, err := strconv.Atoi(strings.TrimSpace(string(attemptsBytes)))
+	if err != nil {
+		t.Fatalf("parse attempts: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 cp attempts after throttle retry, got %d", attempts)
+	}
+}
+
+func writeFakeGHShutdownParallel(t *testing.T, dir string) {
+	t.Helper()
+	script := `#!/bin/sh
+set -eu
+counter_dir="${GH_COUNTER_DIR:-}"
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "list" ]; then
+  printf '[{"name":"cs1","state":"Shutdown","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs2","state":"Shutdown","lastUsedAt":"2026-02-18T00:00:00Z"},{"name":"cs3","state":"Shutdown","lastUsedAt":"2026-02-18T00:00:00Z"}]'
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "ssh" ]; then
+  exit 1
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "cp" ]; then
+  stage=""
+  for arg in "$@"; do
+    stage="$arg"
+  done
+  mkdir -p "$counter_dir"
+  lock="$counter_dir/lock"
+  while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+  active="$(cat "$counter_dir/active" 2>/dev/null || echo 0)"
+  active=$((active + 1))
+  echo "$active" > "$counter_dir/active"
+  max="$(cat "$counter_dir/max" 2>/dev/null || echo 0)"
+  if [ "$active" -gt "$max" ]; then
+    echo "$active" > "$counter_dir/max"
+  fi
+  rmdir "$lock"
+  sleep 0.3
+  mkdir -p "$stage/.copilot/logs" "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000"
+  cat > "$stage/.copilot/logs/process-codespace.log" <<'EOF'
+2026-02-18T10:00:00 Created ACP session: 123e4567-e89b-12d3-a456-426614174000
+2026-02-18T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2026-02-18T10:00:02 {"model":"gpt-4.1"}
+2026-02-18T10:00:03 {"prompt_tokens":12,"completion_tokens":3}
+EOF
+  cat > "$stage/.copilot/session-state/123e4567-e89b-12d3-a456-426614174000/workspace.yaml" <<'EOF'
+cwd: /tmp/codespace-repo
+EOF
+  while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+  active="$(cat "$counter_dir/active" 2>/dev/null || echo 1)"
+  active=$((active - 1))
+  if [ "$active" -lt 0 ]; then active=0; fi
+  echo "$active" > "$counter_dir/active"
+  rmdir "$lock"
+  exit 0
+fi
+if [ "${1:-}" = "cs" ] && [ "${2:-}" = "stop" ]; then
+  exit 0
+fi
+exit 1
+`
+	path := filepath.Join(dir, "gh")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh shutdown parallel: %v", err)
+	}
+}
+
+func TestSyncCodespacesToDBStoppedStartupConcurrencyLimited(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeGHShutdownParallel(t, binDir)
+	withPath(t, binDir)
+
+	counterDir := filepath.Join(t.TempDir(), "counter")
+	oldCounter := os.Getenv("GH_COUNTER_DIR")
+	if err := os.Setenv("GH_COUNTER_DIR", counterDir); err != nil {
+		t.Fatalf("set GH_COUNTER_DIR: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Setenv("GH_COUNTER_DIR", oldCounter) })
+
+	db := initDB(filepath.Join(t.TempDir(), "codespaces-stopped-parallel.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	inserted := syncCodespacesToDB(db, true, false)
+	if inserted != 3 {
+		t.Fatalf("syncCodespacesToDB inserted=%d, want 3", inserted)
+	}
+
+	maxBytes, err := os.ReadFile(filepath.Join(counterDir, "max"))
+	if err != nil {
+		t.Fatalf("read max parallelism: %v", err)
+	}
+	maxParallel, err := strconv.Atoi(strings.TrimSpace(string(maxBytes)))
+	if err != nil {
+		t.Fatalf("parse max parallelism: %v", err)
+	}
+	if maxParallel != 1 {
+		t.Fatalf("expected stopped startup concurrency ==1, got %d", maxParallel)
+	}
+}
+
 func writeFakeGHSshFails(t *testing.T, dir string) {
 	t.Helper()
 	script := `#!/bin/sh
@@ -588,7 +795,7 @@ func TestCopyCodespaceDataSshTarFallback(t *testing.T) {
 	withPath(t, binDir)
 
 	cs := codespaceInfo{Name: "cs1", State: "Available", LastUsedAt: "2026-02-18T00:00:00Z"}
-	result := copyCodespaceData(cs, 0, 1)
+	result := copyCodespaceData(cs, 0, 1, nil)
 	t.Cleanup(func() {
 		if result.TmpDir != "" {
 			os.RemoveAll(result.TmpDir)
@@ -611,7 +818,7 @@ func TestCopyCodespaceDataSshTarSuccess(t *testing.T) {
 	withPath(t, binDir)
 
 	cs := codespaceInfo{Name: "cs1", State: "Available", LastUsedAt: "2026-02-18T00:00:00Z"}
-	result := copyCodespaceData(cs, 0, 1)
+	result := copyCodespaceData(cs, 0, 1, nil)
 	t.Cleanup(func() {
 		if result.TmpDir != "" {
 			os.RemoveAll(result.TmpDir)
