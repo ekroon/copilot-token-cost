@@ -315,16 +315,16 @@ func TestWebStateTodayWindowPropagatesToSnapshotAndOutput(t *testing.T) {
 	}
 
 	mux := newWebMux(state)
-	homeRec := httptest.NewRecorder()
-	mux.ServeHTTP(homeRec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if homeRec.Code != http.StatusOK {
-		t.Fatalf("GET / status=%d", homeRec.Code)
+	detailsRec := httptest.NewRecorder()
+	mux.ServeHTTP(detailsRec, httptest.NewRequest(http.MethodGet, "/details", nil))
+	if detailsRec.Code != http.StatusOK {
+		t.Fatalf("GET /details status=%d", detailsRec.Code)
 	}
-	if !strings.Contains(homeRec.Body.String(), "Period: today ("+dateRange+")") {
-		t.Fatalf("GET / body missing date range summary")
+	if !strings.Contains(detailsRec.Body.String(), "Period: today ("+dateRange+")") {
+		t.Fatalf("GET /details body missing date range summary")
 	}
-	if strings.Contains(homeRec.Body.String(), "2026-01-01") {
-		t.Fatalf("GET / body unexpectedly contains filtered-out date")
+	if strings.Contains(detailsRec.Body.String(), "2026-01-01") {
+		t.Fatalf("GET /details body unexpectedly contains filtered-out date")
 	}
 
 	statsRec := httptest.NewRecorder()
@@ -730,33 +730,40 @@ func TestWebMuxEndpointAvailability(t *testing.T) {
 	if ct := homeRec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
 		t.Fatalf("GET / content-type=%q", ct)
 	}
-	if !strings.Contains(homeRec.Body.String(), "Copilot Token Cost Dashboard") {
-		t.Fatalf("GET / body missing dashboard title")
-	}
-	if !strings.Contains(homeRec.Body.String(), `<a href="/daily-spend">View today's spend</a>`) {
-		t.Fatalf("GET / body missing daily spend link")
-	}
-
-	dailySpendRec := httptest.NewRecorder()
-	mux.ServeHTTP(dailySpendRec, httptest.NewRequest(http.MethodGet, "/daily-spend", nil))
-	if dailySpendRec.Code != http.StatusOK {
-		t.Fatalf("GET /daily-spend status=%d", dailySpendRec.Code)
-	}
-	if ct := dailySpendRec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
-		t.Fatalf("GET /daily-spend content-type=%q", ct)
-	}
 	for _, needle := range []string{
-		"Today's Copilot Spend",
+		"Copilot Stats",
 		`id="daily-spend-region"`,
 		`id="daily-spend-tokens"`,
 		`id="daily-spend-cost"`,
 		`id="daily-spend-weekly-average"`,
 		`id="daily-spend-token-trend"`,
+		`<a href="/details">View details</a>`,
 		`data-init="@get('/events')"`,
 	} {
-		if !strings.Contains(dailySpendRec.Body.String(), needle) {
-			t.Fatalf("GET /daily-spend body missing %q", needle)
+		if !strings.Contains(homeRec.Body.String(), needle) {
+			t.Fatalf("GET / body missing %q", needle)
 		}
+	}
+
+	detailsRec := httptest.NewRecorder()
+	mux.ServeHTTP(detailsRec, httptest.NewRequest(http.MethodGet, "/details", nil))
+	if detailsRec.Code != http.StatusOK {
+		t.Fatalf("GET /details status=%d", detailsRec.Code)
+	}
+	if ct := detailsRec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("GET /details content-type=%q", ct)
+	}
+	if !strings.Contains(detailsRec.Body.String(), "Copilot Token Cost Dashboard") {
+		t.Fatalf("GET /details body missing dashboard title")
+	}
+	if !strings.Contains(detailsRec.Body.String(), `<a href="/">View Copilot Stats</a>`) {
+		t.Fatalf("GET /details body missing Copilot Stats link")
+	}
+
+	dailySpendRec := httptest.NewRecorder()
+	mux.ServeHTTP(dailySpendRec, httptest.NewRequest(http.MethodGet, "/daily-spend", nil))
+	if dailySpendRec.Code != http.StatusNotFound {
+		t.Fatalf("GET /daily-spend status=%d, want=%d", dailySpendRec.Code, http.StatusNotFound)
 	}
 
 	statsRec := httptest.NewRecorder()
@@ -1427,7 +1434,7 @@ func TestRenderWebDailySpendRegionUsesSelectedDayLabelsForHistoricalRange(t *tes
 
 	body := renderWebDailySpendRegion(payload, true, time.Date(2026, time.February, 20, 12, 0, 0, 0, time.UTC))
 	for _, needle := range []string{
-		"<h2>Daily Spend</h2>",
+		"<h2>Copilot Stats</h2>",
 		"Selected-day summary",
 		"Rolling average (3 days including selected day)",
 		"Top projects on selected day",
@@ -1574,7 +1581,7 @@ func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 		"data-on:datastar-fetch=",
 		"datastar.js",
 		"id=\"refresh-indicators-region\"",
-		`<a href="/daily-spend">View today's spend</a>`,
+		`<a href="/">View Copilot Stats</a>`,
 		"id=\"overview-summary\"",
 		"id=\"sync-status-region\"",
 		"sync-status-compact",
@@ -1699,7 +1706,7 @@ func TestDailySpendShellHTMLRendersCoreSections(t *testing.T) {
 	payload := sampleWebDashboardPayload()
 	body := dailySpendShellHTML(payload, true, time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
 	for _, needle := range []string{
-		"Today's Copilot Spend",
+		"Copilot Stats",
 		`id="daily-spend-region"`,
 		`id="daily-spend-tokens"`,
 		`id="daily-spend-output-tokens"`,

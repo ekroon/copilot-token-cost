@@ -1554,7 +1554,7 @@ func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, re
   <header id="dashboard-header">
     <div>
       <h1>Copilot Token Cost Dashboard</h1>
-      <p><a href="/daily-spend">View today's spend</a></p>
+      <p><a href="/">View Copilot Stats</a></p>
     </div>
     %s
   </header>
@@ -2292,12 +2292,12 @@ func webDailyCacheEfficiencyTrend(rows []webDailyTotalsRow, day string, currentP
 
 func renderWebDailySpendRegion(payload statsPayload, hasSnapshot bool, now time.Time) string {
 	if !hasSnapshot {
-		return `<section id="daily-spend-region" class="daily-spend-region"><h2>Today's Spend</h2><p>Loading today's totals…</p></section>`
+		return `<section id="daily-spend-region" class="daily-spend-region"><h2>Copilot Stats</h2><p>Loading stats…</p></section>`
 	}
 	data := buildWebDailySpendData(payload, now)
 	nowDay := now.Format("2006-01-02")
 	isToday := data.Day == nowDay
-	sectionTitle := "Today's Spend"
+	sectionTitle := "Copilot Stats"
 	daySummaryTitle := "Today summary"
 	windowSummaryTitle := "Weekly average (rolling 7 days including today)"
 	topProjectsDayTitle := "Top projects today"
@@ -2306,7 +2306,6 @@ func renderWebDailySpendRegion(payload statsPayload, hasSnapshot bool, now time.
 	topModelsWindowTitle := "Top models this week"
 	emptyStateMessage := "No usage recorded yet for today."
 	if !isToday {
-		sectionTitle = "Daily Spend"
 		daySummaryTitle = "Selected-day summary"
 		topProjectsDayTitle = "Top projects on selected day"
 		topModelsDayTitle = "Top models on selected day"
@@ -2396,7 +2395,7 @@ func dailySpendShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, n
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Copilot Daily Spend</title>
+  <title>Copilot Stats</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 1.5rem; }
     #dashboard-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 1rem; }
@@ -2436,8 +2435,8 @@ func dailySpendShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, n
 <body data-signals:status-message="''">
   <header id="dashboard-header">
     <div>
-      <h1>Today's Copilot Spend</h1>
-      <p><a href="/">Back to dashboard</a></p>
+      <h1>Copilot Stats</h1>
+      <p><a href="/details">View details</a></p>
     </div>
     %s
   </header>
@@ -2464,22 +2463,22 @@ func newWebMux(state *webState) *http.ServeMux {
 			return
 		}
 		payload, hasSnapshot := state.getSnapshot()
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		page := dashboardShellHTMLWithIndicators(payload, hasSnapshot, state.renderRefreshIndicators(time.Now()))
-		if _, err := w.Write([]byte(page)); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write / response: %v\n", err)
-		}
-	})
-	mux.HandleFunc("/daily-spend", func(w http.ResponseWriter, r *http.Request) {
-		if !handleMethod(w, r, http.MethodGet) {
-			return
-		}
-		payload, hasSnapshot := state.getSnapshot()
 		now := time.Now()
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		page := dailySpendShellHTMLWithIndicators(payload, hasSnapshot, now, state.renderRefreshIndicators(now))
 		if _, err := w.Write([]byte(page)); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write /daily-spend response: %v\n", err)
+			fmt.Fprintf(os.Stderr, "failed to write / response: %v\n", err)
+		}
+	})
+	mux.HandleFunc("/details", func(w http.ResponseWriter, r *http.Request) {
+		if !handleMethod(w, r, http.MethodGet) {
+			return
+		}
+		payload, hasSnapshot := state.getSnapshot()
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		page := dashboardShellHTMLWithIndicators(payload, hasSnapshot, state.renderRefreshIndicators(time.Now()))
+		if _, err := w.Write([]byte(page)); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write /details response: %v\n", err)
 		}
 	})
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {

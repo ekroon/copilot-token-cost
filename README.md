@@ -63,7 +63,7 @@ cd go && go build -o copilot-token-cost .  # build once
 
 Web mode is Data-star-first: the dashboard shell is server-rendered with Datastar-driven updates (no custom fetch loop).
 The overview renders as tables/sections (`Sync status`, `Per-model summary`, `Per-project summary`, `Daily totals`), and live updates emit `datastar-patch-elements` SSE fragments that patch `#overview-summary`, `#sync-status-region`, `#model-summary-region`, `#project-summary-region`, `#daily-totals-region`, and `#stats-json`.
-The `/daily-spend` page is now information-first, with sections for `Today summary` + weekly average, token/money trends, and top projects/models for today and this week; money sections report premium spend and cache-aware API-equivalent spend (`API spend` in the UI).
+The `/` page is now the Copilot Stats view, with sections for `Today summary` + weekly average, token/money trends, and top projects/models for today and this week; money sections report premium spend and cache-aware API-equivalent spend (`API spend` in the UI).
 The dashboard keeps a persistent `GET /events` SSE stream open; reconnecting starts a fresh stream for subsequent broadcasts, and keep-alive heartbeat events are sent while idle.
 Web mode respects the same date-window flags as CLI output (`<days>`, `--today`, `--yesterday`, `--from/--to`, `--all`).
 The server starts immediately and serves the latest DB snapshot; startup then runs local refresh + Codespaces sync in the background (Codespaces only when mode is `auto`).
@@ -72,8 +72,8 @@ Periodic behavior remains configurable: local refresh uses `--web-refresh-interv
 Use `--web-codespaces-mode manual` to disable startup/periodic Codespaces sync and trigger it on-demand via `POST /actions/sync-codespaces`.
 
 Web endpoints:
-- `GET /` — dashboard shell
-- `GET /daily-spend` — daily spend information view (today + weekly average, token/money trends, top projects/models for today/week)
+- `GET /` — Copilot Stats view (today + weekly average, token/money trends, top projects/models for today/week)
+- `GET /details` — dashboard shell with summary tables and JSON snapshot
 - `GET /events` — persistent Datastar SSE stream for live patch broadcasts + heartbeat keep-alives
 - `GET /api/stats` — current JSON stats snapshot
 - `GET /healthz` — liveness check (`ok`)
