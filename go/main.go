@@ -1563,6 +1563,35 @@ func codespaceThrottleBackoff(attempt int) time.Duration {
 	return time.Duration(1<<attempt) * time.Second
 }
 
+func summarizeSyncCommandStderr(stderr string) string {
+	trimmed := strings.TrimSpace(stderr)
+	if trimmed == "" {
+		return ""
+	}
+	oneLine := strings.Join(strings.Fields(trimmed), " ")
+	if len(oneLine) > 240 {
+		return oneLine[:240] + "..."
+	}
+	return oneLine
+}
+
+func formatSshTarFailure(sshErr, tarErr error, sshStderr, tarStderr string) string {
+	var parts []string
+	if sshErr != nil {
+		parts = append(parts, fmt.Sprintf("ssh error: %v", sshErr))
+	}
+	if tarErr != nil {
+		parts = append(parts, fmt.Sprintf("extract error: %v", tarErr))
+	}
+	if msg := summarizeSyncCommandStderr(sshStderr); msg != "" {
+		parts = append(parts, "ssh stderr: "+msg)
+	}
+	if msg := summarizeSyncCommandStderr(tarStderr); msg != "" {
+		parts = append(parts, "extract stderr: "+msg)
+	}
+	return strings.Join(parts, "; ")
+}
+
 func copyCodespaceData(cs codespaceInfo, idx, total int, stoppedStartLimiter chan struct{}) codespaceCopyResult {
 	res := codespaceCopyResult{
 		Idx:       idx,
@@ -1619,7 +1648,12 @@ func copyCodespaceData(cs codespaceInfo, idx, total int, stoppedStartLimiter cha
 					fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
 					copied = true
 				} else {
-					fmt.Fprintf(os.Stderr, "  ⚠️ ssh+tar failed for %s (%.1fs), falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds())
+					detail := formatSshTarFailure(sshWaitErr, tarWaitErr, sshErrBuf.String(), tarErrBuf.String())
+					if detail != "" {
+						fmt.Fprintf(os.Stderr, "  ⚠️ ssh+tar failed for %s (%.1fs): %s; falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds(), detail)
+					} else {
+						fmt.Fprintf(os.Stderr, "  ⚠️ ssh+tar failed for %s (%.1fs), falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds())
+					}
 				}
 			}
 		}
@@ -1774,7 +1808,7 @@ func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, e
 			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (shutdown, unchanged lastUsedAt)\n", cs.Name)
 			continue
 		}
-		if !force {
+		if !force && cs.State != "Available" {
 			source := "codespace:" + cs.Name
 			known := getKnownLogFiles(db, source)
 			if len(known) > 0 {
@@ -2228,6 +2262,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --codespaces-sync  # sync running codespaces\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --today  # web mode with date window\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-mode manual  # disable auto codespaces sync\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-interval 15s  # near-continuous codespaces sync\n")
 	}
 	flag.Parse()
 

@@ -214,6 +214,26 @@ func TestRunStartupSyncEmitsExpectedStartupLogMessages(t *testing.T) {
 	}
 }
 
+func TestRunStartupSyncEmitsSkippedMessageWhenStatusSkipped(t *testing.T) {
+	state := &webState{}
+	logs := captureStderr(t, func() {
+		state.runStartupSync("codespaces", func() error {
+			state.setSyncStatus("codespaces", webSyncCodeSkipped, webSyncReasonCodespacesNoChanges)
+			return nil
+		})
+	})
+
+	if !strings.Contains(logs, "web startup codespaces sync started") {
+		t.Fatalf("startup logs missing start message: %q", logs)
+	}
+	if !strings.Contains(logs, "web startup codespaces sync skipped: codespaces_no_changes") {
+		t.Fatalf("startup logs missing skipped message: %q", logs)
+	}
+	if strings.Contains(logs, "web startup codespaces sync completed") {
+		t.Fatalf("startup logs unexpectedly report completed for skipped sync: %q", logs)
+	}
+}
+
 func TestStartCodespacesAutoSyncPerformsStartupSync(t *testing.T) {
 	root := t.TempDir()
 	logsDir := filepath.Join(root, "logs")

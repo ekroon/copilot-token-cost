@@ -503,6 +503,13 @@ func (s *webState) runStartupSync(source string, syncFn func() error) {
 	for {
 		err := syncFn()
 		if err == nil {
+			s.snapshotMu.RLock()
+			status, hasStatus := s.syncStatus[source]
+			s.snapshotMu.RUnlock()
+			if hasStatus && status.Code == webSyncCodeSkipped {
+				fmt.Fprintf(os.Stderr, "web startup %s sync skipped: %s\n", source, status.Reason)
+				return
+			}
 			fmt.Fprintf(os.Stderr, "web startup %s sync completed\n", source)
 			return
 		}

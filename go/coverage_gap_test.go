@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -399,6 +400,24 @@ func TestCodespaceThrottleDetectionAndBackoff(t *testing.T) {
 	}
 }
 
+func TestSshTarFailureFormatting(t *testing.T) {
+	detail := formatSshTarFailure(
+		errors.New("exit status 1"),
+		errors.New("exit status 2"),
+		"ssh failed\npermission denied",
+		"gzip: stdin: unexpected end of file",
+	)
+	if detail == "" {
+		t.Fatal("expected formatted failure detail")
+	}
+	if !strings.Contains(detail, "ssh error: exit status 1") {
+		t.Fatalf("missing ssh error detail: %q", detail)
+	}
+	if !strings.Contains(detail, "extract stderr: gzip: stdin: unexpected end of file") {
+		t.Fatalf("missing extract stderr detail: %q", detail)
+	}
+}
+
 func TestSyncCodespacesToDBWithFakeGH(t *testing.T) {
 	binDir := t.TempDir()
 	writeFakeGH(t, binDir, true)
@@ -422,8 +441,8 @@ func TestSyncCodespacesToDBWithFakeGH(t *testing.T) {
 	}
 
 	second := syncCodespacesToDB(db, false, false)
-	if second != 0 {
-		t.Fatalf("second sync should skip (all log files already synced), got %d", second)
+	if second != 1 {
+		t.Fatalf("second sync should re-copy available codespace logs, got %d", second)
 	}
 }
 
@@ -474,9 +493,9 @@ func TestCodespaceSkipHeuristic(t *testing.T) {
 	// Now change cs2's lastUsedAt in sync state to something different
 	upsertCodespaceSyncState(db, "cs2", "2020-01-01T00:00:00Z")
 	inserted2 := syncCodespacesToDB(db, true, false)
-	// cs1 (Available) skipped (all log files already synced) + cs2 (Shutdown, changed lastUsedAt) synced = 1
-	if inserted2 != 1 {
-		t.Fatalf("expected 1 (Available skipped, Shutdown with changed lastUsedAt synced), got %d", inserted2)
+	// cs1 (Available) re-syncs + cs2 (Shutdown, changed lastUsedAt) syncs = 2
+	if inserted2 != 2 {
+		t.Fatalf("expected 2 (Available re-synced, Shutdown with changed lastUsedAt synced), got %d", inserted2)
 	}
 }
 
@@ -490,15 +509,15 @@ func TestRemoteDiffSkipsAlreadySyncedFiles(t *testing.T) {
 	// Pre-seed parsed_logs so cs1's only log file is already known
 	markLogParsed(db, "process-codespace.log", 100.0, 1, "codespace:cs1")
 
-	// cs1 (Available): all remote files already synced → skip copy
+	// cs1 (Available): do not trust filename-only skip; always re-copy to catch appended logs
 	inserted := syncCodespacesToDB(db, false, false)
-	if inserted != 0 {
-		t.Fatalf("expected 0 (all files already synced), got %d", inserted)
+	if inserted != 1 {
+		t.Fatalf("expected 1 (available codespace re-synced), got %d", inserted)
 	}
 
-	// Verify no new api_calls were created
-	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs1'") != 0 {
-		t.Fatalf("expected no api_calls since copy was skipped")
+	// Verify sync still converges to one record for the source
+	if countRows(t, db, "SELECT COUNT(*) FROM api_calls WHERE source='codespace:cs1'") != 1 {
+		t.Fatalf("expected one api_call after re-sync")
 	}
 }
 
