@@ -29,6 +29,15 @@ cd go && go build -o copilot-token-cost .  # build once
 ./go/copilot-token-cost --json             # machine-readable output
 ```
 
+### Codespaces tail prototype (SSH/SFTP spike)
+
+```bash
+cd go
+go run ./cmd/codespace-tail-proto --codespace <codespace-name> --run-for 60s --poll-interval 2s
+```
+
+The prototype does a full copy first, then tails appended bytes; with `--reconnect-once` (default), it reconnects mid-run and performs a full recopy before resuming tail reads.
+
 ## Common Flags
 
 | Flag | Description |
