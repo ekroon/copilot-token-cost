@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -1596,6 +1597,16 @@ func summarizeSyncCommandStderr(stderr string) string {
 	return oneLine
 }
 
+// isTarFileChangedWarning returns true when tar exited with code 1 due to
+// "file changed as we read it" — a benign warning, not a fatal error.
+func isTarFileChangedWarning(err error, stderr string) bool {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.Contains(stderr, "file changed as we read it") {
+		return true
+	}
+	return false
+}
+
 func formatSshTarFailure(sshErr, tarErr error, sshStderr, tarStderr string) string {
 	var parts []string
 	if sshErr != nil {
@@ -1665,8 +1676,13 @@ func copyCodespaceData(cs codespaceInfo, idx, total int, stoppedStartLimiter cha
 			if tarErr := tarExtract.Start(); tarErr == nil {
 				tarWaitErr := tarExtract.Wait()
 				sshWaitErr := sshTarCmd.Wait()
-				if sshWaitErr == nil && tarWaitErr == nil {
-					fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
+				sshOK := sshWaitErr == nil || isTarFileChangedWarning(sshWaitErr, sshErrBuf.String())
+				if sshOK && tarWaitErr == nil {
+					if sshWaitErr != nil {
+						fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs) (tar warned: file changed as we read it)\n", cs.Name, time.Since(cpStart).Seconds())
+					} else {
+						fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
+					}
 					copied = true
 				} else {
 					detail := formatSshTarFailure(sshWaitErr, tarWaitErr, sshErrBuf.String(), tarErrBuf.String())

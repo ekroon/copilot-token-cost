@@ -1108,7 +1108,7 @@ func (s *webState) renderRefreshIndicators(now time.Time) string {
 			localCountdown = formatRefreshCountdown(localNext.Sub(now))
 		}
 	}
-	if localStatus.Reason == webSyncReasonInProgress {
+	if localStatus.Reason == webSyncReasonInProgress && !localStreaming {
 		localState = "Running"
 	}
 	if localStreaming {
@@ -1165,7 +1165,7 @@ func (s *webState) renderRefreshIndicators(now time.Time) string {
 			codespacesState = "Reconnecting"
 		}
 	}
-	if codespacesStatus.Reason == webSyncReasonInProgress {
+	if codespacesStatus.Reason == webSyncReasonInProgress && !codespacesStreaming {
 		codespacesState = "Running"
 	}
 
