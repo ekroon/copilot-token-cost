@@ -608,7 +608,7 @@ func TestRefreshLocalStreamingStatusConnected(t *testing.T) {
 	state.localStreaming = true
 	state.rebuildSnapshot()
 
-	state.refreshLocalStreamingStatus(3, "2026-01-01T00:00:00Z", nil)
+	state.refreshLocalStreamingStatus(3, "2026-01-01T00:00:00Z", "", nil)
 
 	payload, ok := state.getSnapshot()
 	if !ok {
@@ -620,6 +620,41 @@ func TestRefreshLocalStreamingStatusConnected(t *testing.T) {
 	}
 	if !strings.Contains(got.Reason, webSyncReasonLocalStreaming) || !strings.Contains(got.Reason, "watching=3") {
 		t.Fatalf("reason=%q, want local streaming marker", got.Reason)
+	}
+}
+
+func TestLocalProcessLogsShrank(t *testing.T) {
+	prev := map[string]localLogState{
+		"/tmp/process-a.log": {Size: 100},
+	}
+	cur := map[string]localLogState{
+		"/tmp/process-a.log": {Size: 90},
+	}
+	if !localProcessLogsShrank(prev, cur) {
+		t.Fatal("expected shrink detection to be true")
+	}
+}
+
+func TestPersistLocalStreamingCheckpointsWritesRows(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "process-a.log")
+	if err := os.WriteFile(logPath, []byte("2026-01-01T00:00:00 {\"prompt_tokens\":1,\"completion_tokens\":1}\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	info, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("stat log: %v", err)
+	}
+	state := newTestWebState(t, root)
+	state.persistLocalStreamingCheckpoints(map[string]localLogState{
+		logPath: {Size: info.Size(), MTime: info.ModTime().UTC()},
+	}, "2026-01-01T00:00:10Z", "")
+	var count int
+	if err := state.db.QueryRow("SELECT COUNT(*) FROM codespace_tail_offsets WHERE source='local' AND log_file=?", logPath).Scan(&count); err != nil {
+		t.Fatalf("query checkpoint count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("checkpoint rows=%d, want=1", count)
 	}
 }
 

@@ -1,12 +1,15 @@
 package main
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"html"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -15,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 type webModeConfig struct {
@@ -355,6 +360,10 @@ func (s *webState) rebuildSnapshot() {
 }
 
 func (s *webState) refreshLocalSnapshot() error {
+	return s.refreshLocalSnapshotWithForce(false)
+}
+
+func (s *webState) refreshLocalSnapshotWithForce(force bool) error {
 	if err := s.beginSyncAction("local"); err != nil {
 		return err
 	}
@@ -399,7 +408,7 @@ func (s *webState) refreshLocalSnapshot() error {
 			message: statusReason,
 		}
 	} else {
-		syncLogsToDB(s.db, logsDir, s.sessionDir, false, "local", s.syncFrom, s.syncTo)
+		syncLogsToDB(s.db, logsDir, s.sessionDir, force, "local", s.syncFrom, s.syncTo)
 		s.setSyncStatus("local", webSyncCodeOK, webSyncReasonLocalSyncCompleted)
 	}
 
@@ -589,7 +598,131 @@ func localProcessLogsChanged(prev, cur map[string]localLogState) bool {
 	return false
 }
 
-func (s *webState) refreshLocalStreamingStatus(watched int, lastChunkAt string, streamErr error) {
+func isLocalProcessLogName(name string) bool {
+	return strings.HasPrefix(name, "process") && strings.HasSuffix(name, ".log")
+}
+
+func localProcessLogsShrank(prev, cur map[string]localLogState) bool {
+	for path, old := range prev {
+		next, ok := cur[path]
+		if !ok {
+			continue
+		}
+		if next.Size < old.Size {
+			return true
+		}
+	}
+	return false
+}
+
+func localSampleHash(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := info.Size()
+	hasher := sha256.New()
+	const sampleWindow int64 = 64 * 1024
+	readRange := func(offset, length int64) error {
+		if length <= 0 {
+			return nil
+		}
+		buf := make([]byte, length)
+		n, err := file.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if _, err := hasher.Write(buf[:n]); err != nil {
+			return err
+		}
+		return nil
+	}
+	if size <= sampleWindow {
+		if err := readRange(0, size); err != nil {
+			return "", err
+		}
+	} else {
+		if err := readRange(0, sampleWindow); err != nil {
+			return "", err
+		}
+		if err := readRange(size-sampleWindow, sampleWindow); err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func (s *webState) persistLocalStreamingCheckpoints(current map[string]localLogState, lastChunkAt, lastDefensiveRecopyAt string) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for path, st := range current {
+		hash := ""
+		lastErr := ""
+		if h, err := localSampleHash(path); err == nil {
+			hash = h
+		} else {
+			lastErr = err.Error()
+		}
+		_, _ = s.db.Exec(
+			`INSERT INTO codespace_tail_offsets (
+				source,log_file,last_offset,last_size,last_mtime,last_hash,connection_state,last_error,last_chunk_at,last_full_copy_at,last_defensive_recopy_at,updated_at
+			) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(source,log_file) DO UPDATE SET
+				last_offset=excluded.last_offset,
+				last_size=excluded.last_size,
+				last_mtime=excluded.last_mtime,
+				last_hash=excluded.last_hash,
+				connection_state=excluded.connection_state,
+				last_error=excluded.last_error,
+				last_chunk_at=excluded.last_chunk_at,
+				last_full_copy_at=excluded.last_full_copy_at,
+				last_defensive_recopy_at=excluded.last_defensive_recopy_at,
+				updated_at=excluded.updated_at`,
+			"local",
+			path,
+			st.Size,
+			st.Size,
+			st.MTime.Format(time.RFC3339Nano),
+			hash,
+			"connected",
+			nullableString(lastErr),
+			nullableString(lastChunkAt),
+			nullableString(lastChunkAt),
+			nullableString(lastDefensiveRecopyAt),
+			now,
+		)
+	}
+}
+
+func (s *webState) markLocalStreamingDisconnected(disappeared []string) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, path := range disappeared {
+		_, _ = s.db.Exec(
+			`INSERT INTO codespace_tail_offsets (source,log_file,last_offset,last_size,connection_state,last_error,updated_at)
+			 VALUES (?,?,0,0,'disconnected','file_disappeared',?)
+			 ON CONFLICT(source,log_file) DO UPDATE SET
+			   connection_state='disconnected',
+			   last_error='file_disappeared',
+			   updated_at=excluded.updated_at`,
+			"local",
+			path,
+			now,
+		)
+	}
+}
+
+func nullableString(v string) interface{} {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	return v
+}
+
+func (s *webState) refreshLocalStreamingStatus(watched int, lastChunkAt string, lastDefensiveRecopyAt string, streamErr error) {
 	reason := fmt.Sprintf("%s watching=%d", webSyncReasonLocalStreaming, watched)
 	code := webSyncCodeSkipped
 	if streamErr != nil {
@@ -603,6 +736,9 @@ func (s *webState) refreshLocalStreamingStatus(watched int, lastChunkAt string, 
 	}
 	if strings.TrimSpace(lastChunkAt) != "" {
 		reason += " last_chunk_at=" + lastChunkAt
+	}
+	if strings.TrimSpace(lastDefensiveRecopyAt) != "" {
+		reason += " last_defensive_recopy_at=" + lastDefensiveRecopyAt
 	}
 	s.setSyncStatus("local", code, reason)
 }
@@ -619,41 +755,94 @@ func (s *webState) startLocalStreamingLoop(interval, fallbackInterval time.Durat
 	s.setLocalRefreshSchedule(0, time.Time{})
 	initial, err := scanLocalProcessLogs(s.logsDir)
 	if err != nil {
-		s.refreshLocalStreamingStatus(0, "", err)
+		s.refreshLocalStreamingStatus(0, "", "", err)
 		return
 	}
 	s.localStreamMu.Lock()
 	s.localStream = initial
 	s.localChunkAt = time.Time{}
 	s.localStreamMu.Unlock()
-	s.refreshLocalStreamingStatus(len(initial), "", nil)
+	s.persistLocalStreamingCheckpoints(initial, "", "")
+	s.refreshLocalStreamingStatus(len(initial), "", "", nil)
 
 	ticker := time.NewTicker(cadence)
+	fallbackTicker := time.NewTicker(fallback)
+	watcher, watchErr := fsnotify.NewWatcher()
+	var watcherEvents <-chan fsnotify.Event
+	var watcherErrors <-chan error
+	if watchErr == nil {
+		if err := watcher.Add(s.logsDir); err != nil {
+			_ = watcher.Close()
+			watcher = nil
+		} else {
+			watcherEvents = watcher.Events
+			watcherErrors = watcher.Errors
+		}
+	}
 	go func() {
-		lastFallback := time.Now().UTC()
-		for tick := range ticker.C {
-			current, err := scanLocalProcessLogs(s.logsDir)
-			if err != nil {
-				s.refreshLocalStreamingStatus(0, "", err)
+		shouldScan := true
+		for {
+			select {
+			case <-ticker.C:
+				shouldScan = true
+			case <-fallbackTicker.C:
+				shouldScan = true
+			case ev, ok := <-watcherEvents:
+				if ok && isLocalProcessLogName(filepath.Base(ev.Name)) {
+					shouldScan = true
+				}
+			case _, ok := <-watcherErrors:
+				if !ok {
+					continue
+				}
+				shouldScan = true
+			}
+			if !shouldScan {
 				continue
 			}
+			shouldScan = false
+
+			tick := time.Now().UTC()
+			current, err := scanLocalProcessLogs(s.logsDir)
+			if err != nil {
+				s.refreshLocalStreamingStatus(0, "", "", err)
+				continue
+			}
+
 			s.localStreamMu.Lock()
 			changed := localProcessLogsChanged(s.localStream, current)
+			defensiveRecopy := localProcessLogsShrank(s.localStream, current)
+			var disappeared []string
+			for path := range s.localStream {
+				if _, ok := current[path]; !ok {
+					disappeared = append(disappeared, path)
+				}
+			}
 			s.localStream = current
 			lastChunkAt := s.localChunkAt
 			s.localStreamMu.Unlock()
 
-			shouldSync := changed || tick.UTC().Sub(lastFallback) >= fallback
-			if shouldSync {
-				if err := s.refreshLocalSnapshot(); err != nil {
+			shouldSync := changed
+			lastDefensiveRecopyAt := ""
+			if defensiveRecopy {
+				if err := s.refreshLocalSnapshotWithForce(true); err != nil {
 					if !isSyncInProgressError(err) {
-						s.refreshLocalStreamingStatus(len(current), "", err)
+						s.refreshLocalStreamingStatus(len(current), "", "", err)
 					}
 					continue
 				}
-				lastFallback = tick.UTC()
+				lastDefensiveRecopyAt = tick.Format(time.RFC3339Nano)
+				shouldSync = false
+			}
+			if shouldSync {
+				if err := s.refreshLocalSnapshot(); err != nil {
+					if !isSyncInProgressError(err) {
+						s.refreshLocalStreamingStatus(len(current), "", lastDefensiveRecopyAt, err)
+					}
+					continue
+				}
 				s.localStreamMu.Lock()
-				s.localChunkAt = tick.UTC()
+				s.localChunkAt = tick
 				lastChunkAt = s.localChunkAt
 				s.localStreamMu.Unlock()
 			}
@@ -661,7 +850,11 @@ func (s *webState) startLocalStreamingLoop(interval, fallbackInterval time.Durat
 			if !lastChunkAt.IsZero() {
 				lastChunkStr = lastChunkAt.Format(time.RFC3339Nano)
 			}
-			s.refreshLocalStreamingStatus(len(current), lastChunkStr, nil)
+			s.persistLocalStreamingCheckpoints(current, lastChunkStr, lastDefensiveRecopyAt)
+			if len(disappeared) > 0 {
+				s.markLocalStreamingDisconnected(disappeared)
+			}
+			s.refreshLocalStreamingStatus(len(current), lastChunkStr, lastDefensiveRecopyAt, nil)
 		}
 	}()
 }
