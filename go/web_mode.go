@@ -706,6 +706,7 @@ func (s *webState) renderRefreshIndicators(now time.Time) string {
 	localInterval := s.localRefreshInterval
 	localNext := s.localNextRefreshAt
 	codespacesMode := s.codespacesMode
+	codespacesStreaming := s.codespacesStreaming
 	codespacesInterval := s.codespacesInterval
 	codespacesNext := s.codespacesNextRefreshAt
 	localStatus := s.syncStatus["local"]
@@ -732,6 +733,29 @@ func (s *webState) renderRefreshIndicators(now time.Time) string {
 		codespacesState = "Starting"
 	} else {
 		codespacesCountdown = formatRefreshCountdown(codespacesNext.Sub(now))
+	}
+	if codespacesStreaming {
+		codespacesCountdown = ""
+		if codespacesState == "Idle" || codespacesState == "Starting" {
+			codespacesState = "Reconnecting"
+		}
+	}
+	if strings.Contains(codespacesStatus.Reason, webSyncReasonCodespacesStreaming) {
+		codespacesCountdown = ""
+		switch codespacesStatus.Code {
+		case webSyncCodeOK:
+			if strings.Contains(codespacesStatus.Reason, "connected=0") {
+				codespacesState = "Reconnecting"
+			} else {
+				codespacesState = "Live"
+			}
+		case webSyncCodeStale:
+			codespacesState = "Disconnected"
+		case webSyncCodeError, webSyncCodeTimeout:
+			codespacesState = "Error"
+		default:
+			codespacesState = "Reconnecting"
+		}
 	}
 	if codespacesStatus.Reason == webSyncReasonInProgress {
 		codespacesState = "Running"

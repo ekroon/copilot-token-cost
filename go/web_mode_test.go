@@ -1997,6 +1997,39 @@ func TestRenderRefreshIndicatorsRunningKeepsCountdown(t *testing.T) {
 	}
 }
 
+func TestRenderRefreshIndicatorsStreamingShowsLiveWithoutCountdown(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.codespacesMode = "auto"
+	now := time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC)
+	state.setCodespacesRefreshSchedule(5*time.Minute, now.Add(4*time.Minute+50*time.Second))
+	state.syncStatus["codespaces"] = newSyncSourceStatus(webSyncCodeOK, webSyncReasonCodespacesStreaming+" active_streams=4 connected=2")
+
+	body := state.renderRefreshIndicators(now)
+	if !strings.Contains(body, "Codespaces") || !strings.Contains(body, ">Live<") {
+		t.Fatalf("expected live codespaces indicator, got %q", body)
+	}
+	if strings.Contains(body, "4m 50s") {
+		t.Fatalf("streaming indicator should not show periodic countdown: %q", body)
+	}
+}
+
+func TestRenderRefreshIndicatorsStreamingModeFallbackHidesCountdown(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.codespacesMode = "auto"
+	state.codespacesStreaming = true
+	now := time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC)
+	state.setCodespacesRefreshSchedule(5*time.Minute, now.Add(4*time.Minute+46*time.Second))
+	state.syncStatus["codespaces"] = newSyncSourceStatus(webSyncCodeSkipped, webSyncReasonCodespacesNoChanges)
+
+	body := state.renderRefreshIndicators(now)
+	if !strings.Contains(body, "Codespaces") || !strings.Contains(body, ">Reconnecting<") {
+		t.Fatalf("expected reconnecting fallback for streaming mode, got %q", body)
+	}
+	if strings.Contains(body, "4m 46s") {
+		t.Fatalf("streaming mode fallback should hide periodic countdown: %q", body)
+	}
+}
+
 func TestBuildDashboardPatchIncludesRefreshIndicatorsPatch(t *testing.T) {
 	state := newTestWebState(t, t.TempDir())
 	patch, err := state.buildDashboardPatch(sampleWebDashboardPayload(), time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
