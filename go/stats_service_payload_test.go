@@ -392,3 +392,83 @@ func TestWorkspacePathHelpersNormalizationAndCanonicalization(t *testing.T) {
 		t.Fatalf("canonical project=%q, want=%q", got, projectName(localPath))
 	}
 }
+
+func TestBuildStatsPayloadProjectCostsReconcileWithModelCosts(t *testing.T) {
+	setTestPricing(t)
+
+	day := "2025-01-02"
+	project := "/workspaces/github"
+	aggregated := aggregatedStats{
+		DailyStats: map[string]map[string]*Stats{
+			day: {
+				"model-a": {
+					APICalls:            2,
+					PromptTokens:        1_100_000,
+					CompletionTokens:    0,
+					CacheCreationTokens: 0,
+					CacheReadTokens:     500_000,
+				},
+			},
+		},
+		ModelStats: map[string]*Stats{
+			"model-a": {
+				APICalls:            2,
+				PromptTokens:        1_100_000,
+				CompletionTokens:    0,
+				CacheCreationTokens: 0,
+				CacheReadTokens:     500_000,
+			},
+		},
+		ProjectStats: map[string]*Stats{
+			project: {
+				APICalls:            2,
+				PromptTokens:        1_100_000,
+				CompletionTokens:    0,
+				CacheCreationTokens: 0,
+				CacheReadTokens:     500_000,
+			},
+		},
+		Records: []Record{
+			{
+				Model:               "model-a",
+				PromptTokens:        100_000,
+				CompletionTokens:    0,
+				CacheCreationTokens: 0,
+				CacheReadTokens:     500_000,
+				Timestamp:           day + "T10:00:00",
+				SessionID:           "sid-1",
+				Source:              "codespace:test",
+			},
+			{
+				Model:               "model-a",
+				PromptTokens:        1_000_000,
+				CompletionTokens:    0,
+				CacheCreationTokens: 0,
+				CacheReadTokens:     0,
+				Timestamp:           day + "T10:01:00",
+				SessionID:           "sid-1",
+				Source:              "codespace:test",
+			},
+		},
+		SessionWorkspaces: map[string]workspaceMeta{
+			"codespace:test\x1fsid-1": {CWD: project},
+		},
+		TotalRecords: 2,
+	}
+
+	payload := buildStatsPayload(aggregated, "today", day+" → "+day, 0)
+
+	dayModel, ok := payload.Daily[day]["model-a"].(statsPayloadStats)
+	if !ok {
+		t.Fatalf("daily model payload type mismatch: %T", payload.Daily[day]["model-a"])
+	}
+	dayProject := payload.DailyProjects[day][project]
+	assertFloatEqual(t, dayProject.Cost, dayModel.Cost)
+
+	projectTotals := payload.Projects[project]
+	modelTotals := payload.Models["model-a"]
+	assertFloatEqual(t, projectTotals.Cost, modelTotals.Cost)
+	if projectTotals.PromptTokens != modelTotals.PromptTokens || projectTotals.CacheReadTokens != modelTotals.CacheReadTokens {
+		t.Fatalf("project/model token totals mismatch: project=%+v model=%+v", projectTotals, modelTotals)
+	}
+}

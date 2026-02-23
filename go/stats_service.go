@@ -235,10 +235,7 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 		out.Daily[day] = dayMap
 	}
 
-	projCosts := make(map[string][2]float64)
-	projModelCosts := make(map[string]map[string][2]float64)
-	dailyProjectStats := make(map[string]map[string]*Stats)
-	dailyProjectCosts := make(map[string]map[string][2]float64)
+	projectModelDailyStats := make(map[string]map[string]map[string]*Stats)
 	workspacePaths := make([]string, 0, len(filtered))
 	for _, r := range filtered {
 		if r.SessionID == "" {
@@ -258,93 +255,109 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 		}
 		proj := canonicalProjectLabel(cwd, localProjectsByBase)
 		model := normalizeModel(r.Model)
-		rs := &Stats{
-			PromptTokens:        r.PromptTokens,
-			CompletionTokens:    r.CompletionTokens,
-			CacheCreationTokens: r.CacheCreationTokens,
-			CacheReadTokens:     r.CacheReadTokens,
-		}
-		cost := calcCost(model, rs, r.Timestamp)
-		costNC := calcCostNocache(model, rs, r.Timestamp)
 		day := "unknown"
 		if len(r.Timestamp) >= 10 {
 			day = r.Timestamp[:10]
 		}
-		c := projCosts[proj]
-		c[0] += cost
-		c[1] += costNC
-		projCosts[proj] = c
-		if projModelCosts[proj] == nil {
-			projModelCosts[proj] = make(map[string][2]float64)
+		if projectModelDailyStats[day] == nil {
+			projectModelDailyStats[day] = make(map[string]map[string]*Stats)
 		}
-		mc := projModelCosts[proj][model]
-		mc[0] += cost
-		mc[1] += costNC
-		projModelCosts[proj][model] = mc
-		if dailyProjectStats[day] == nil {
-			dailyProjectStats[day] = make(map[string]*Stats)
+		if projectModelDailyStats[day][proj] == nil {
+			projectModelDailyStats[day][proj] = make(map[string]*Stats)
 		}
-		if dailyProjectCosts[day] == nil {
-			dailyProjectCosts[day] = make(map[string][2]float64)
+		if projectModelDailyStats[day][proj][model] == nil {
+			projectModelDailyStats[day][proj][model] = newStats()
 		}
-		if _, ok := dailyProjectStats[day][proj]; !ok {
-			dailyProjectStats[day][proj] = newStats()
-		}
-		dailyProjectStats[day][proj].add(r, model)
-		dayProjectCost := dailyProjectCosts[day][proj]
-		dayProjectCost[0] += cost
-		dayProjectCost[1] += costNC
-		dailyProjectCosts[day][proj] = dayProjectCost
+		projectModelDailyStats[day][proj][model].add(r, model)
 	}
 
-	for proj, s := range projectStats {
-		pc := projCosts[proj]
-		out.Projects[proj] = statsPayloadStats{
-			APICalls:            s.APICalls,
-			UserTurns:           s.UserTurns,
-			PromptTokens:        s.PromptTokens,
-			CompletionTokens:    s.CompletionTokens,
-			CacheCreationTokens: s.CacheCreationTokens,
-			CacheReadTokens:     s.CacheReadTokens,
-			PremiumRequests:     s.PremiumRequests,
-			PremiumRequestCost:  roundN(s.PremiumRequests*getPremiumRequestCost(""), 4),
-			InputUncached:       uncachedInput(s),
-			Cost:                roundN(pc[0], 4),
-			CostWithoutCache:    roundN(pc[1], 4),
+	projectCostTotals := make(map[string][2]float64)
+	projectModelCostTotals := make(map[string]map[string][2]float64)
+	for day, projects := range projectModelDailyStats {
+		for project, models := range projects {
+			if _, ok := projectModelCostTotals[project]; !ok {
+				projectModelCostTotals[project] = make(map[string][2]float64)
+			}
+			for model, stats := range models {
+				cost := calcCost(model, stats, day)
+				costNC := calcCostNocache(model, stats, day)
+				projectCost := projectCostTotals[project]
+				projectCost[0] += cost
+				projectCost[1] += costNC
+				projectCostTotals[project] = projectCost
+				modelCost := projectModelCostTotals[project][model]
+				modelCost[0] += cost
+				modelCost[1] += costNC
+				projectModelCostTotals[project][model] = modelCost
+			}
+		}
+	}
+
+	for project, stats := range projectStats {
+		costs := projectCostTotals[project]
+		out.Projects[project] = statsPayloadStats{
+			APICalls:            stats.APICalls,
+			UserTurns:           stats.UserTurns,
+			PromptTokens:        stats.PromptTokens,
+			CompletionTokens:    stats.CompletionTokens,
+			CacheCreationTokens: stats.CacheCreationTokens,
+			CacheReadTokens:     stats.CacheReadTokens,
+			PremiumRequests:     stats.PremiumRequests,
+			PremiumRequestCost:  roundN(stats.PremiumRequests*getPremiumRequestCost(""), 4),
+			InputUncached:       uncachedInput(stats),
+			Cost:                roundN(costs[0], 4),
+			CostWithoutCache:    roundN(costs[1], 4),
 		}
 	}
 
 	projectModelStats := aggregated.ProjectModelStats
 	if len(projectModelStats) > 0 {
 		out.ProjectModels = make(map[string]map[string]statsPayloadStats)
-		for proj, models := range projectModelStats {
-			out.ProjectModels[proj] = make(map[string]statsPayloadStats)
-			pmc := projModelCosts[proj]
-			for model, s := range models {
-				mc := pmc[model]
-				out.ProjectModels[proj][model] = statsPayloadStats{
-					APICalls:            s.APICalls,
-					UserTurns:           s.UserTurns,
-					PromptTokens:        s.PromptTokens,
-					CompletionTokens:    s.CompletionTokens,
-					CacheCreationTokens: s.CacheCreationTokens,
-					CacheReadTokens:     s.CacheReadTokens,
-					PremiumRequests:     s.PremiumRequests,
-					PremiumRequestCost:  roundN(s.PremiumRequests*getPremiumRequestCost(""), 4),
-					InputUncached:       uncachedInput(s),
-					Cost:                roundN(mc[0], 4),
-					CostWithoutCache:    roundN(mc[1], 4),
+		for project, models := range projectModelStats {
+			out.ProjectModels[project] = make(map[string]statsPayloadStats)
+			for model, stats := range models {
+				costs := projectModelCostTotals[project][model]
+				out.ProjectModels[project][model] = statsPayloadStats{
+					APICalls:            stats.APICalls,
+					UserTurns:           stats.UserTurns,
+					PromptTokens:        stats.PromptTokens,
+					CompletionTokens:    stats.CompletionTokens,
+					CacheCreationTokens: stats.CacheCreationTokens,
+					CacheReadTokens:     stats.CacheReadTokens,
+					PremiumRequests:     stats.PremiumRequests,
+					PremiumRequestCost:  roundN(stats.PremiumRequests*getPremiumRequestCost(""), 4),
+					InputUncached:       uncachedInput(stats),
+					Cost:                roundN(costs[0], 4),
+					CostWithoutCache:    roundN(costs[1], 4),
 				}
 			}
 		}
 	}
-	if len(dailyProjectStats) > 0 {
+	if len(projectModelDailyStats) > 0 {
 		out.DailyProjects = make(map[string]map[string]statsPayloadStats)
-		for day, projects := range dailyProjectStats {
+		dayKeys := make([]string, 0, len(projectModelDailyStats))
+		for day := range projectModelDailyStats {
+			dayKeys = append(dayKeys, day)
+		}
+		sort.Strings(dayKeys)
+		for _, day := range dayKeys {
+			projects := projectModelDailyStats[day]
 			out.DailyProjects[day] = make(map[string]statsPayloadStats)
-			dayCosts := dailyProjectCosts[day]
-			for project, stats := range projects {
-				projectCosts := dayCosts[project]
+			projectKeys := make([]string, 0, len(projects))
+			for project := range projects {
+				projectKeys = append(projectKeys, project)
+			}
+			sort.Strings(projectKeys)
+			for _, project := range projectKeys {
+				models := projects[project]
+				stats := newStats()
+				projectCost := 0.0
+				projectCostNoCache := 0.0
+				for model, modelStats := range models {
+					mergeStats(stats, modelStats)
+					projectCost += calcCost(model, modelStats, day)
+					projectCostNoCache += calcCostNocache(model, modelStats, day)
+				}
 				out.DailyProjects[day][project] = statsPayloadStats{
 					APICalls:            stats.APICalls,
 					UserTurns:           stats.UserTurns,
@@ -355,8 +368,8 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 					PremiumRequests:     stats.PremiumRequests,
 					PremiumRequestCost:  roundN(stats.PremiumRequests*getPremiumRequestCost(day), 4),
 					InputUncached:       uncachedInput(stats),
-					Cost:                roundN(projectCosts[0], 4),
-					CostWithoutCache:    roundN(projectCosts[1], 4),
+					Cost:                roundN(projectCost, 4),
+					CostWithoutCache:    roundN(projectCostNoCache, 4),
 				}
 			}
 		}
