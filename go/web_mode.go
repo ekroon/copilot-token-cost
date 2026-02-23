@@ -61,10 +61,11 @@ type webState struct {
 	codespacesLastSuccessAt  time.Time
 	codespacesHasSuccess     bool
 
-	snapshotMu sync.RWMutex
-	snapshot   statsPayload
-	hasData    bool
-	syncStatus map[string]syncSourceStatus
+	snapshotMu   sync.RWMutex
+	snapshot     statsPayload
+	hasData      bool
+	syncStatus   map[string]syncSourceStatus
+	expandedRows map[string]map[string]bool // group ("project"/"day") -> rowKey -> expanded
 
 	refreshMu     sync.Mutex
 	subscribersMu sync.Mutex
@@ -253,6 +254,36 @@ func (s *webState) subscribe() (<-chan string, func()) {
 		}
 		s.subscribersMu.Unlock()
 	}
+}
+
+func (s *webState) setRowExpanded(group, rowKey string, expanded bool) {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	if s.expandedRows == nil {
+		s.expandedRows = make(map[string]map[string]bool)
+	}
+	if s.expandedRows[group] == nil {
+		s.expandedRows[group] = make(map[string]bool)
+	}
+	if expanded {
+		s.expandedRows[group][rowKey] = true
+	} else {
+		delete(s.expandedRows[group], rowKey)
+	}
+}
+
+func (s *webState) getExpandedRows() map[string]map[string]bool {
+	s.snapshotMu.RLock()
+	defer s.snapshotMu.RUnlock()
+	result := make(map[string]map[string]bool, len(s.expandedRows))
+	for group, rows := range s.expandedRows {
+		cp := make(map[string]bool, len(rows))
+		for k, v := range rows {
+			cp[k] = v
+		}
+		result[group] = cp
+	}
+	return result
 }
 
 func pushLatestUpdate(ch chan string, patch string) {
@@ -1151,14 +1182,14 @@ func (s *webState) buildRefreshIndicatorsPatch(now time.Time) string {
 }
 
 func (s *webState) buildDashboardPatch(payload statsPayload, now time.Time) (string, error) {
-	patch, err := buildRefreshPatch(payload, now)
+	patch, err := buildRefreshPatch(payload, now, s.getExpandedRows())
 	if err != nil {
 		return "", err
 	}
 	return patch + s.buildRefreshIndicatorsPatch(now), nil
 }
 
-func buildRefreshPatch(payload statsPayload, now time.Time) (string, error) {
+func buildRefreshPatch(payload statsPayload, now time.Time, expandedRows map[string]map[string]bool) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to encode refresh payload: %w", err)
@@ -1167,11 +1198,12 @@ func buildRefreshPatch(payload statsPayload, now time.Time) (string, error) {
 
 	var patch strings.Builder
 	appendDatastarOuterPatch(&patch, "#overview-summary", `<p id="overview-summary">`+renderWebOverviewSummary(payload, true)+`</p>`)
-	appendDatastarOuterPatch(&patch, "#sync-status-region", `<details id="sync-status-region" class="sync-status-compact">`+renderWebSyncStatusTable(payload, true)+`</details>`)
+	appendDatastarOuterPatch(&patch, "#sync-status-summary", renderWebSyncStatusSummary(payload, true))
+	appendDatastarOuterPatch(&patch, "#sync-status-table", renderWebSyncStatusTableOnly(payload, true))
 	appendDatastarOuterPatch(&patch, "#daily-token-chart-region", `<div id="daily-token-chart-region">`+renderWebDailyTokenChart(payload, true)+`</div>`)
 	appendDatastarOuterPatch(&patch, "#model-summary-region", `<div id="model-summary-region">`+renderWebModelSummaryTable(payload, true)+`</div>`)
-	appendDatastarOuterPatch(&patch, "#project-summary-region", `<div id="project-summary-region">`+renderWebProjectSummaryTable(payload, true)+`</div>`)
-	appendDatastarOuterPatch(&patch, "#daily-totals-region", `<div id="daily-totals-region">`+renderWebDailyTotalsTable(payload, true)+`</div>`)
+	appendDatastarOuterPatch(&patch, "#project-summary-region", `<div id="project-summary-region">`+renderWebProjectSummaryTable(payload, true, expandedRows["project"])+`</div>`)
+	appendDatastarOuterPatch(&patch, "#daily-totals-region", `<div id="daily-totals-region">`+renderWebDailyTotalsTable(payload, true, expandedRows["day"])+`</div>`)
 	appendDatastarOuterPatch(&patch, "#daily-spend-region", renderWebDailySpendRegion(payload, true, now))
 	appendDatastarOuterPatch(&patch, "#stats-json", `<pre id="stats-json">`+escaped+`</pre>`)
 	return patch.String(), nil
@@ -1418,7 +1450,7 @@ func renderWebModelSummaryTable(payload statsPayload, hasSnapshot bool) string {
 	return b.String()
 }
 
-func renderWebProjectSummaryTable(payload statsPayload, hasSnapshot bool) string {
+func renderWebProjectSummaryTable(payload statsPayload, hasSnapshot bool, expandedProjectRows map[string]bool) string {
 	if !hasSnapshot {
 		return "<p>Loading project summary…</p>"
 	}
@@ -1437,8 +1469,9 @@ func renderWebProjectSummaryTable(payload statsPayload, hasSnapshot bool) string
 		totalInput += row.stats.PromptTokens
 		totalOutput += row.stats.CompletionTokens
 		rowKey := webStableRowKey("project", row.name)
-		b.WriteString(renderWebProjectSummaryRow(row, rowKey, false))
-		b.WriteString(renderWebProjectDetailRow(payload, row.name, rowKey, false))
+		expanded := expandedProjectRows[rowKey]
+		b.WriteString(renderWebProjectSummaryRow(row, rowKey, expanded))
+		b.WriteString(renderWebProjectDetailRow(payload, row.name, rowKey, expanded))
 	}
 	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
@@ -1501,7 +1534,7 @@ func renderWebProjectDetailRow(payload statsPayload, projectName, rowKey string,
 	return b.String()
 }
 
-func renderWebDailyTotalsTable(payload statsPayload, hasSnapshot bool) string {
+func renderWebDailyTotalsTable(payload statsPayload, hasSnapshot bool, expandedDayRows map[string]bool) string {
 	if !hasSnapshot {
 		return "<p>Loading daily totals…</p>"
 	}
@@ -1522,8 +1555,9 @@ func renderWebDailyTotalsTable(payload statsPayload, hasSnapshot bool) string {
 		totalInput += row.promptTokens
 		totalOutput += row.completionTokens
 		rowKey := webStableRowKey("day", row.day)
-		b.WriteString(renderWebDaySummaryRow(row, rowKey, false))
-		b.WriteString(renderWebDayDetailRow(payload, row.day, rowKey, false))
+		expanded := expandedDayRows[rowKey]
+		b.WriteString(renderWebDaySummaryRow(row, rowKey, expanded))
+		b.WriteString(renderWebDayDetailRow(payload, row.day, rowKey, expanded))
 	}
 	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
@@ -1644,11 +1678,22 @@ func renderSyncStatusSummaryLine(payload statsPayload) string {
 }
 
 func renderWebSyncStatusTable(payload statsPayload, hasSnapshot bool) string {
+	return renderWebSyncStatusSummary(payload, hasSnapshot) + renderWebSyncStatusTableOnly(payload, hasSnapshot)
+}
+
+func renderWebSyncStatusSummary(payload statsPayload, hasSnapshot bool) string {
 	if !hasSnapshot {
-		return "<p>Loading sync status…</p>"
+		return `<summary id="sync-status-summary">Loading sync status…</summary>`
 	}
 	if len(payload.SyncStatus) == 0 {
-		return "<p>No sync status available.</p>"
+		return `<summary id="sync-status-summary">No sync status available.</summary>`
+	}
+	return fmt.Sprintf(`<summary id="sync-status-summary">%s</summary>`, renderSyncStatusSummaryLine(payload))
+}
+
+func renderWebSyncStatusTableOnly(payload statsPayload, hasSnapshot bool) string {
+	if !hasSnapshot || len(payload.SyncStatus) == 0 {
+		return `<table id="sync-status-table"></table>`
 	}
 
 	sources := make([]string, 0, len(payload.SyncStatus))
@@ -1657,10 +1702,7 @@ func renderWebSyncStatusTable(payload statsPayload, hasSnapshot bool) string {
 	}
 	sort.Strings(sources)
 
-	summaryLine := renderSyncStatusSummaryLine(payload)
-
 	var b strings.Builder
-	fmt.Fprintf(&b, `<summary>%s</summary>`, summaryLine)
 	b.WriteString(`<table id="sync-status-table"><thead><tr><th>Source</th><th>Code</th><th>Reason</th><th>Updated</th></tr></thead><tbody>`)
 	for _, source := range sources {
 		status := payload.SyncStatus[source]
@@ -1851,7 +1893,7 @@ func renderWebOverviewSummary(payload statsPayload, hasSnapshot bool) string {
 	)
 }
 
-func dashboardOverviewHTML(payload statsPayload, hasSnapshot bool) string {
+func dashboardOverviewHTML(payload statsPayload, hasSnapshot bool, expandedRows map[string]map[string]bool) string {
 	return fmt.Sprintf(`<p id="overview-summary">%s</p>
   <details id="sync-status-region" class="sync-status-compact">%s</details>
   <section>
@@ -1874,17 +1916,17 @@ func dashboardOverviewHTML(payload statsPayload, hasSnapshot bool) string {
 		renderWebSyncStatusTable(payload, hasSnapshot),
 		renderWebDailyTokenChart(payload, hasSnapshot),
 		renderWebModelSummaryTable(payload, hasSnapshot),
-		renderWebProjectSummaryTable(payload, hasSnapshot),
-		renderWebDailyTotalsTable(payload, hasSnapshot),
+		renderWebProjectSummaryTable(payload, hasSnapshot, expandedRows["project"]),
+		renderWebDailyTotalsTable(payload, hasSnapshot, expandedRows["day"]),
 	)
 }
 
-func dashboardShellHTML(payload statsPayload, hasSnapshot bool) string {
+func dashboardShellHTML(payload statsPayload, hasSnapshot bool, expandedRows map[string]map[string]bool) string {
 	placeholderIndicators := `<div id="refresh-indicators-region"><div id="refresh-indicators" class="refresh-indicators">` +
 		renderRefreshIndicatorRow("Local", "Idle", "") +
 		renderRefreshIndicatorRow("Codespaces", "Idle", "") +
 		`</div></div>`
-	return dashboardShellHTMLWithIndicators(payload, hasSnapshot, placeholderIndicators)
+	return dashboardShellHTMLWithIndicators(payload, hasSnapshot, placeholderIndicators, expandedRows)
 }
 
 func renderWebExpansionReplayScript() string {
@@ -1975,8 +2017,8 @@ func renderWebExpansionReplayScript() string {
   </script>`
 }
 
-func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, refreshIndicatorsHTML string) string {
-	overviewHTML := dashboardOverviewHTML(payload, hasSnapshot)
+func dashboardShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, refreshIndicatorsHTML string, expandedRows map[string]map[string]bool) string {
+	overviewHTML := dashboardOverviewHTML(payload, hasSnapshot, expandedRows)
 	replayScript := renderWebExpansionReplayScript()
 	statsJSON := "Loading…"
 	if hasSnapshot {
@@ -2964,7 +3006,7 @@ func newWebMux(state *webState) *http.ServeMux {
 		}
 		payload, hasSnapshot := state.getSnapshot()
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		page := dashboardShellHTMLWithIndicators(payload, hasSnapshot, state.renderRefreshIndicators(time.Now()))
+		page := dashboardShellHTMLWithIndicators(payload, hasSnapshot, state.renderRefreshIndicators(time.Now()), state.getExpandedRows())
 		if _, err := w.Write([]byte(page)); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write /details response: %v\n", err)
 		}
@@ -3065,7 +3107,9 @@ func newWebMux(state *webState) *http.ServeMux {
 			})
 			return
 		}
-		patch, err := buildProjectRowTogglePatch(payload, rowKey, parseWebExpandAction(r.URL.Query().Get("expand")))
+		expand := parseWebExpandAction(r.URL.Query().Get("expand"))
+		state.setRowExpanded("project", rowKey, expand)
+		patch, err := buildProjectRowTogglePatch(payload, rowKey, expand)
 		if err != nil {
 			writeActionError(w, &webActionError{
 				status:  http.StatusNotFound,
@@ -3103,7 +3147,9 @@ func newWebMux(state *webState) *http.ServeMux {
 			})
 			return
 		}
-		patch, err := buildDayRowTogglePatch(payload, rowKey, parseWebExpandAction(r.URL.Query().Get("expand")))
+		expand := parseWebExpandAction(r.URL.Query().Get("expand"))
+		state.setRowExpanded("day", rowKey, expand)
+		patch, err := buildDayRowTogglePatch(payload, rowKey, expand)
 		if err != nil {
 			writeActionError(w, &webActionError{
 				status:  http.StatusNotFound,

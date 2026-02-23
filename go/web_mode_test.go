@@ -785,12 +785,13 @@ func TestRebuildSnapshotBroadcastsPatchToSubscribers(t *testing.T) {
 
 	state.rebuildSnapshot()
 	patch := waitForPatch(t, updates, "rebuild snapshot patch")
-	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 9 {
-		t.Fatalf("patch event count=%d, want=9", got)
+	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 10 {
+		t.Fatalf("patch event count=%d, want=10", got)
 	}
 	for _, selector := range []string{
 		"data: selector #overview-summary",
-		"data: selector #sync-status-region",
+		"data: selector #sync-status-summary",
+		"data: selector #sync-status-table",
 		"data: selector #daily-token-chart-region",
 		"data: selector #model-summary-region",
 		"data: selector #project-summary-region",
@@ -833,7 +834,7 @@ func TestSetSyncStatusBroadcastsPatch(t *testing.T) {
 	state.setSyncStatus("local", webSyncCodeOK, webSyncReasonLocalSyncCompleted)
 
 	patch := waitForPatch(t, updates, "sync status patch")
-	if !strings.Contains(patch, "data: selector #sync-status-region") {
+	if !strings.Contains(patch, "data: selector #sync-status-summary") {
 		t.Fatalf("sync status patch missing selector")
 	}
 	if !strings.Contains(patch, webSyncReasonLocalSyncCompleted) {
@@ -1303,12 +1304,13 @@ func TestWebMuxSyncCodespacesActionBehaviorAndValidation(t *testing.T) {
 	if !strings.Contains(syncRec.Body.String(), "event: datastar-patch-elements") {
 		t.Fatalf("POST /actions/sync-codespaces missing datastar patch event")
 	}
-	if got := strings.Count(syncRec.Body.String(), "event: datastar-patch-elements"); got != 9 {
-		t.Fatalf("POST /actions/sync-codespaces patch event count=%d, want=9", got)
+	if got := strings.Count(syncRec.Body.String(), "event: datastar-patch-elements"); got != 10 {
+		t.Fatalf("POST /actions/sync-codespaces patch event count=%d, want=10", got)
 	}
 	for _, selector := range []string{
 		"data: selector #overview-summary",
-		"data: selector #sync-status-region",
+		"data: selector #sync-status-summary",
+		"data: selector #sync-status-table",
 		"data: selector #daily-token-chart-region",
 		"data: selector #model-summary-region",
 		"data: selector #project-summary-region",
@@ -1811,7 +1813,7 @@ func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 	projectKey := webStableRowKey("project", "token-consumption-copilot")
 	dayKey := webStableRowKey("day", "2026-02-18")
 
-	body := dashboardShellHTML(payload, true)
+	body := dashboardShellHTML(payload, true, nil)
 	expected := []string{
 		"data-init=\"@get('/events')\"",
 		"data-on:datastar-fetch=",
@@ -2206,19 +2208,20 @@ func TestBuildDashboardPatchIncludesRefreshIndicatorsPatch(t *testing.T) {
 }
 
 func TestBuildRefreshPatchPatchesOverviewFragments(t *testing.T) {
-	patch, err := buildRefreshPatch(sampleWebDashboardPayload(), time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
+	patch, err := buildRefreshPatch(sampleWebDashboardPayload(), time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC), nil)
 	if err != nil {
 		t.Fatalf("buildRefreshPatch: %v", err)
 	}
-	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 8 {
-		t.Fatalf("patch event count=%d, want=8", got)
+	if got := strings.Count(patch, "event: datastar-patch-elements"); got != 9 {
+		t.Fatalf("patch event count=%d, want=9", got)
 	}
-	if got := strings.Count(patch, "data: mode outer"); got != 8 {
-		t.Fatalf("outer mode count=%d, want=8", got)
+	if got := strings.Count(patch, "data: mode outer"); got != 9 {
+		t.Fatalf("outer mode count=%d, want=9", got)
 	}
 	orderedSelectors := []string{
 		"data: selector #overview-summary",
-		"data: selector #sync-status-region",
+		"data: selector #sync-status-summary",
+		"data: selector #sync-status-table",
 		"data: selector #daily-token-chart-region",
 		"data: selector #model-summary-region",
 		"data: selector #project-summary-region",
@@ -2258,7 +2261,7 @@ func TestBuildRefreshPatchPatchesOverviewFragments(t *testing.T) {
 }
 
 func TestBuildRefreshPatchDailySpendFrameUsesValidSSELines(t *testing.T) {
-	patch, err := buildRefreshPatch(sampleWebDashboardPayload(), time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
+	patch, err := buildRefreshPatch(sampleWebDashboardPayload(), time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC), nil)
 	if err != nil {
 		t.Fatalf("buildRefreshPatch: %v", err)
 	}
@@ -2307,5 +2310,35 @@ func TestBuildRefreshPatchDailySpendFrameUsesValidSSELines(t *testing.T) {
 		if strings.Contains(dailySpendFrame, legacy) {
 			t.Fatalf("daily spend frame unexpectedly contains legacy trend table %q", legacy)
 		}
+	}
+}
+
+func TestBuildRefreshPatchPreservesExpandedRows(t *testing.T) {
+	payload := sampleWebDashboardPayload()
+	projectKey := webStableRowKey("project", "token-consumption-copilot")
+	dayKey := webStableRowKey("day", "2026-02-18")
+
+	expandedRows := map[string]map[string]bool{
+		"project": {projectKey: true},
+		"day":     {dayKey: true},
+	}
+	patch, err := buildRefreshPatch(payload, time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC), expandedRows)
+	if err != nil {
+		t.Fatalf("buildRefreshPatch: %v", err)
+	}
+
+	if !strings.Contains(patch, `data-expand-action="false"`) {
+		t.Fatalf("expanded row missing data-expand-action=false in refresh patch")
+	}
+	if !strings.Contains(patch, `class="detail-table"`) {
+		t.Fatalf("expanded row missing detail-table content in refresh patch")
+	}
+
+	collapsedPatch, err := buildRefreshPatch(payload, time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC), nil)
+	if err != nil {
+		t.Fatalf("buildRefreshPatch collapsed: %v", err)
+	}
+	if strings.Contains(collapsedPatch, `class="detail-table"`) {
+		t.Fatalf("collapsed patch unexpectedly contains detail-table content")
 	}
 }
