@@ -299,32 +299,29 @@ func connectSSHAndSFTP(target *sshTarget) (*ssh.Client, *sftp.Client, error) {
 	return sshClient, sftpClient, nil
 }
 
-func pickRemoteLogFile(client *sftp.Client) (string, error) {
+func isProcessLogFile(name string) bool {
+	return strings.HasPrefix(name, "process") && strings.HasSuffix(name, ".log")
+}
+
+func listRemoteProcessLogs(client *sftp.Client) ([]string, error) {
 	entries, err := client.ReadDir(logsRoot)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	type candidate struct {
-		name    string
-		modTime time.Time
-	}
-	var candidates []candidate
+	var paths []string
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		name := entry.Name()
-		if strings.HasSuffix(name, ".log") && strings.HasPrefix(name, "process") {
-			candidates = append(candidates, candidate{name: name, modTime: entry.ModTime()})
+		if isProcessLogFile(entry.Name()) {
+			paths = append(paths, filepath.Join(logsRoot, entry.Name()))
 		}
 	}
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("no process*.log files found in %s", logsRoot)
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("no process*.log files found in %s", logsRoot)
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].modTime.After(candidates[j].modTime)
-	})
-	return filepath.Join(logsRoot, candidates[0].name), nil
+	sort.Strings(paths)
+	return paths, nil
 }
 
 func fullCopy(client *sftp.Client, remotePath, localPath string) (int64, error) {
@@ -339,6 +336,21 @@ func fullCopy(client *sftp.Client, remotePath, localPath string) (int64, error) 
 	}
 	defer localFile.Close()
 	return io.Copy(localFile, remoteFile)
+}
+
+type trackedTailFile struct {
+	Source                string
+	RemotePath            string
+	LocalPath             string
+	Offset                int64
+	FullCopyPending       bool
+	LastHash              string
+	LastMtime             string
+	LastError             string
+	LastChunkAt           string
+	LastFullCopyAt        string
+	LastDefensiveRecopyAt string
+	ConnectionState       string
 }
 
 func appendDelta(client *sftp.Client, remotePath, localPath string, offset int64) (int64, error) {
@@ -358,42 +370,136 @@ func appendDelta(client *sftp.Client, remotePath, localPath string, offset int64
 	return io.Copy(localFile, remoteFile)
 }
 
-func runTailSession(client *sftp.Client, remotePath, localPath string, interval time.Duration, until time.Time) error {
-	size, err := fullCopy(client, remotePath, localPath)
+func deriveLocalPathForRemote(localPath, codespace, remotePath string, multiFile bool) string {
+	if !multiFile {
+		return deriveLocalPath(localPath, codespace, remotePath)
+	}
+	base := fmt.Sprintf("%s-%s", codespace, filepath.Base(remotePath))
+	if strings.TrimSpace(localPath) == "" {
+		return base
+	}
+	return filepath.Join(localPath, base)
+}
+
+func reconcileTrackedFiles(tracked map[string]*trackedTailFile, checkpoints map[string]tailCheckpoint, source string, discovered []string, codespace, localPath string, multiFile bool) (added, removed []string) {
+	seen := make(map[string]bool, len(discovered))
+	for _, remotePath := range discovered {
+		seen[remotePath] = true
+		if _, ok := tracked[remotePath]; ok {
+			continue
+		}
+		cp := checkpoints[remotePath]
+		tracked[remotePath] = &trackedTailFile{
+			Source:                source,
+			RemotePath:            remotePath,
+			LocalPath:             deriveLocalPathForRemote(localPath, codespace, remotePath, multiFile),
+			Offset:                cp.LastOffset,
+			FullCopyPending:       true,
+			LastHash:              cp.LastHash,
+			LastMtime:             cp.LastMtime,
+			LastError:             cp.LastError,
+			LastChunkAt:           cp.LastChunkAt,
+			LastFullCopyAt:        cp.LastFullCopyAt,
+			LastDefensiveRecopyAt: cp.LastDefensiveRecopyAt,
+			ConnectionState:       cp.ConnectionState,
+		}
+		added = append(added, remotePath)
+	}
+	for remotePath := range tracked {
+		if seen[remotePath] {
+			continue
+		}
+		delete(tracked, remotePath)
+		removed = append(removed, remotePath)
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	return added, removed
+}
+
+func syncTrackedFile(client *sftp.Client, file *trackedTailFile, store *tailStateStore) error {
+	nowTS := time.Now().UTC().Format(time.RFC3339Nano)
+	info, err := client.Stat(file.RemotePath)
 	if err != nil {
+		file.ConnectionState = "degraded"
+		file.LastError = err.Error()
+		_ = store.Upsert(tailCheckpoint{
+			Source:          file.Source,
+			LogFile:         file.RemotePath,
+			LastOffset:      file.Offset,
+			LastHash:        file.LastHash,
+			ConnectionState: file.ConnectionState,
+			LastError:       file.LastError,
+		})
 		return err
 	}
-	offset := size
-	fmt.Printf("full copy: %s -> %s (%d bytes)\n", remotePath, localPath, size)
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for time.Now().Before(until) {
-		<-ticker.C
-		info, err := client.Stat(remotePath)
+	file.ConnectionState = "connected"
+	file.LastError = ""
+	remoteSize := info.Size()
+	file.LastMtime = info.ModTime().UTC().Format(time.RFC3339Nano)
+	fullCopied := false
+	defensiveRecopy := false
+	wroteBytes := int64(0)
+	if file.FullCopyPending || remoteSize < file.Offset {
+		size, err := fullCopy(client, file.RemotePath, file.LocalPath)
 		if err != nil {
 			return err
 		}
-		remoteSize := info.Size()
-		if remoteSize < offset {
-			resetSize, err := fullCopy(client, remotePath, localPath)
-			if err != nil {
-				return err
-			}
-			offset = resetSize
-			fmt.Printf("rotation/truncate detected; full recopy (%d bytes)\n", resetSize)
-			continue
-		}
-		if remoteSize == offset {
-			continue
-		}
-		written, err := appendDelta(client, remotePath, localPath, offset)
+		file.Offset = size
+		file.FullCopyPending = false
+		fullCopied = true
+		file.LastFullCopyAt = nowTS
+		fmt.Printf("full copy: %s -> %s (%d bytes)\n", file.RemotePath, file.LocalPath, size)
+	} else if remoteSize > file.Offset {
+		written, err := appendDelta(client, file.RemotePath, file.LocalPath, file.Offset)
 		if err != nil {
 			return err
 		}
-		offset += written
-		fmt.Printf("tail append: +%d bytes (offset=%d)\n", written, offset)
+		wroteBytes = written
+		file.Offset += written
+		fmt.Printf("tail append: %s +%d bytes (offset=%d)\n", file.RemotePath, written, file.Offset)
 	}
+
+	localHash, localSize, localErr := localSampleHash(file.LocalPath)
+	if localErr == nil {
+		remoteHash, remoteErr := remoteSampleHash(client, file.RemotePath, file.Offset)
+		if remoteErr == nil && localHash != "" && remoteHash != "" && localHash != remoteHash {
+			resetSize, copyErr := fullCopy(client, file.RemotePath, file.LocalPath)
+			if copyErr == nil {
+				file.Offset = resetSize
+				if h, _, hErr := localSampleHash(file.LocalPath); hErr == nil {
+					localHash = h
+				}
+				defensiveRecopy = true
+				file.LastDefensiveRecopyAt = nowTS
+				file.LastFullCopyAt = nowTS
+				fmt.Printf("defensive recopy: digest mismatch for %s, reset to %d bytes\n", file.RemotePath, resetSize)
+			}
+		}
+	}
+	if localErr == nil {
+		file.LastHash = localHash
+		if file.Offset == 0 {
+			file.Offset = localSize
+		}
+	}
+	if wroteBytes > 0 || fullCopied || defensiveRecopy {
+		file.LastChunkAt = nowTS
+	}
+
+	_ = store.Upsert(tailCheckpoint{
+		Source:                file.Source,
+		LogFile:               file.RemotePath,
+		LastOffset:            file.Offset,
+		LastSize:              localSize,
+		LastMtime:             file.LastMtime,
+		LastHash:              file.LastHash,
+		ConnectionState:       file.ConnectionState,
+		LastError:             file.LastError,
+		LastChunkAt:           file.LastChunkAt,
+		LastFullCopyAt:        file.LastFullCopyAt,
+		LastDefensiveRecopyAt: file.LastDefensiveRecopyAt,
+	})
 	return nil
 }
 
@@ -405,12 +511,77 @@ func deriveLocalPath(localPath, codespace, remotePath string) string {
 	return fmt.Sprintf("%s-%s", codespace, base)
 }
 
+func sortedTrackedKeys(tracked map[string]*trackedTailFile) []string {
+	keys := make([]string, 0, len(tracked))
+	for key := range tracked {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func runTailSession(client *sftp.Client, source, codespace, remoteFile, localPath string, interval time.Duration, until time.Time, tracked map[string]*trackedTailFile, forceFullCopy bool, store *tailStateStore, checkpoints map[string]tailCheckpoint) error {
+	multiFile := strings.TrimSpace(remoteFile) == ""
+	syncOnce := func() error {
+		var discovered []string
+		var err error
+		if multiFile {
+			discovered, err = listRemoteProcessLogs(client)
+			if err != nil {
+				return err
+			}
+		} else {
+			discovered = []string{remoteFile}
+		}
+		added, removed := reconcileTrackedFiles(tracked, checkpoints, source, discovered, codespace, localPath, multiFile)
+		for _, file := range added {
+			fmt.Printf("discovered new log file: %s\n", file)
+		}
+		for _, file := range removed {
+			fmt.Printf("log file disappeared, stopping sync: %s\n", file)
+			_ = store.MarkDisconnected(source, file, "file_disappeared")
+		}
+		if forceFullCopy {
+			for _, file := range tracked {
+				file.FullCopyPending = true
+			}
+			forceFullCopy = false
+		}
+		for _, key := range sortedTrackedKeys(tracked) {
+			if err := syncTrackedFile(client, tracked[key], store); err != nil {
+				if os.IsNotExist(err) && multiFile {
+					delete(tracked, key)
+					fmt.Printf("log file disappeared during sync: %s\n", key)
+					_ = store.MarkDisconnected(source, key, "file_disappeared")
+					continue
+				}
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := syncOnce(); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for time.Now().Before(until) {
+		<-ticker.C
+		if err := syncOnce(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func main() {
 	var (
 		codespace     = flag.String("codespace", "", "Codespace name")
 		sshHost       = flag.String("ssh-host", "", "Explicit SSH host alias from gh cs ssh --config")
-		remoteFile    = flag.String("remote-file", "", "Remote log file path (default: latest process*.log)")
-		localFile     = flag.String("local-file", "", "Local mirror file path")
+		remoteFile    = flag.String("remote-file", "", "Remote log file path (default: discover and tail all process*.log files)")
+		localFile     = flag.String("local-file", "", "Single local mirror file path when --remote-file is set; otherwise local directory for mirrored files")
+		stateDB       = flag.String("state-db", "", "SQLite state DB path (default: copilot-token-cost state DB)")
 		pollInterval  = flag.Duration("poll-interval", 2*time.Second, "Polling interval for tail reads")
 		runFor        = flag.Duration("run-for", 45*time.Second, "Prototype run duration")
 		reconnectOnce = flag.Bool("reconnect-once", true, "Force one reconnect cycle (full recopy on reconnect)")
@@ -440,11 +611,26 @@ func main() {
 	fmt.Printf("resolved target alias=%s host=%s port=%s user=%s proxy=%t\n",
 		target.Alias, target.Host, target.Port, target.User, strings.TrimSpace(strings.ToLower(target.ProxyCmd)) != "" && strings.TrimSpace(strings.ToLower(target.ProxyCmd)) != "none")
 
+	source := "codespace:" + strings.TrimSpace(*codespace)
+	store, err := openTailStateStore(*stateDB)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open state DB failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = store.Close() }()
+	checkpoints, err := store.LoadBySource(source)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load state checkpoints failed: %v\n", err)
+		os.Exit(1)
+	}
+
 	endTime := time.Now().Add(*runFor)
 	reconnectAt := time.Time{}
 	if *reconnectOnce {
 		reconnectAt = time.Now().Add(*runFor / 2)
 	}
+	remoteOverride := strings.TrimSpace(*remoteFile)
+	tracked := map[string]*trackedTailFile{}
 
 	for {
 		sshClient, sftpClient, err := connectSSHAndSFTP(target)
@@ -453,24 +639,11 @@ func main() {
 			os.Exit(1)
 		}
 
-		currentRemote := strings.TrimSpace(*remoteFile)
-		if currentRemote == "" {
-			currentRemote, err = pickRemoteLogFile(sftpClient)
-			if err != nil {
-				_ = sftpClient.Close()
-				_ = sshClient.Close()
-				fmt.Fprintf(os.Stderr, "pick remote log file failed: %v\n", err)
-				os.Exit(1)
-			}
-		}
-		currentLocal := deriveLocalPath(*localFile, *codespace, currentRemote)
-		fmt.Printf("using remote=%s local=%s\n", currentRemote, currentLocal)
-
 		sessionUntil := endTime
 		if !reconnectAt.IsZero() && reconnectAt.Before(endTime) {
 			sessionUntil = reconnectAt
 		}
-		err = runTailSession(sftpClient, currentRemote, currentLocal, *pollInterval, sessionUntil)
+		err = runTailSession(sftpClient, source, *codespace, remoteOverride, *localFile, *pollInterval, sessionUntil, tracked, true, store, checkpoints)
 		_ = sftpClient.Close()
 		_ = sshClient.Close()
 		if err != nil {

@@ -20,6 +20,7 @@ type webModeConfig struct {
 	ListenAddress            string
 	RefreshInterval          time.Duration
 	CodespacesMode           string
+	CodespacesStreaming      bool
 	CodespacesInterval       time.Duration
 	CodespacesIncludeStopped bool
 	LogsDir                  string
@@ -43,6 +44,7 @@ type webState struct {
 	syncFrom                 *time.Time
 	syncTo                   *time.Time
 	codespacesMode           string
+	codespacesStreaming      bool
 	codespacesIncludeStopped bool
 	localRefreshInterval     time.Duration
 	localNextRefreshAt       time.Time
@@ -88,6 +90,7 @@ const (
 	webSyncReasonCodespacesNoChanges = "codespaces_no_changes"
 	webSyncReasonCodespacesCompleted = "codespaces_sync_completed"
 	webSyncReasonCodespacesStale     = "codespaces_sync_stale"
+	webSyncReasonCodespacesStreaming = "codespaces_streaming"
 
 	defaultWebCodespacesInterval = 5 * time.Minute
 	maxWebCodespacesRetryBackoff = 30 * time.Minute
@@ -184,6 +187,7 @@ func newWebState(cfg webModeConfig) (*webState, error) {
 		syncFrom:                 cfg.SyncFrom,
 		syncTo:                   cfg.SyncTo,
 		codespacesMode:           mode,
+		codespacesStreaming:      cfg.CodespacesStreaming,
 		codespacesIncludeStopped: cfg.CodespacesIncludeStopped,
 		localRefreshInterval:     cfg.RefreshInterval,
 		codespacesInterval:       codespacesInterval,
@@ -463,6 +467,74 @@ func (s *webState) syncCodespacesSnapshot() error {
 
 func (s *webState) syncCodespacesSnapshotAuto() error {
 	return s.syncCodespacesSnapshotWithMode(false)
+}
+
+func (s *webState) refreshCodespacesStreamingStatus() {
+	if !s.codespacesStreaming {
+		return
+	}
+	rows, err := s.db.Query(
+		`SELECT connection_state, COALESCE(last_chunk_at, ''), COALESCE(last_defensive_recopy_at, ''), COALESCE(last_error, '')
+		 FROM codespace_tail_offsets
+		 WHERE source LIKE 'codespace:%'`,
+	)
+	if err != nil {
+		s.setSyncStatus("codespaces", webSyncCodeError, fmt.Sprintf("%s query_failed=%v", webSyncReasonCodespacesStreaming, err))
+		return
+	}
+	defer rows.Close()
+
+	total := 0
+	connected := 0
+	connecting := 0
+	var lastChunkAt string
+	var lastRecopyAt string
+	var lastError string
+	for rows.Next() {
+		var state, chunkAt, recopyAt, errText string
+		if err := rows.Scan(&state, &chunkAt, &recopyAt, &errText); err != nil {
+			continue
+		}
+		total++
+		switch strings.ToLower(strings.TrimSpace(state)) {
+		case "connected":
+			connected++
+		case "connecting", "reconnecting":
+			connecting++
+		}
+		if chunkAt > lastChunkAt {
+			lastChunkAt = chunkAt
+		}
+		if recopyAt > lastRecopyAt {
+			lastRecopyAt = recopyAt
+		}
+		if errText != "" {
+			lastError = errText
+		}
+	}
+	if total == 0 {
+		s.setSyncStatus("codespaces", webSyncCodeSkipped, webSyncReasonCodespacesStreaming+" no_stream_state")
+		return
+	}
+	reason := fmt.Sprintf("%s active_streams=%d connected=%d", webSyncReasonCodespacesStreaming, total, connected)
+	if lastChunkAt != "" {
+		reason += " last_chunk_at=" + lastChunkAt
+	}
+	if lastRecopyAt != "" {
+		reason += " last_defensive_recopy_at=" + lastRecopyAt
+	}
+	if lastError != "" {
+		reason += " last_error=" + lastError
+	}
+	if connected > 0 {
+		s.setSyncStatus("codespaces", webSyncCodeOK, reason)
+		return
+	}
+	if connecting > 0 {
+		s.setSyncStatus("codespaces", webSyncCodeSkipped, reason)
+		return
+	}
+	s.setSyncStatus("codespaces", webSyncCodeStale, reason)
 }
 
 func (s *webState) startCodespacesAutoSyncLoop(interval time.Duration) {
@@ -2705,6 +2777,16 @@ func runWebMode(cfg webModeConfig) error {
 		}()
 	} else {
 		state.setLocalRefreshSchedule(0, time.Time{})
+	}
+	if cfg.CodespacesStreaming {
+		state.refreshCodespacesStreamingStatus()
+		streamingTicker := time.NewTicker(2 * time.Second)
+		defer streamingTicker.Stop()
+		go func() {
+			for range streamingTicker.C {
+				state.refreshCodespacesStreamingStatus()
+			}
+		}()
 	}
 	mux := newWebMux(state)
 

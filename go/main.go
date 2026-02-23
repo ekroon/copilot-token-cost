@@ -744,6 +744,24 @@ CREATE TABLE IF NOT EXISTS codespace_sync_state (
     last_synced_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS codespace_tail_offsets (
+    source TEXT NOT NULL,
+    log_file TEXT NOT NULL,
+    last_offset INTEGER NOT NULL DEFAULT 0,
+    last_size INTEGER NOT NULL DEFAULT 0,
+    last_mtime TEXT,
+    last_hash TEXT,
+    connection_state TEXT NOT NULL DEFAULT 'disconnected',
+    last_error TEXT,
+    last_chunk_at TEXT,
+    last_full_copy_at TEXT,
+    last_defensive_recopy_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (source, log_file)
+);
+
+CREATE INDEX IF NOT EXISTS idx_codespace_tail_offsets_source ON codespace_tail_offsets(source);
+
 CREATE INDEX IF NOT EXISTS idx_api_calls_timestamp ON api_calls(timestamp);
 CREATE INDEX IF NOT EXISTS idx_api_calls_model ON api_calls(model_normalized);
 CREATE INDEX IF NOT EXISTS idx_api_calls_session ON api_calls(session_id);
@@ -2236,6 +2254,7 @@ func main() {
 	webListen := flag.String("web-listen", "127.0.0.1:7331", "Web mode listen address")
 	webRefreshInterval := flag.Duration("web-refresh-interval", 30*time.Second, "Web mode refresh interval")
 	webCodespacesMode := flag.String("web-codespaces-mode", "auto", "Web mode Codespaces sync mode: manual|auto (default auto: background startup sync + periodic sync)")
+	webCodespacesStreaming := flag.Bool("web-codespaces-streaming", false, "Enable experimental codespaces streaming status from tail checkpoints")
 	webCodespacesInterval := flag.Duration("web-codespaces-interval", 5*time.Minute, "Web mode Codespaces periodic sync interval when mode=auto")
 
 	flag.Usage = func() {
@@ -2244,7 +2263,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "                         [--sync] [--import-file FILE] [--export-file FILE]\n\n")
 		fmt.Fprintf(os.Stderr, "                         [--codespaces-sync] [--codespaces-include-stopped]\n\n")
 		fmt.Fprintf(os.Stderr, "                         [--web] [--web-listen ADDR] [--web-refresh-interval DURATION]\n")
-		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-mode manual|auto] [--web-codespaces-interval DURATION]\n\n")
+		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-mode manual|auto] [--web-codespaces-streaming] [--web-codespaces-interval DURATION]\n\n")
 		fmt.Fprintf(os.Stderr, "Copilot CLI Token Cost Calculator\n\n")
 		fmt.Fprintf(os.Stderr, "Prompt text storage is always-on when prompt text is available; unavailable prompt text is stored as NULL.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
@@ -2263,6 +2282,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --today  # web mode with date window\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-mode manual  # disable auto codespaces sync\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-interval 15s  # near-continuous codespaces sync\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-streaming  # show experimental live streaming status\n")
 	}
 	flag.Parse()
 
@@ -2394,6 +2414,7 @@ func main() {
 			ListenAddress:            *webListen,
 			RefreshInterval:          *webRefreshInterval,
 			CodespacesMode:           webCodespacesModeValue,
+			CodespacesStreaming:      *webCodespacesStreaming,
 			CodespacesInterval:       *webCodespacesInterval,
 			CodespacesIncludeStopped: *codespacesIncludeStopped,
 			LogsDir:                  logsDir,

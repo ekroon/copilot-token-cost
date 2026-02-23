@@ -36,7 +36,9 @@ cd go
 go run ./cmd/codespace-tail-proto --codespace <codespace-name> --run-for 60s --poll-interval 2s
 ```
 
-The prototype does a full copy first, then tails appended bytes; with `--reconnect-once` (default), it reconnects mid-run and performs a full recopy before resuming tail reads.
+By default, the prototype discovers and tails all `process*.log` files, picks up new files that appear during runtime, and stops syncing files that disappear. It does a full copy first, then tails appended bytes; with `--reconnect-once` (default), it reconnects mid-run and performs a full recopy before resuming tail reads.
+
+It persists per-file tail checkpoints to SQLite (`codespace_tail_offsets`) and runs digest checks; if local/remote digests diverge, it performs a defensive full recopy before continuing. Use `--state-db <path>` to override the checkpoint DB path.
 
 ## Common Flags
 
@@ -60,6 +62,7 @@ The prototype does a full copy first, then tails appended bytes; with `--reconne
 | `--web-listen ADDR` | Web mode listen address (default `127.0.0.1:7331`) |
 | `--web-refresh-interval DURATION` | Local refresh interval in web mode (default `30s`) |
 | `--web-codespaces-mode MODE` | Web Codespaces sync mode: `manual` or `auto` (default `auto`: background startup sync + periodic sync) |
+| `--web-codespaces-streaming` | Experimental: read live Codespaces streaming checkpoint status (`codespace_tail_offsets`) into dashboard sync status |
 | `--web-codespaces-interval DURATION` | Web Codespaces sync interval when mode is `auto` (default `5m`) |
 
 ## Web mode
@@ -68,6 +71,7 @@ The prototype does a full copy first, then tails appended bytes; with `--reconne
 ./go/copilot-token-cost --web
 ./go/copilot-token-cost --web --today
 ./go/copilot-token-cost --web --web-codespaces-mode manual
+./go/copilot-token-cost --web --web-codespaces-streaming
 ```
 
 Web mode is Data-star-first: the dashboard shell is server-rendered with Datastar-driven updates (no custom fetch loop).
@@ -78,6 +82,7 @@ Web mode respects the same date-window flags as CLI output (`<days>`, `--today`,
 The server starts immediately and serves the latest DB snapshot; startup then runs local refresh + Codespaces sync in the background (Codespaces only when mode is `auto`).
 Startup and sync progress are logged to stderr (startup handoff plus local/codespaces start/finish/failure lines).
 Periodic behavior remains configurable: local refresh uses `--web-refresh-interval` (default `30s`) and auto Codespaces sync uses `--web-codespaces-interval` (default `5m`).
+With `--web-codespaces-streaming`, dashboard sync status also reflects live streaming checkpoint state from `codespace_tail_offsets` (active streams, last chunk timestamp, defensive recopy timestamp, and last error).
 Use `--web-codespaces-mode manual` to disable startup/periodic Codespaces sync and trigger it on-demand via `POST /actions/sync-codespaces`.
 
 Web endpoints:

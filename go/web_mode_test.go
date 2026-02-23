@@ -512,6 +512,97 @@ func TestRefreshLocalSnapshotUpdatesSyncStatusInSnapshot(t *testing.T) {
 	}
 }
 
+func TestRefreshCodespacesStreamingStatusNoState(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.codespacesStreaming = true
+	state.rebuildSnapshot()
+
+	state.refreshCodespacesStreamingStatus()
+
+	payload, ok := state.getSnapshot()
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	got := payload.SyncStatus["codespaces"]
+	if got.Code != webSyncCodeSkipped {
+		t.Fatalf("codespaces code=%q, want=%q", got.Code, webSyncCodeSkipped)
+	}
+	if !strings.Contains(got.Reason, "no_stream_state") {
+		t.Fatalf("reason=%q, want no_stream_state", got.Reason)
+	}
+}
+
+func TestRefreshCodespacesStreamingStatusConnected(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.codespacesStreaming = true
+	state.rebuildSnapshot()
+	if _, err := state.db.Exec(
+		`INSERT INTO codespace_tail_offsets (source,log_file,last_offset,last_size,last_hash,connection_state,last_chunk_at,last_full_copy_at,last_defensive_recopy_at,updated_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))`,
+		"codespace:demo",
+		"/home/vscode/.copilot/logs/process-a.log",
+		100,
+		100,
+		"abc123",
+		"connected",
+		"2026-01-01T00:00:00Z",
+		"2026-01-01T00:00:00Z",
+		"2026-01-01T00:00:00Z",
+	); err != nil {
+		t.Fatalf("insert tail state: %v", err)
+	}
+
+	state.refreshCodespacesStreamingStatus()
+
+	payload, ok := state.getSnapshot()
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	got := payload.SyncStatus["codespaces"]
+	if got.Code != webSyncCodeOK {
+		t.Fatalf("codespaces code=%q, want=%q", got.Code, webSyncCodeOK)
+	}
+	if !strings.Contains(got.Reason, webSyncReasonCodespacesStreaming) {
+		t.Fatalf("reason=%q, want streaming marker", got.Reason)
+	}
+	if !strings.Contains(got.Reason, "connected=1") {
+		t.Fatalf("reason=%q, want connected=1", got.Reason)
+	}
+}
+
+func TestRefreshCodespacesStreamingStatusDisconnectedBecomesStale(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.codespacesStreaming = true
+	state.rebuildSnapshot()
+	if _, err := state.db.Exec(
+		`INSERT INTO codespace_tail_offsets (source,log_file,last_offset,last_size,last_hash,connection_state,last_error,updated_at)
+		 VALUES (?,?,?,?,?,?,?,datetime('now'))`,
+		"codespace:demo",
+		"/home/vscode/.copilot/logs/process-a.log",
+		100,
+		100,
+		"abc123",
+		"disconnected",
+		"network_timeout",
+	); err != nil {
+		t.Fatalf("insert tail state: %v", err)
+	}
+
+	state.refreshCodespacesStreamingStatus()
+
+	payload, ok := state.getSnapshot()
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	got := payload.SyncStatus["codespaces"]
+	if got.Code != webSyncCodeStale {
+		t.Fatalf("codespaces code=%q, want=%q", got.Code, webSyncCodeStale)
+	}
+	if !strings.Contains(got.Reason, "last_error=network_timeout") {
+		t.Fatalf("reason=%q, want last_error marker", got.Reason)
+	}
+}
+
 func TestRebuildSnapshotUsesConfiguredDateWindow(t *testing.T) {
 	state := newTestWebState(t, t.TempDir())
 	state.periodLabel = "today"
