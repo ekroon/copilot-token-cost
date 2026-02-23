@@ -1421,8 +1421,11 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 
 	for _, logPath := range matches {
 		filename := filepath.Base(logPath)
-		info, err := os.Stat(logPath)
+		info, err := os.Lstat(logPath)
 		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			continue
 		}
 		if !force {

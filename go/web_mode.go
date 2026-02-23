@@ -72,6 +72,9 @@ type webState struct {
 	localStreamMu sync.Mutex
 	localStream   map[string]localLogState
 	localChunkAt  time.Time
+	stopCh        chan struct{}
+	loopsWG       sync.WaitGroup
+	closeOnce     sync.Once
 }
 
 type localLogState struct {
@@ -115,6 +118,7 @@ const (
 
 var webEventsHeartbeatInterval = 25 * time.Second
 var webIndicatorRefreshInterval = time.Second
+var newFSWatcher = fsnotify.NewWatcher
 
 func (e *webActionError) Error() string {
 	return e.message
@@ -213,16 +217,23 @@ func newWebState(cfg webModeConfig) (*webState, error) {
 			"local":      newSyncSourceStatus(webSyncCodeSkipped, webSyncReasonNotStarted),
 			"codespaces": newSyncSourceStatus(webSyncCodeSkipped, codespacesReason),
 		},
+		stopCh: make(chan struct{}),
 	}
 	state.rebuildSnapshot()
 	return state, nil
 }
 
 func (s *webState) close() {
-	s.closeSubscribers()
-	if s.db != nil {
-		_ = s.db.Close()
-	}
+	s.closeOnce.Do(func() {
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+		s.loopsWG.Wait()
+		s.closeSubscribers()
+		if s.db != nil {
+			_ = s.db.Close()
+		}
+	})
 }
 
 func (s *webState) subscribe() (<-chan string, func()) {
@@ -567,14 +578,14 @@ func scanLocalProcessLogs(logsDir string) (map[string]localLogState, error) {
 	}
 	out := make(map[string]localLogState, len(matches))
 	for _, path := range matches {
-		info, err := os.Stat(path)
+		info, err := os.Lstat(path)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return nil, err
 		}
-		if info.IsDir() {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			continue
 		}
 		out[path] = localLogState{Size: info.Size(), MTime: info.ModTime().UTC()}
@@ -767,7 +778,7 @@ func (s *webState) startLocalStreamingLoop(interval, fallbackInterval time.Durat
 
 	ticker := time.NewTicker(cadence)
 	fallbackTicker := time.NewTicker(fallback)
-	watcher, watchErr := fsnotify.NewWatcher()
+	watcher, watchErr := newFSWatcher()
 	var watcherEvents <-chan fsnotify.Event
 	var watcherErrors <-chan error
 	if watchErr == nil {
@@ -779,20 +790,34 @@ func (s *webState) startLocalStreamingLoop(interval, fallbackInterval time.Durat
 			watcherErrors = watcher.Errors
 		}
 	}
+	s.loopsWG.Add(1)
 	go func() {
+		defer s.loopsWG.Done()
+		defer ticker.Stop()
+		defer fallbackTicker.Stop()
+		if watcher != nil {
+			defer watcher.Close()
+		}
 		shouldScan := true
 		for {
 			select {
+			case <-s.stopCh:
+				return
 			case <-ticker.C:
 				shouldScan = true
 			case <-fallbackTicker.C:
 				shouldScan = true
 			case ev, ok := <-watcherEvents:
+				if !ok {
+					watcherEvents = nil
+					continue
+				}
 				if ok && isLocalProcessLogName(filepath.Base(ev.Name)) {
 					shouldScan = true
 				}
 			case _, ok := <-watcherErrors:
 				if !ok {
+					watcherErrors = nil
 					continue
 				}
 				shouldScan = true
@@ -863,10 +888,18 @@ func (s *webState) startCodespacesAutoSyncLoop(interval time.Duration) {
 	cadence := normalizeCodespacesInterval(interval)
 	s.setCodespacesRefreshSchedule(cadence, time.Now().Add(cadence))
 	ticker := time.NewTicker(cadence)
+	s.loopsWG.Add(1)
 	go func() {
-		for tick := range ticker.C {
-			s.setCodespacesRefreshSchedule(cadence, tick.Add(cadence))
-			go runScheduledSync(s.syncCodespacesSnapshotAuto, "web codespaces auto sync failed")
+		defer s.loopsWG.Done()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stopCh:
+				return
+			case tick := <-ticker.C:
+				s.setCodespacesRefreshSchedule(cadence, tick.Add(cadence))
+				go runScheduledSync(s.syncCodespacesSnapshotAuto, "web codespaces auto sync failed")
+			}
 		}
 	}()
 }
@@ -3138,11 +3171,18 @@ func runWebMode(cfg webModeConfig) error {
 	} else if cfg.RefreshInterval > 0 {
 		state.setLocalRefreshSchedule(cfg.RefreshInterval, time.Now().Add(cfg.RefreshInterval))
 		ticker := time.NewTicker(cfg.RefreshInterval)
-		defer ticker.Stop()
+		state.loopsWG.Add(1)
 		go func() {
-			for tick := range ticker.C {
-				state.setLocalRefreshSchedule(cfg.RefreshInterval, tick.Add(cfg.RefreshInterval))
-				go runScheduledSync(state.refreshLocalSnapshot, "web refresh tick failed")
+			defer state.loopsWG.Done()
+			defer ticker.Stop()
+			for {
+				select {
+				case <-state.stopCh:
+					return
+				case tick := <-ticker.C:
+					state.setLocalRefreshSchedule(cfg.RefreshInterval, tick.Add(cfg.RefreshInterval))
+					go runScheduledSync(state.refreshLocalSnapshot, "web refresh tick failed")
+				}
 			}
 		}()
 	} else {
@@ -3151,10 +3191,17 @@ func runWebMode(cfg webModeConfig) error {
 	if cfg.CodespacesStreaming {
 		state.refreshCodespacesStreamingStatus()
 		streamingTicker := time.NewTicker(2 * time.Second)
-		defer streamingTicker.Stop()
+		state.loopsWG.Add(1)
 		go func() {
-			for range streamingTicker.C {
-				state.refreshCodespacesStreamingStatus()
+			defer state.loopsWG.Done()
+			defer streamingTicker.Stop()
+			for {
+				select {
+				case <-state.stopCh:
+					return
+				case <-streamingTicker.C:
+					state.refreshCodespacesStreamingStatus()
+				}
 			}
 		}()
 	}

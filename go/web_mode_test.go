@@ -13,24 +13,28 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func newTestWebState(t *testing.T, logsDir string) *webState {
 	t.Helper()
 	db := initDB(tempDBPath(t))
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
-	return &webState{
+	state := &webState{
 		db:             db,
 		logsDir:        logsDir,
 		sessionDir:     filepath.Join(t.TempDir(), "session-state"),
 		codespacesMode: "manual",
+		stopCh:         make(chan struct{}),
 		syncStatus: map[string]syncSourceStatus{
 			"local":      newSyncSourceStatus(webSyncCodeSkipped, webSyncReasonNotStarted),
 			"codespaces": newSyncSourceStatus(webSyncCodeSkipped, webSyncReasonManualMode),
 		},
 	}
+	t.Cleanup(func() {
+		state.close()
+	})
+	return state
 }
 
 func captureStderr(t *testing.T, fn func()) string {
@@ -635,6 +639,45 @@ func TestLocalProcessLogsShrank(t *testing.T) {
 	}
 }
 
+func TestLocalProcessLogsChangedOnMTimeOnly(t *testing.T) {
+	ts := time.Date(2026, time.February, 23, 12, 0, 0, 0, time.UTC)
+	prev := map[string]localLogState{
+		"/tmp/process-a.log": {Size: 100, MTime: ts},
+	}
+	cur := map[string]localLogState{
+		"/tmp/process-a.log": {Size: 100, MTime: ts.Add(time.Second)},
+	}
+	if !localProcessLogsChanged(prev, cur) {
+		t.Fatal("expected mtime-only change to trigger change detection")
+	}
+}
+
+func TestScanLocalProcessLogsSkipsSymlinks(t *testing.T) {
+	logsDir := t.TempDir()
+	realPath := filepath.Join(logsDir, "process-real.log")
+	if err := os.WriteFile(realPath, []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write real log: %v", err)
+	}
+	target := filepath.Join(logsDir, "other-file.log")
+	if err := os.WriteFile(target, []byte("secret"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	linkPath := filepath.Join(logsDir, "process-link.log")
+	if err := os.Symlink(target, linkPath); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	logs, err := scanLocalProcessLogs(logsDir)
+	if err != nil {
+		t.Fatalf("scanLocalProcessLogs: %v", err)
+	}
+	if _, ok := logs[realPath]; !ok {
+		t.Fatalf("expected real process log to be included")
+	}
+	if _, ok := logs[linkPath]; ok {
+		t.Fatalf("expected symlinked process log to be skipped")
+	}
+}
+
 func TestPersistLocalStreamingCheckpointsWritesRows(t *testing.T) {
 	root := t.TempDir()
 	logPath := filepath.Join(root, "process-a.log")
@@ -655,6 +698,33 @@ func TestPersistLocalStreamingCheckpointsWritesRows(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("checkpoint rows=%d, want=1", count)
+	}
+}
+
+func TestStartLocalStreamingLoopWatcherInitFailureFallsBack(t *testing.T) {
+	logsDir := t.TempDir()
+	logPath := filepath.Join(logsDir, "process-a.log")
+	if err := os.WriteFile(logPath, []byte("2026-01-01T00:00:00 {\"prompt_tokens\":1,\"completion_tokens\":1}\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	state := newTestWebState(t, logsDir)
+	state.localStreaming = true
+	state.rebuildSnapshot()
+
+	oldWatcherFactory := newFSWatcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("watcher unavailable") }
+	t.Cleanup(func() { newFSWatcher = oldWatcherFactory })
+
+	state.startLocalStreamingLoop(10*time.Millisecond, 20*time.Millisecond)
+	time.Sleep(80 * time.Millisecond)
+
+	payload, ok := state.getSnapshot()
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	reason := payload.SyncStatus["local"].Reason
+	if !strings.Contains(reason, webSyncReasonLocalStreaming) {
+		t.Fatalf("expected local streaming status after fallback, got %q", reason)
 	}
 }
 

@@ -163,6 +163,47 @@ func TestSyncLogsToDBPersistsPromptTextWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestSyncLogsToDBSkipsSymlinkedProcessLogs(t *testing.T) {
+	dbPath := tempDBPath(t)
+	db := initDB(dbPath)
+	defer db.Close()
+
+	root := t.TempDir()
+	logsDir := filepath.Join(root, "logs")
+	sessionDir := filepath.Join(root, "session-state")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	realLog := filepath.Join(logsDir, "process-real.log")
+	content := "2025-01-03T10:00:00 Workspace initialized: 123e4567-e89b-12d3-a456-426614174222\nPremiumRequestProcessor: Setting X-Initiator to 'user'\n{\"model\":\"gpt-4.1\"}\n{\"prompt_tokens\":20,\"completion_tokens\":8}\n"
+	writeLogFile(t, realLog, time.Date(2025, 1, 3, 10, 0, 0, 0, time.Local), content)
+	target := filepath.Join(logsDir, "other.log")
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	link := filepath.Join(logsDir, "process-link.log")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	inserted := syncLogsToDB(db, logsDir, sessionDir, false, "local-symlink", nil, nil)
+	if inserted != 1 {
+		t.Fatalf("syncLogsToDB inserted=%d, want=1 (symlink skipped)", inserted)
+	}
+	if countRowsSyncUtils(t, db, "SELECT COUNT(*) FROM parsed_logs WHERE source='local-symlink'") != 1 {
+		t.Fatalf("expected only real log to be parsed")
+	}
+}
+
+func countRowsSyncUtils(t *testing.T, db *sql.DB, q string) int {
+	t.Helper()
+	var c int
+	if err := db.QueryRow(q).Scan(&c); err != nil {
+		t.Fatalf("query row count: %v", err)
+	}
+	return c
+}
+
 func TestSyncLogsToDBBackfillsMissingPromptTextIdempotently(t *testing.T) {
 	dbPath := tempDBPath(t)
 	db := initDB(dbPath)

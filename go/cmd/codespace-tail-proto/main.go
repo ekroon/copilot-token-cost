@@ -467,8 +467,10 @@ func syncTrackedFile(client *sftp.Client, file *trackedTailFile, store *tailStat
 			resetSize, copyErr := fullCopy(client, file.RemotePath, file.LocalPath)
 			if copyErr == nil {
 				file.Offset = resetSize
-				if h, _, hErr := localSampleHash(file.LocalPath); hErr == nil {
+				localSize = resetSize
+				if h, sizeAfter, hErr := localSampleHash(file.LocalPath); hErr == nil {
 					localHash = h
+					localSize = sizeAfter
 				}
 				defensiveRecopy = true
 				file.LastDefensiveRecopyAt = nowTS
