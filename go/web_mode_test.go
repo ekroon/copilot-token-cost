@@ -603,6 +603,26 @@ func TestRefreshCodespacesStreamingStatusDisconnectedBecomesStale(t *testing.T) 
 	}
 }
 
+func TestRefreshLocalStreamingStatusConnected(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.localStreaming = true
+	state.rebuildSnapshot()
+
+	state.refreshLocalStreamingStatus(3, "2026-01-01T00:00:00Z", nil)
+
+	payload, ok := state.getSnapshot()
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	got := payload.SyncStatus["local"]
+	if got.Code != webSyncCodeOK {
+		t.Fatalf("local code=%q, want=%q", got.Code, webSyncCodeOK)
+	}
+	if !strings.Contains(got.Reason, webSyncReasonLocalStreaming) || !strings.Contains(got.Reason, "watching=3") {
+		t.Fatalf("reason=%q, want local streaming marker", got.Reason)
+	}
+}
+
 func TestRebuildSnapshotUsesConfiguredDateWindow(t *testing.T) {
 	state := newTestWebState(t, t.TempDir())
 	state.periodLabel = "today"
@@ -2027,6 +2047,34 @@ func TestRenderRefreshIndicatorsStreamingModeFallbackHidesCountdown(t *testing.T
 	}
 	if strings.Contains(body, "4m 46s") {
 		t.Fatalf("streaming mode fallback should hide periodic countdown: %q", body)
+	}
+}
+
+func TestRenderRefreshIndicatorsLocalStreamingFallbackHidesCountdown(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.localStreaming = true
+	now := time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC)
+	state.setLocalRefreshSchedule(30*time.Second, now.Add(11*time.Second))
+	state.syncStatus["local"] = newSyncSourceStatus(webSyncCodeSkipped, webSyncReasonNotStarted)
+
+	body := state.renderRefreshIndicators(now)
+	if !strings.Contains(body, "Local") || !strings.Contains(body, ">Reconnecting<") {
+		t.Fatalf("expected local reconnecting fallback in streaming mode, got %q", body)
+	}
+	if strings.Contains(body, "11s") {
+		t.Fatalf("local streaming fallback should hide periodic countdown: %q", body)
+	}
+}
+
+func TestRenderRefreshIndicatorsLocalStreamingShowsLive(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.localStreaming = true
+	now := time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC)
+	state.syncStatus["local"] = newSyncSourceStatus(webSyncCodeOK, webSyncReasonLocalStreaming+" watching=2 last_chunk_at=2026-01-01T00:00:00Z")
+
+	body := state.renderRefreshIndicators(now)
+	if !strings.Contains(body, "Local") || !strings.Contains(body, ">Live<") {
+		t.Fatalf("expected local live indicator, got %q", body)
 	}
 }
 

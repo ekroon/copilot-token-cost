@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ type webModeConfig struct {
 	RefreshInterval          time.Duration
 	CodespacesMode           string
 	CodespacesStreaming      bool
+	LocalStreaming           bool
 	CodespacesInterval       time.Duration
 	CodespacesIncludeStopped bool
 	LogsDir                  string
@@ -43,6 +45,7 @@ type webState struct {
 	dateToQuery              string
 	syncFrom                 *time.Time
 	syncTo                   *time.Time
+	localStreaming           bool
 	codespacesMode           string
 	codespacesStreaming      bool
 	codespacesIncludeStopped bool
@@ -61,6 +64,14 @@ type webState struct {
 	refreshMu     sync.Mutex
 	subscribersMu sync.Mutex
 	subscribers   map[chan string]struct{}
+	localStreamMu sync.Mutex
+	localStream   map[string]localLogState
+	localChunkAt  time.Time
+}
+
+type localLogState struct {
+	Size  int64
+	MTime time.Time
 }
 
 type webActionError struct {
@@ -87,6 +98,7 @@ const (
 	webSyncReasonAutoMode            = "auto_mode"
 	webSyncReasonLocalSyncCompleted  = "local_sync_completed"
 	webSyncReasonLocalLogsDirMissing = "logs_dir_not_found"
+	webSyncReasonLocalStreaming      = "local_streaming"
 	webSyncReasonCodespacesNoChanges = "codespaces_no_changes"
 	webSyncReasonCodespacesCompleted = "codespaces_sync_completed"
 	webSyncReasonCodespacesStale     = "codespaces_sync_stale"
@@ -186,6 +198,7 @@ func newWebState(cfg webModeConfig) (*webState, error) {
 		dateToQuery:              strings.TrimSpace(cfg.DateToQuery),
 		syncFrom:                 cfg.SyncFrom,
 		syncTo:                   cfg.SyncTo,
+		localStreaming:           cfg.LocalStreaming,
 		codespacesMode:           mode,
 		codespacesStreaming:      cfg.CodespacesStreaming,
 		codespacesIncludeStopped: cfg.CodespacesIncludeStopped,
@@ -537,6 +550,122 @@ func (s *webState) refreshCodespacesStreamingStatus() {
 	s.setSyncStatus("codespaces", webSyncCodeStale, reason)
 }
 
+func scanLocalProcessLogs(logsDir string) (map[string]localLogState, error) {
+	pattern := filepath.Join(logsDir, "process*.log")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]localLogState, len(matches))
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if info.IsDir() {
+			continue
+		}
+		out[path] = localLogState{Size: info.Size(), MTime: info.ModTime().UTC()}
+	}
+	return out, nil
+}
+
+func localProcessLogsChanged(prev, cur map[string]localLogState) bool {
+	if len(prev) != len(cur) {
+		return true
+	}
+	for path, st := range cur {
+		old, ok := prev[path]
+		if !ok {
+			return true
+		}
+		if old.Size != st.Size || !old.MTime.Equal(st.MTime) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *webState) refreshLocalStreamingStatus(watched int, lastChunkAt string, streamErr error) {
+	reason := fmt.Sprintf("%s watching=%d", webSyncReasonLocalStreaming, watched)
+	code := webSyncCodeSkipped
+	if streamErr != nil {
+		code = webSyncCodeError
+		reason += " last_error=" + streamErr.Error()
+		s.setSyncStatus("local", code, reason)
+		return
+	}
+	if watched > 0 {
+		code = webSyncCodeOK
+	}
+	if strings.TrimSpace(lastChunkAt) != "" {
+		reason += " last_chunk_at=" + lastChunkAt
+	}
+	s.setSyncStatus("local", code, reason)
+}
+
+func (s *webState) startLocalStreamingLoop(interval, fallbackInterval time.Duration) {
+	cadence := interval
+	if cadence <= 0 {
+		cadence = 2 * time.Second
+	}
+	fallback := fallbackInterval
+	if fallback <= 0 {
+		fallback = 30 * time.Second
+	}
+	s.setLocalRefreshSchedule(0, time.Time{})
+	initial, err := scanLocalProcessLogs(s.logsDir)
+	if err != nil {
+		s.refreshLocalStreamingStatus(0, "", err)
+		return
+	}
+	s.localStreamMu.Lock()
+	s.localStream = initial
+	s.localChunkAt = time.Time{}
+	s.localStreamMu.Unlock()
+	s.refreshLocalStreamingStatus(len(initial), "", nil)
+
+	ticker := time.NewTicker(cadence)
+	go func() {
+		lastFallback := time.Now().UTC()
+		for tick := range ticker.C {
+			current, err := scanLocalProcessLogs(s.logsDir)
+			if err != nil {
+				s.refreshLocalStreamingStatus(0, "", err)
+				continue
+			}
+			s.localStreamMu.Lock()
+			changed := localProcessLogsChanged(s.localStream, current)
+			s.localStream = current
+			lastChunkAt := s.localChunkAt
+			s.localStreamMu.Unlock()
+
+			shouldSync := changed || tick.UTC().Sub(lastFallback) >= fallback
+			if shouldSync {
+				if err := s.refreshLocalSnapshot(); err != nil {
+					if !isSyncInProgressError(err) {
+						s.refreshLocalStreamingStatus(len(current), "", err)
+					}
+					continue
+				}
+				lastFallback = tick.UTC()
+				s.localStreamMu.Lock()
+				s.localChunkAt = tick.UTC()
+				lastChunkAt = s.localChunkAt
+				s.localStreamMu.Unlock()
+			}
+			lastChunkStr := ""
+			if !lastChunkAt.IsZero() {
+				lastChunkStr = lastChunkAt.Format(time.RFC3339Nano)
+			}
+			s.refreshLocalStreamingStatus(len(current), lastChunkStr, nil)
+		}
+	}()
+}
+
 func (s *webState) startCodespacesAutoSyncLoop(interval time.Duration) {
 	cadence := normalizeCodespacesInterval(interval)
 	s.setCodespacesRefreshSchedule(cadence, time.Now().Add(cadence))
@@ -705,6 +834,7 @@ func (s *webState) renderRefreshIndicators(now time.Time) string {
 	s.snapshotMu.RLock()
 	localInterval := s.localRefreshInterval
 	localNext := s.localNextRefreshAt
+	localStreaming := s.localStreaming
 	codespacesMode := s.codespacesMode
 	codespacesStreaming := s.codespacesStreaming
 	codespacesInterval := s.codespacesInterval
@@ -723,6 +853,27 @@ func (s *webState) renderRefreshIndicators(now time.Time) string {
 	}
 	if localStatus.Reason == webSyncReasonInProgress {
 		localState = "Running"
+	}
+	if localStreaming {
+		localCountdown = ""
+		if strings.Contains(localStatus.Reason, webSyncReasonLocalStreaming) {
+			switch localStatus.Code {
+			case webSyncCodeOK:
+				if strings.Contains(localStatus.Reason, "watching=0") {
+					localState = "Reconnecting"
+				} else {
+					localState = "Live"
+				}
+			case webSyncCodeStale:
+				localState = "Disconnected"
+			case webSyncCodeError, webSyncCodeTimeout:
+				localState = "Error"
+			default:
+				localState = "Reconnecting"
+			}
+		} else if localState == "Idle" || localState == "Off" {
+			localState = "Reconnecting"
+		}
 	}
 
 	codespacesState := "Idle"
@@ -2789,7 +2940,9 @@ func runWebMode(cfg webModeConfig) error {
 	}
 	defer state.close()
 
-	if cfg.RefreshInterval > 0 {
+	if cfg.LocalStreaming {
+		state.startLocalStreamingLoop(2*time.Second, cfg.RefreshInterval)
+	} else if cfg.RefreshInterval > 0 {
 		state.setLocalRefreshSchedule(cfg.RefreshInterval, time.Now().Add(cfg.RefreshInterval))
 		ticker := time.NewTicker(cfg.RefreshInterval)
 		defer ticker.Stop()

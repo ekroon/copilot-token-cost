@@ -2253,6 +2253,7 @@ func main() {
 	webFlag := flag.Bool("web", false, "Run in web mode (respects date-window flags)")
 	webListen := flag.String("web-listen", "127.0.0.1:7331", "Web mode listen address")
 	webRefreshInterval := flag.Duration("web-refresh-interval", 30*time.Second, "Web mode refresh interval")
+	webLocalStreaming := flag.Bool("web-local-streaming", false, "Enable experimental realtime local log streaming in web mode")
 	webCodespacesMode := flag.String("web-codespaces-mode", "auto", "Web mode Codespaces sync mode: manual|auto (default auto: background startup sync + periodic sync)")
 	webCodespacesStreaming := flag.Bool("web-codespaces-streaming", false, "Enable experimental codespaces streaming status from tail checkpoints")
 	webCodespacesInterval := flag.Duration("web-codespaces-interval", 5*time.Minute, "Web mode Codespaces periodic sync interval when mode=auto")
@@ -2263,7 +2264,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "                         [--sync] [--import-file FILE] [--export-file FILE]\n\n")
 		fmt.Fprintf(os.Stderr, "                         [--codespaces-sync] [--codespaces-include-stopped]\n\n")
 		fmt.Fprintf(os.Stderr, "                         [--web] [--web-listen ADDR] [--web-refresh-interval DURATION]\n")
-		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-mode manual|auto] [--web-codespaces-streaming] [--web-codespaces-interval DURATION]\n\n")
+		fmt.Fprintf(os.Stderr, "                         [--web-local-streaming] [--web-codespaces-mode manual|auto]\n")
+		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-streaming] [--web-codespaces-interval DURATION]\n\n")
 		fmt.Fprintf(os.Stderr, "Copilot CLI Token Cost Calculator\n\n")
 		fmt.Fprintf(os.Stderr, "Prompt text storage is always-on when prompt text is available; unavailable prompt text is stored as NULL.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
@@ -2281,6 +2283,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --codespaces-sync  # sync running codespaces\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --today  # web mode with date window\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-mode manual  # disable auto codespaces sync\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-local-streaming  # enable experimental realtime local streaming\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-interval 15s  # near-continuous codespaces sync\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-streaming  # show experimental live streaming status\n")
 	}
@@ -2413,6 +2416,7 @@ func main() {
 		cfg := webModeConfig{
 			ListenAddress:            *webListen,
 			RefreshInterval:          *webRefreshInterval,
+			LocalStreaming:           *webLocalStreaming,
 			CodespacesMode:           webCodespacesModeValue,
 			CodespacesStreaming:      *webCodespacesStreaming,
 			CodespacesInterval:       *webCodespacesInterval,

@@ -61,6 +61,7 @@ It persists per-file tail checkpoints to SQLite (`codespace_tail_offsets`) and r
 | `--web` | Run local web dashboard mode (respects date-window flags like `--today`, `--yesterday`, `--from/--to`; cannot be combined with `--json` or `--export-file`) |
 | `--web-listen ADDR` | Web mode listen address (default `127.0.0.1:7331`) |
 | `--web-refresh-interval DURATION` | Local refresh interval in web mode (default `30s`) |
+| `--web-local-streaming` | Experimental: realtime local log streaming updates in web mode (replaces periodic local refresh loop) |
 | `--web-codespaces-mode MODE` | Web Codespaces sync mode: `manual` or `auto` (default `auto`: background startup sync + periodic sync) |
 | `--web-codespaces-streaming` | Experimental: read live Codespaces streaming checkpoint status (`codespace_tail_offsets`) into dashboard sync status |
 | `--web-codespaces-interval DURATION` | Web Codespaces sync interval when mode is `auto` (default `5m`) |
@@ -70,6 +71,7 @@ It persists per-file tail checkpoints to SQLite (`codespace_tail_offsets`) and r
 ```bash
 ./go/copilot-token-cost --web
 ./go/copilot-token-cost --web --today
+./go/copilot-token-cost --web --web-local-streaming
 ./go/copilot-token-cost --web --web-codespaces-mode manual
 ./go/copilot-token-cost --web --web-codespaces-streaming
 ```
@@ -82,7 +84,7 @@ Web mode respects the same date-window flags as CLI output (`<days>`, `--today`,
 The server starts immediately and serves the latest DB snapshot; startup then runs local refresh + Codespaces sync in the background (Codespaces only when mode is `auto`).
 Startup and sync progress are logged to stderr (startup handoff plus local/codespaces start/finish/failure lines).
 Periodic behavior remains configurable: local refresh uses `--web-refresh-interval` (default `30s`) and auto Codespaces sync uses `--web-codespaces-interval` (default `5m`).
-With `--web-codespaces-streaming`, dashboard sync status also reflects live streaming checkpoint state from `codespace_tail_offsets` (active streams, last chunk timestamp, defensive recopy timestamp, and last error).
+With `--web-local-streaming`, local updates are pushed from realtime log-file change detection instead of periodic local polling. With `--web-codespaces-streaming`, dashboard sync status also reflects live streaming checkpoint state from `codespace_tail_offsets` (active streams, last chunk timestamp, defensive recopy timestamp, and last error).
 Use `--web-codespaces-mode manual` to disable startup/periodic Codespaces sync and trigger it on-demand via `POST /actions/sync-codespaces`.
 
 Web endpoints:
