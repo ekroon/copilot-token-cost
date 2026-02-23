@@ -1380,7 +1380,7 @@ func renderWebModelSummaryTable(payload statsPayload, hasSnapshot bool) string {
 	totalPremium := 0.0
 	var totalInput, totalOutput int
 	var b strings.Builder
-	b.WriteString(`<table id="model-summary-table"><thead><tr><th>Model</th><th>Calls</th><th>Input</th><th>Output</th><th>Tok/Prem</th><th>Premium</th><th>Cost</th><th>API%</th></tr></thead><tbody>`)
+	b.WriteString(`<table id="model-summary-table"><thead><tr><th>Model</th><th>Calls</th><th>Input</th><th>Output</th><th>Tok/Prem</th><th>Premium</th><th>Premium Cost</th><th>API Cost</th><th>API%</th></tr></thead><tbody>`)
 	for _, row := range rows {
 		totalPremium += row.stats.PremiumRequests
 		totalInput += row.stats.PromptTokens
@@ -1389,7 +1389,7 @@ func renderWebModelSummaryTable(payload statsPayload, hasSnapshot bool) string {
 		if row.stats.PremiumRequests > 0 {
 			tokPerPrem = fmtTokens(int(float64(row.stats.PromptTokens+row.stats.CompletionTokens) / row.stats.PremiumRequests))
 		}
-		fmt.Fprintf(&b, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
+		fmt.Fprintf(&b, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>",
 			html.EscapeString(row.name),
 			commaInt(row.stats.APICalls),
 			fmtTokens(row.stats.PromptTokens),
@@ -1397,6 +1397,7 @@ func renderWebModelSummaryTable(payload statsPayload, hasSnapshot bool) string {
 			tokPerPrem,
 			commaFloat(row.stats.PremiumRequests, 0),
 			fmtCost(row.stats.PremiumRequestCost),
+			fmtCost(row.stats.Cost),
 			fmtAPIPercent(row.stats.PremiumRequestCost, row.stats.Cost),
 		)
 	}
@@ -1404,13 +1405,14 @@ func renderWebModelSummaryTable(payload statsPayload, hasSnapshot bool) string {
 	if totalPremium > 0 {
 		totalTokPerPrem = fmtTokens(int(float64(totalInput+totalOutput) / totalPremium))
 	}
-	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
+	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
 		fmtTokens(totalInput),
 		fmtTokens(totalOutput),
 		totalTokPerPrem,
 		commaFloat(totalPremium, 0),
 		fmtCost(payload.TotalPremiumRequestCost),
+		fmtCost(payload.TotalCost),
 		fmtAPIPercent(payload.TotalPremiumRequestCost, payload.TotalCost),
 	)
 	return b.String()
@@ -1429,7 +1431,7 @@ func renderWebProjectSummaryTable(payload statsPayload, hasSnapshot bool) string
 	var totalInput, totalOutput int
 	var b strings.Builder
 
-	b.WriteString(`<table id="project-summary-table"><thead><tr><th>Project</th><th>Calls</th><th>Input</th><th>Output</th><th>Premium</th><th>Cost</th><th>API%</th></tr></thead><tbody>`)
+	b.WriteString(`<table id="project-summary-table"><thead><tr><th>Project</th><th>Calls</th><th>Input</th><th>Output</th><th>Premium</th><th>Premium Cost</th><th>API Cost</th><th>API%</th></tr></thead><tbody>`)
 	for _, row := range rows {
 		totalPremium += row.stats.PremiumRequests
 		totalInput += row.stats.PromptTokens
@@ -1438,12 +1440,13 @@ func renderWebProjectSummaryTable(payload statsPayload, hasSnapshot bool) string
 		b.WriteString(renderWebProjectSummaryRow(row, rowKey, false))
 		b.WriteString(renderWebProjectDetailRow(payload, row.name, rowKey, false))
 	}
-	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
+	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
 		fmtTokens(totalInput),
 		fmtTokens(totalOutput),
 		commaFloat(totalPremium, 0),
 		fmtCost(payload.TotalPremiumRequestCost),
+		fmtCost(payload.TotalCost),
 		fmtAPIPercent(payload.TotalPremiumRequestCost, payload.TotalCost),
 	)
 	return b.String()
@@ -1460,12 +1463,13 @@ func renderWebProjectSummaryRow(row webStatsRow, rowKey string, expanded bool) s
 	fmt.Fprintf(&b, `<tr id="%s" class="expandable-row" data-row-group="project" data-row-key="%s" data-expand-action="%s" data-on:click="@post('/actions/project-row?row_key=%s&expand=%s')">`,
 		webProjectSummaryRowID(rowKey), rowKey, expand, rowKey, expand)
 	fmt.Fprintf(&b, `<td>%s %s</td>`, icon, html.EscapeString(row.name))
-	fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+	fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
 		commaInt(row.stats.APICalls),
 		fmtTokens(row.stats.PromptTokens),
 		fmtTokens(row.stats.CompletionTokens),
 		commaFloat(row.stats.PremiumRequests, 0),
 		fmtCost(row.stats.PremiumRequestCost),
+		fmtCost(row.stats.Cost),
 		fmtAPIPercent(row.stats.PremiumRequestCost, row.stats.Cost),
 	)
 	b.WriteString(`</tr>`)
@@ -1479,15 +1483,16 @@ func renderWebProjectDetailRow(payload statsPayload, projectName, rowKey string,
 		return fmt.Sprintf(`<tr id="%s"></tr>`, webProjectDetailRowID(rowKey))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, `<tr id="%s"><td colspan="7"><table class="detail-table"><tbody>`, webProjectDetailRowID(rowKey))
+	fmt.Fprintf(&b, `<tr id="%s"><td colspan="8"><table class="detail-table"><tbody>`, webProjectDetailRowID(rowKey))
 	for _, mr := range modelRows {
-		fmt.Fprintf(&b, `<tr class="project-model-row"><td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+		fmt.Fprintf(&b, `<tr class="project-model-row"><td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
 			html.EscapeString(mr.name),
 			commaInt(mr.stats.APICalls),
 			fmtTokens(mr.stats.PromptTokens),
 			fmtTokens(mr.stats.CompletionTokens),
 			commaFloat(mr.stats.PremiumRequests, 0),
 			fmtCost(mr.stats.PremiumRequestCost),
+			fmtCost(mr.stats.Cost),
 			fmtAPIPercent(mr.stats.PremiumRequestCost, mr.stats.Cost),
 		)
 		b.WriteString(`</tr>`)
@@ -1510,7 +1515,7 @@ func renderWebDailyTotalsTable(payload statsPayload, hasSnapshot bool) string {
 	var totalInput, totalOutput int
 	var b strings.Builder
 
-	b.WriteString(`<table id="daily-totals-table"><thead><tr><th>Date</th><th>Calls</th><th>Premium</th><th>Input</th><th>Output</th><th>Cost</th><th>API%</th></tr></thead><tbody>`)
+	b.WriteString(`<table id="daily-totals-table"><thead><tr><th>Date</th><th>Calls</th><th>Premium</th><th>Input</th><th>Output</th><th>Premium Cost</th><th>API Cost</th><th>API%</th></tr></thead><tbody>`)
 	for _, row := range rows {
 		totalPremium += row.premiumRequests
 		totalPremCost += row.premRequestCost
@@ -1520,12 +1525,13 @@ func renderWebDailyTotalsTable(payload statsPayload, hasSnapshot bool) string {
 		b.WriteString(renderWebDaySummaryRow(row, rowKey, false))
 		b.WriteString(renderWebDayDetailRow(payload, row.day, rowKey, false))
 	}
-	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
+	fmt.Fprintf(&b, "</tbody><tfoot><tr><th>Total</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th><th>%s</th></tr></tfoot></table>",
 		commaInt(payload.APICalls),
 		commaFloat(totalPremium, 0),
 		fmtTokens(totalInput),
 		fmtTokens(totalOutput),
 		fmtCost(totalPremCost),
+		fmtCost(payload.TotalCost),
 		fmtAPIPercent(totalPremCost, payload.TotalCost),
 	)
 	return b.String()
@@ -1542,12 +1548,13 @@ func renderWebDaySummaryRow(row webDailyTotalsRow, rowKey string, expanded bool)
 	fmt.Fprintf(&b, `<tr id="%s" class="expandable-row" data-row-group="day" data-row-key="%s" data-expand-action="%s" data-on:click="@post('/actions/day-row?row_key=%s&expand=%s')">`,
 		webDaySummaryRowID(rowKey), rowKey, expand, rowKey, expand)
 	fmt.Fprintf(&b, `<td>%s %s</td>`, icon, html.EscapeString(row.day))
-	fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+	fmt.Fprintf(&b, `<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
 		commaInt(row.apiCalls),
 		commaFloat(row.premiumRequests, 0),
 		fmtTokens(row.promptTokens),
 		fmtTokens(row.completionTokens),
 		fmtCost(row.premRequestCost),
+		fmtCost(row.totalCost),
 		fmtAPIPercent(row.premRequestCost, row.totalCost),
 	)
 	b.WriteString(`</tr>`)
@@ -1572,19 +1579,20 @@ func renderWebDayDetailRow(payload statsPayload, day, rowKey string, expanded bo
 		return fmt.Sprintf(`<tr id="%s"></tr>`, webDayDetailRowID(rowKey))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, `<tr id="%s"><td colspan="7"><table class="detail-table"><tbody>`, webDayDetailRowID(rowKey))
+	fmt.Fprintf(&b, `<tr id="%s"><td colspan="8"><table class="detail-table"><tbody>`, webDayDetailRowID(rowKey))
 	for _, model := range modelNames {
 		stats, ok := webDailyStatsValue(dayMap[model])
 		if !ok {
 			continue
 		}
-		fmt.Fprintf(&b, `<tr class="daily-model-row"><td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
+		fmt.Fprintf(&b, `<tr class="daily-model-row"><td class="model-indent">%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>`,
 			html.EscapeString(model),
 			commaInt(stats.APICalls),
 			commaFloat(stats.PremiumRequests, 0),
 			fmtTokens(stats.PromptTokens),
 			fmtTokens(stats.CompletionTokens),
 			fmtCost(stats.PremiumRequestCost),
+			fmtCost(stats.Cost),
 			fmtAPIPercent(stats.PremiumRequestCost, stats.Cost),
 		)
 		b.WriteString(`</tr>`)

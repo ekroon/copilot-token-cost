@@ -1826,6 +1826,8 @@ func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 		"Per-model summary",
 		"id=\"model-summary-table\"",
 		"<th>Model</th>",
+		"<th>Premium Cost</th>",
+		"<th>API Cost</th>",
 		"<th>API%</th>",
 		"gpt-5",
 		"id=\"project-summary-region\"",
@@ -1863,6 +1865,12 @@ func TestDashboardShellHTMLRendersOverviewTables(t *testing.T) {
 	}
 	if strings.Contains(body, "No-Cache") {
 		t.Fatalf("dashboard body unexpectedly contains No-Cache column")
+	}
+	if !strings.Contains(body, "$1.25") {
+		t.Fatalf("dashboard body missing cache-aware API total")
+	}
+	if strings.Contains(body, "$1.80") {
+		t.Fatalf("dashboard body unexpectedly contains no-cache total")
 	}
 	if strings.Contains(body, "/actions/refresh") {
 		t.Fatalf("dashboard body unexpectedly contains /actions/refresh control")
