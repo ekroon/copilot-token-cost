@@ -566,7 +566,8 @@ func (s *Service) SyncCodespacesToDBTick(includeStopped bool, force bool) (int, 
 	failedCopies := 0
 	for _, res := range ordered {
 		if res.Copied {
-			total += s.SyncLogsToDB(res.LogsDir, res.SessionDir, force, "codespace:"+res.Codespace.Name, nil, nil)
+			syncForce := force || res.Codespace.State == "Available"
+			total += s.SyncLogsToDB(res.LogsDir, res.SessionDir, syncForce, "codespace:"+res.Codespace.Name, nil, nil)
 			s.storage.UpsertCodespaceSyncState(res.Codespace.Name, res.Codespace.LastUsedAt)
 		} else {
 			failedCopies++
