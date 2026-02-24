@@ -289,6 +289,114 @@ func FormatSshTarFailure(sshErr, tarErr error, sshStderr, tarStderr string) stri
 	return strings.Join(parts, "; ")
 }
 
+func collectHostAliases(config string) []string {
+	var aliases []string
+	for _, raw := range strings.Split(config, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(line), "host ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		for _, alias := range fields[1:] {
+			if strings.ContainsAny(alias, "*?") {
+				continue
+			}
+			aliases = append(aliases, alias)
+		}
+	}
+	return aliases
+}
+
+func selectHostAlias(codespace string, aliases []string) (string, error) {
+	if len(aliases) == 0 {
+		return "", errors.New("no host aliases found in gh cs ssh --config output")
+	}
+	want := strings.ToLower(strings.TrimSpace(codespace))
+	for _, alias := range aliases {
+		if strings.EqualFold(alias, want) {
+			return alias, nil
+		}
+	}
+	for _, alias := range aliases {
+		if strings.Contains(strings.ToLower(alias), want) {
+			return alias, nil
+		}
+	}
+	return "", fmt.Errorf("could not infer SSH host alias for codespace %q", codespace)
+}
+
+func sshControlPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory failed: %w", err)
+	}
+	if strings.TrimSpace(home) == "" {
+		return "", errors.New("resolve home directory failed: empty home path")
+	}
+	sshDir := filepath.Join(home, ".ssh")
+	if mkErr := os.MkdirAll(sshDir, 0o700); mkErr != nil {
+		return "", mkErr
+	}
+	return filepath.Join(sshDir, "copilot-token-cost-%C"), nil
+}
+
+func buildCodespaceSSHTarCommand(ctx context.Context, codespace string) (*exec.Cmd, func(), error) {
+	cfgCmd := exec.CommandContext(ctx, "gh", "cs", "ssh", "-c", codespace, "--config")
+	cfgCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+	var cfgErr bytes.Buffer
+	cfgCmd.Stderr = &cfgErr
+	configText, err := cfgCmd.Output()
+	if err != nil {
+		detail := SummarizeSyncCommandStderr(cfgErr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, nil, fmt.Errorf("gh cs ssh --config failed: %s", detail)
+	}
+	alias, err := selectHostAlias(codespace, collectHostAliases(string(configText)))
+	if err != nil {
+		return nil, nil, err
+	}
+	configFile, err := os.CreateTemp("", "codespaces-ssh-config-*.tmp")
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := configFile.Write(configText); err != nil {
+		_ = configFile.Close()
+		_ = os.Remove(configFile.Name())
+		return nil, nil, err
+	}
+	if err := configFile.Close(); err != nil {
+		_ = os.Remove(configFile.Name())
+		return nil, nil, err
+	}
+	controlPath, err := sshControlPath()
+	if err != nil {
+		_ = os.Remove(configFile.Name())
+		return nil, nil, err
+	}
+	cmd := exec.CommandContext(ctx, "ssh",
+		"-F", configFile.Name(),
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPersist=15m",
+		"-o", "ControlPath="+controlPath,
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
+		alias,
+		"tar", "czf", "-", "-C", "/home/vscode", ".copilot/logs", ".copilot/session-state",
+	)
+	cleanup := func() {
+		_ = os.Remove(configFile.Name())
+	}
+	return cmd, cleanup, nil
+}
+
 func (s *Service) CopyCodespaceData(cs CodespaceInfo, idx, total int, stoppedStartLimiter chan struct{}) CodespaceCopyResult {
 	res := CodespaceCopyResult{
 		Idx:       idx,
@@ -326,9 +434,18 @@ func (s *Service) CopyCodespaceData(cs CodespaceInfo, idx, total int, stoppedSta
 	defer cpCancel()
 
 	copied := false
-	sshTarCmd := exec.CommandContext(cpCtx, "gh", "cs", "ssh", "-c", cs.Name, "--",
-		"tar", "czf", "-", "-C", "/home/vscode", ".copilot/logs", ".copilot/session-state")
-	sshTarCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+	sshTarCmd, cleanupSSHConfig, sshBuildErr := buildCodespaceSSHTarCommand(cpCtx, cs.Name)
+	if cleanupSSHConfig != nil {
+		defer cleanupSSHConfig()
+	}
+	if sshBuildErr != nil {
+		fmt.Fprintf(os.Stderr, "  ℹ️ SSH reuse unavailable for %s: %v; using gh cs ssh directly\n", cs.Name, sshBuildErr)
+		sshTarCmd = exec.CommandContext(cpCtx, "gh", "cs", "ssh", "-c", cs.Name, "--",
+			"tar", "czf", "-", "-C", "/home/vscode", ".copilot/logs", ".copilot/session-state")
+		sshTarCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
+	} else {
+		fmt.Fprintf(os.Stderr, "  🔐 SSH reuse enabled for %s (ControlPersist=15m)\n", cs.Name)
+	}
 	var sshErrBuf bytes.Buffer
 	sshTarCmd.Stderr = &sshErrBuf
 	if pipe, pipeErr := sshTarCmd.StdoutPipe(); pipeErr == nil {

@@ -84,6 +84,7 @@ Web mode respects the same date-window flags as CLI output (`<days>`, `--today`,
 The server starts immediately and serves the latest DB snapshot; startup then runs local refresh + Codespaces sync in the background (Codespaces only when mode is `auto`).
 Startup and sync progress are logged to stderr (startup handoff plus local/codespaces start/finish/failure lines).
 Periodic behavior remains configurable: local refresh uses `--web-refresh-interval` (default `30s`) and auto Codespaces sync uses `--web-codespaces-interval` (default `5m`).
+Codespaces auto-sync runs on each interval and attempts SSH connection reuse (`ControlMaster=auto`, `ControlPersist=15m`) for the `ssh+tar` copy path to reduce repeated auth prompts; if prompts still recur, use `--web-codespaces-mode manual` or a longer interval.
 With `--web-local-streaming`, local updates are pushed from realtime log-file change detection instead of periodic local polling, and local checkpoints are persisted in `codespace_tail_offsets` (`source='local'`) including hash metadata and defensive-recopy timestamps. With `--web-codespaces-streaming`, dashboard sync status also reflects live streaming checkpoint state from `codespace_tail_offsets` (active streams, last chunk timestamp, defensive recopy timestamp, and last error).
 Use `--web-codespaces-mode manual` to disable startup/periodic Codespaces sync and trigger it on-demand via `POST /actions/sync-codespaces`.
 

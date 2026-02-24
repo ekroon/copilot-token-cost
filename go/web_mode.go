@@ -931,6 +931,7 @@ func (s *webState) startCodespacesAutoSyncLoop(interval time.Duration) {
 				return
 			case tick := <-ticker.C:
 				s.setCodespacesRefreshSchedule(cadence, tick.Add(cadence))
+				fmt.Fprintf(os.Stderr, "web codespaces auto sync tick: running scheduled sync (interval=%s)\n", cadence)
 				go runScheduledSync(s.syncCodespacesSnapshotAuto, "web codespaces auto sync failed")
 			}
 		}
@@ -3115,6 +3116,9 @@ func runWebMode(cfg webModeConfig) error {
 	defer func() { _ = listener.Close() }()
 	fmt.Fprintf(os.Stderr, "Web mode listening on http://%s\n", cfg.ListenAddress)
 	fmt.Fprintln(os.Stderr, "Web startup handoff: serving initial snapshot from existing DB state; initial local/codespaces sync running in background")
+	if strings.EqualFold(strings.TrimSpace(cfg.CodespacesMode), "auto") {
+		fmt.Fprintln(os.Stderr, "Web codespaces auto-sync runs on a timer and reuses SSH control connections when possible (ControlPersist=15m); if prompts still repeat, increase --web-codespaces-interval or use --web-codespaces-mode manual.")
+	}
 	state.startStartupSync(cfg.CodespacesInterval)
 	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("web server failed: %w", err)
