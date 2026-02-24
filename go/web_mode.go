@@ -1,6 +1,8 @@
 package main
 
 import (
+	httplayer "copilot-token-cost/internal/http"
+	webstack "copilot-token-cost/internal/web"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -2982,231 +2984,72 @@ func dailySpendShellHTMLWithIndicators(payload statsPayload, hasSnapshot bool, n
 </html>`, refreshIndicatorsHTML, renderWebDailySpendRegion(payload, hasSnapshot, now))
 }
 
+func newDashboardRuntime(state *webState) *webstack.DashboardRuntime {
+	return &webstack.DashboardRuntime{
+		RenderHomePageFn: func(now time.Time) string {
+			payload, hasSnapshot := state.getSnapshot()
+			return dailySpendShellHTMLWithIndicators(payload, hasSnapshot, now, state.renderRefreshIndicators(now))
+		},
+		RenderDetailsPageFn: func(now time.Time) string {
+			payload, hasSnapshot := state.getSnapshot()
+			return dashboardShellHTMLWithIndicators(payload, hasSnapshot, state.renderRefreshIndicators(now), state.getExpandedRows())
+		},
+		SubscribeFn:                 state.subscribe,
+		BuildRefreshIndicatorsPatch: state.buildRefreshIndicatorsPatch,
+		SnapshotFn: func() (interface{}, bool) {
+			payload, ok := state.getSnapshot()
+			return payload, ok
+		},
+		SetRowExpandedFn: state.setRowExpanded,
+		BuildProjectRowPatchFn: func(snapshot interface{}, rowKey string, expand bool) (string, error) {
+			payload, ok := snapshot.(statsPayload)
+			if !ok {
+				return "", fmt.Errorf("project row action failed: snapshot unavailable")
+			}
+			return buildProjectRowTogglePatch(payload, rowKey, expand)
+		},
+		BuildDayRowPatchFn: func(snapshot interface{}, rowKey string, expand bool) (string, error) {
+			payload, ok := snapshot.(statsPayload)
+			if !ok {
+				return "", fmt.Errorf("day row action failed: snapshot unavailable")
+			}
+			return buildDayRowTogglePatch(payload, rowKey, expand)
+		},
+		SyncCodespacesFn: func() *webstack.ActionError {
+			if err := state.syncCodespacesSnapshot(); err != nil {
+				if actionErr, ok := err.(*webActionError); ok {
+					return &webstack.ActionError{
+						Status:  actionErr.status,
+						Reason:  actionErr.reason,
+						Message: actionErr.message,
+					}
+				}
+				return &webstack.ActionError{
+					Status:  http.StatusInternalServerError,
+					Reason:  "codespaces_sync_failed",
+					Message: fmt.Sprintf("codespaces sync failed: %v", err),
+				}
+			}
+			return nil
+		},
+		BuildDashboardPatchFn: func(snapshot interface{}, now time.Time) (string, error) {
+			payload, ok := snapshot.(statsPayload)
+			if !ok {
+				return "", fmt.Errorf("codespaces sync failed: snapshot unavailable")
+			}
+			return state.buildDashboardPatch(payload, now)
+		},
+	}
+}
+
 func newWebMux(state *webState) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		if !handleMethod(w, r, http.MethodGet) {
-			return
-		}
-		payload, hasSnapshot := state.getSnapshot()
-		now := time.Now()
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		page := dailySpendShellHTMLWithIndicators(payload, hasSnapshot, now, state.renderRefreshIndicators(now))
-		if _, err := w.Write([]byte(page)); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write / response: %v\n", err)
-		}
+	return httplayer.NewDashboardMux(newDashboardRuntime(state), httplayer.DashboardMuxOptions{
+		HeartbeatInterval: webEventsHeartbeatInterval,
+		IndicatorInterval: webIndicatorRefreshInterval,
+		Logf: func(format string, args ...interface{}) {
+			fmt.Fprintf(os.Stderr, format, args...)
+		},
 	})
-	mux.HandleFunc("/details", func(w http.ResponseWriter, r *http.Request) {
-		if !handleMethod(w, r, http.MethodGet) {
-			return
-		}
-		payload, hasSnapshot := state.getSnapshot()
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		page := dashboardShellHTMLWithIndicators(payload, hasSnapshot, state.renderRefreshIndicators(time.Now()), state.getExpandedRows())
-		if _, err := w.Write([]byte(page)); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write /details response: %v\n", err)
-		}
-	})
-	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
-		if !handleMethod(w, r, http.MethodGet) {
-			return
-		}
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-			return
-		}
-
-		updates, unsubscribe := state.subscribe()
-		defer unsubscribe()
-
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		w.WriteHeader(http.StatusOK)
-		flusher.Flush()
-
-		heartbeat := time.NewTicker(webEventsHeartbeatInterval)
-		defer heartbeat.Stop()
-		indicators := time.NewTicker(webIndicatorRefreshInterval)
-		defer indicators.Stop()
-
-		for {
-			select {
-			case <-r.Context().Done():
-				return
-			case patch, ok := <-updates:
-				if !ok {
-					return
-				}
-				if _, err := w.Write([]byte(patch)); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write /events patch: %v\n", err)
-					return
-				}
-				flusher.Flush()
-			case t := <-heartbeat.C:
-				if _, err := fmt.Fprintf(w, "event: heartbeat\ndata: %s\n\n", t.UTC().Format(time.RFC3339Nano)); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write /events heartbeat: %v\n", err)
-					return
-				}
-				flusher.Flush()
-			case t := <-indicators.C:
-				patch := state.buildRefreshIndicatorsPatch(t)
-				if _, err := w.Write([]byte(patch)); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write /events indicators patch: %v\n", err)
-					return
-				}
-				flusher.Flush()
-			}
-		}
-	})
-	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
-		if !handleMethod(w, r, http.MethodGet) {
-			return
-		}
-		payload, ok := state.getSnapshot()
-		if !ok {
-			http.Error(w, "stats snapshot unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		writeJSONResponse(w, http.StatusOK, payload)
-	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if !handleMethod(w, r, http.MethodGet) {
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		if _, err := w.Write([]byte("ok\n")); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write /healthz response: %v\n", err)
-		}
-	})
-	mux.HandleFunc("/actions/project-row", func(w http.ResponseWriter, r *http.Request) {
-		if !handleMethod(w, r, http.MethodPost) {
-			return
-		}
-		rowKey := strings.TrimSpace(r.URL.Query().Get("row_key"))
-		if rowKey == "" {
-			writeActionError(w, &webActionError{
-				status:  http.StatusBadRequest,
-				reason:  "row_key_required",
-				message: "project row action failed: row_key is required",
-			})
-			return
-		}
-		payload, ok := state.getSnapshot()
-		if !ok {
-			writeActionError(w, &webActionError{
-				status:  http.StatusServiceUnavailable,
-				reason:  "snapshot_unavailable",
-				message: "project row action failed: snapshot unavailable",
-			})
-			return
-		}
-		expand := parseWebExpandAction(r.URL.Query().Get("expand"))
-		state.setRowExpanded("project", rowKey, expand)
-		patch, err := buildProjectRowTogglePatch(payload, rowKey, expand)
-		if err != nil {
-			writeActionError(w, &webActionError{
-				status:  http.StatusNotFound,
-				reason:  "project_row_not_found",
-				message: "project row action failed: unknown row_key",
-			})
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		if _, err := w.Write([]byte(patch)); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write /actions/project-row response: %v\n", err)
-		}
-	})
-	mux.HandleFunc("/actions/day-row", func(w http.ResponseWriter, r *http.Request) {
-		if !handleMethod(w, r, http.MethodPost) {
-			return
-		}
-		rowKey := strings.TrimSpace(r.URL.Query().Get("row_key"))
-		if rowKey == "" {
-			writeActionError(w, &webActionError{
-				status:  http.StatusBadRequest,
-				reason:  "row_key_required",
-				message: "day row action failed: row_key is required",
-			})
-			return
-		}
-		payload, ok := state.getSnapshot()
-		if !ok {
-			writeActionError(w, &webActionError{
-				status:  http.StatusServiceUnavailable,
-				reason:  "snapshot_unavailable",
-				message: "day row action failed: snapshot unavailable",
-			})
-			return
-		}
-		expand := parseWebExpandAction(r.URL.Query().Get("expand"))
-		state.setRowExpanded("day", rowKey, expand)
-		patch, err := buildDayRowTogglePatch(payload, rowKey, expand)
-		if err != nil {
-			writeActionError(w, &webActionError{
-				status:  http.StatusNotFound,
-				reason:  "day_row_not_found",
-				message: "day row action failed: unknown row_key",
-			})
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		if _, err := w.Write([]byte(patch)); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write /actions/day-row response: %v\n", err)
-		}
-	})
-	mux.HandleFunc("/actions/sync-codespaces", func(w http.ResponseWriter, r *http.Request) {
-		if !handleMethod(w, r, http.MethodPost) {
-			return
-		}
-		if err := state.syncCodespacesSnapshot(); err != nil {
-			if actionErr, ok := err.(*webActionError); ok {
-				writeActionError(w, actionErr)
-				return
-			}
-			writeActionError(w, &webActionError{
-				status:  http.StatusInternalServerError,
-				reason:  "codespaces_sync_failed",
-				message: fmt.Sprintf("codespaces sync failed: %v", err),
-			})
-			return
-		}
-		payload, ok := state.getSnapshot()
-		if !ok {
-			writeActionError(w, &webActionError{
-				status:  http.StatusInternalServerError,
-				reason:  "snapshot_unavailable",
-				message: "codespaces sync failed: snapshot unavailable",
-			})
-			return
-		}
-		patch, err := state.buildDashboardPatch(payload, time.Now())
-		if err != nil {
-			writeActionError(w, &webActionError{
-				status:  http.StatusInternalServerError,
-				reason:  "refresh_patch_failed",
-				message: err.Error(),
-			})
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		if _, err := w.Write([]byte(patch)); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write /actions/sync-codespaces response: %v\n", err)
-		}
-	})
-	return mux
 }
 
 func runWebMode(cfg webModeConfig) error {

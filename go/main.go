@@ -2,18 +2,13 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -23,24 +18,19 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"copilot-token-cost/internal/costing"
+	"copilot-token-cost/internal/domain"
+	"copilot-token-cost/internal/parsing"
+	storagelayer "copilot-token-cost/internal/storage"
+	syncservice "copilot-token-cost/internal/sync"
+
 	_ "modernc.org/sqlite"
 )
 
 // ─── API Pricing (per 1M tokens) ────────────────────────────────────────────
 
-type Pricing struct {
-	Input      float64 `json:"input"`
-	Output     float64 `json:"output"`
-	CacheRead  float64 `json:"cache_read"`
-	CacheWrite float64 `json:"cache_write"`
-}
-
-type PricingPeriod struct {
-	EffectiveFrom      string             `json:"effective_from"`
-	PremiumRequestCost float64            `json:"premium_request_cost"`
-	ModelPricing       map[string]Pricing `json:"model_pricing"`
-	PremiumMultiplier  map[string]float64 `json:"premium_multiplier"`
-}
+type Pricing = costing.Pricing
+type PricingPeriod = costing.PricingPeriod
 
 type pricingFile struct {
 	PricingPeriods []PricingPeriod `json:"pricing_periods"`
@@ -80,28 +70,20 @@ func loadPricing() {
 		fmt.Fprintf(os.Stderr, "Error parsing pricing.json: %v\n", err)
 		os.Exit(1)
 	}
+	if len(pf.PricingPeriods) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: pricing.json contains no pricing periods\n")
+		os.Exit(1)
+	}
 
 	pricingPeriods = pf.PricingPeriods
 }
 
 func getPeriod(timestamp string) *PricingPeriod {
-	if timestamp == "" || len(pricingPeriods) == 0 {
-		return &pricingPeriods[0]
-	}
-	dateStr := timestamp
-	if len(dateStr) > 10 {
-		dateStr = dateStr[:10]
-	}
-	for i := range pricingPeriods {
-		if dateStr >= pricingPeriods[i].EffectiveFrom {
-			return &pricingPeriods[i]
-		}
-	}
-	return &pricingPeriods[len(pricingPeriods)-1]
+	return costing.GetPeriod(pricingPeriods, timestamp)
 }
 
 func getPremiumRequestCost(timestamp string) float64 {
-	return getPeriod(timestamp).PremiumRequestCost
+	return costing.GetPremiumRequestCost(pricingPeriods, timestamp)
 }
 
 var (
@@ -124,48 +106,19 @@ var (
 )
 
 func normalizeModel(name string) string {
-	for _, prefix := range []string{"sweagent-capi:", "capi:"} {
-		if strings.HasPrefix(name, prefix) {
-			name = name[len(prefix):]
-		}
-	}
-	name = reCapiRouting.ReplaceAllString(name, "")
-	name = reReasonEffort.ReplaceAllString(name, "")
-	name = reDateStamp.ReplaceAllString(name, "")
-	return name
+	return costing.NormalizeModel(name)
 }
 
 func getPricing(model string, timestamp string) *Pricing {
-	n := normalizeModel(model)
-	mp := getPeriod(timestamp).ModelPricing
-	if p, ok := mp[n]; ok {
-		return &p
-	}
-	for key, p := range mp {
-		if strings.HasPrefix(n, key) || strings.HasPrefix(key, n) {
-			cp := p
-			return &cp
-		}
-	}
-	return nil
+	return costing.GetPricing(pricingPeriods, model, timestamp)
 }
 
 func getPremiumMultiplier(model string, timestamp string) float64 {
-	n := normalizeModel(model)
-	mult := getPeriod(timestamp).PremiumMultiplier
-	if m, ok := mult[n]; ok {
-		return m
-	}
-	for key, m := range mult {
-		if strings.HasPrefix(n, key) || strings.HasPrefix(key, n) {
-			return m
-		}
-	}
-	return 1
+	return costing.GetPremiumMultiplier(pricingPeriods, model, timestamp)
 }
 
 func isUserInitiator(initiator string) bool {
-	return strings.EqualFold(strings.TrimSpace(initiator), "user")
+	return parsing.IsUserInitiator(initiator)
 }
 
 func promptTextForStorage(promptText *string) sql.NullString {
@@ -181,42 +134,13 @@ func promptTextForStorage(promptText *string) sql.NullString {
 
 // ─── Record & Stats ─────────────────────────────────────────────────────────
 
-type Record struct {
-	Model               string
-	PromptTokens        int
-	CompletionTokens    int
-	PromptText          *string
-	CacheCreationTokens int
-	CacheReadTokens     int
-	IsUserTurn          bool
-	Timestamp           string
-	SessionID           string
-	LogFile             string
-	Source              string
-}
+type Record = domain.Record
+type Stats domain.Stats
 
-type Stats struct {
-	APICalls            int     `json:"api_calls"`
-	UserTurns           int     `json:"user_turns,omitempty"`
-	PromptTokens        int     `json:"prompt_tokens"`
-	CompletionTokens    int     `json:"completion_tokens"`
-	CacheCreationTokens int     `json:"cache_creation_tokens"`
-	CacheReadTokens     int     `json:"cache_read_tokens"`
-	PremiumRequests     float64 `json:"premium_requests"`
-}
-
-func newStats() *Stats { return &Stats{} }
+func newStats() *Stats { return (*Stats)(domain.NewStats()) }
 
 func (s *Stats) add(r Record, model string) {
-	s.APICalls++
-	s.PromptTokens += r.PromptTokens
-	s.CompletionTokens += r.CompletionTokens
-	s.CacheCreationTokens += r.CacheCreationTokens
-	s.CacheReadTokens += r.CacheReadTokens
-	if r.IsUserTurn {
-		s.UserTurns++
-		s.PremiumRequests += getPremiumMultiplier(model, r.Timestamp)
-	}
+	(*domain.Stats)(s).AddRecord(r, getPremiumMultiplier(model, r.Timestamp))
 }
 
 // ─── Log parsing ────────────────────────────────────────────────────────────
@@ -242,211 +166,19 @@ func parseLogFileInRange(logPath string, minTimestamp, maxTimestamp string) []Re
 }
 
 func parseLogContent(content, logPath, minTimestamp, maxTimestamp string) []Record {
-	lines := strings.Split(content, "\n")
-	records := make([]Record, 0, strings.Count(content, `"completion_tokens"`))
-
-	lastModel := "unknown"
-	var lastTimestamp, lastSession string
-	lastInitiator := "agent"
-	var lastPromptText *string
-
-	for i, line := range lines {
-		if len(line) >= 19 &&
-			line[4] == '-' && line[7] == '-' &&
-			line[10] == 'T' && line[13] == ':' && line[16] == ':' {
-			lastTimestamp = line[:19]
-		}
-		if strings.Contains(line, "Workspace initialized") || strings.Contains(line, "Created ACP session") || strings.Contains(line, "Flushed ") {
-			if m := reSession.FindStringSubmatch(line); m != nil {
-				lastSession = m[1]
-			}
-		}
-		if strings.Contains(line, "PremiumRequestProcessor: Setting X-Initiator") {
-			if m := reInitiator.FindStringSubmatch(line); m != nil {
-				lastInitiator = strings.TrimSpace(m[1])
-			}
-		}
-		if strings.Contains(line, `"model"`) {
-			if m := reModelJSON.FindStringSubmatch(line); m != nil {
-				candidate := m[1]
-				if !strings.HasPrefix(candidate, "{") && (strings.Contains(candidate, "claude") || strings.Contains(candidate, "gpt") || strings.Contains(candidate, "gemini")) {
-					lastModel = candidate
-				}
-			}
-		}
-		if prompt := extractPromptTextFromLine(line); prompt != nil {
-			lastPromptText = prompt
-		} else if prompt := extractPromptTextFromProblemStatementLine(lines, i); prompt != nil {
-			lastPromptText = prompt
-		}
-
-		if !strings.Contains(line, `"completion_tokens"`) {
-			continue
-		}
-		if lastTimestamp != "" {
-			if minTimestamp != "" && lastTimestamp < minTimestamp {
-				lastInitiator = "agent"
-				continue
-			}
-			if maxTimestamp != "" && lastTimestamp >= maxTimestamp {
-				lastInitiator = "agent"
-				continue
-			}
-		}
-
-		promptMatch := rePromptTokens.FindStringSubmatch(line)
-		compMatch := reCompTokens.FindStringSubmatch(line)
-		var cacheCreation, cacheReadVal int
-		cacheCreationSet := false
-		cacheReadSet := false
-		if m := reCacheCreation.FindStringSubmatch(line); m != nil {
-			cacheCreation, _ = strconv.Atoi(m[1])
-			cacheCreationSet = true
-		}
-		if m := reCacheRead.FindStringSubmatch(line); m != nil {
-			cacheReadVal, _ = strconv.Atoi(m[1])
-			cacheReadSet = true
-		}
-		if !cacheReadSet {
-			if m := reCachedTokens.FindStringSubmatch(line); m != nil {
-				cacheReadVal, _ = strconv.Atoi(m[1])
-				cacheReadSet = true
-			}
-		}
-
-		if promptMatch == nil || compMatch == nil || !cacheCreationSet || !cacheReadSet || lastModel == "unknown" {
-			blockStart := i - 10
-			if blockStart < 0 {
-				blockStart = 0
-			}
-			blockEnd := i + 16
-			if blockEnd > len(lines) {
-				blockEnd = len(lines)
-			}
-			for j := blockStart; j < blockEnd; j++ {
-				if promptMatch == nil {
-					if m := rePromptTokens.FindStringSubmatch(lines[j]); m != nil {
-						promptMatch = m
-					}
-				}
-				if compMatch == nil {
-					if m := reCompTokens.FindStringSubmatch(lines[j]); m != nil {
-						compMatch = m
-					}
-				}
-				if !cacheCreationSet {
-					if m := reCacheCreation.FindStringSubmatch(lines[j]); m != nil {
-						cacheCreation, _ = strconv.Atoi(m[1])
-						cacheCreationSet = true
-					}
-				}
-				if !cacheReadSet {
-					if m := reCacheRead.FindStringSubmatch(lines[j]); m != nil {
-						cacheReadVal, _ = strconv.Atoi(m[1])
-						cacheReadSet = true
-					} else if m := reCachedTokens.FindStringSubmatch(lines[j]); m != nil {
-						cacheReadVal, _ = strconv.Atoi(m[1])
-						cacheReadSet = true
-					}
-				}
-				if lastModel == "unknown" {
-					if m := reModelJSON.FindStringSubmatch(lines[j]); m != nil {
-						candidate := m[1]
-						if strings.Contains(candidate, "claude") || strings.Contains(candidate, "gpt") || strings.Contains(candidate, "gemini") {
-							lastModel = candidate
-						}
-					}
-				}
-				if promptMatch != nil && compMatch != nil && cacheCreationSet && cacheReadSet && lastModel != "unknown" {
-					break
-				}
-			}
-			if promptMatch == nil || compMatch == nil {
-				continue
-			}
-		}
-
-		promptTokens, _ := strconv.Atoi(promptMatch[1])
-		completionTokens, _ := strconv.Atoi(compMatch[1])
-		promptText := extractPromptTextNearLine(lines, i)
-		if promptText == nil {
-			promptText = lastPromptText
-		}
-
-		records = append(records, Record{
-			Model:               lastModel,
-			PromptTokens:        promptTokens,
-			CompletionTokens:    completionTokens,
-			PromptText:          promptText,
-			CacheCreationTokens: cacheCreation,
-			CacheReadTokens:     cacheReadVal,
-			IsUserTurn:          isUserInitiator(lastInitiator),
-			Timestamp:           lastTimestamp,
-			SessionID:           lastSession,
-			LogFile:             filepath.Base(logPath),
-		})
-		lastInitiator = "agent"
-	}
-	return records
+	return parsing.ParseLogContent(content, logPath, minTimestamp, maxTimestamp)
 }
 
 func extractPromptTextNearLine(lines []string, center int) *string {
-	start := center - 20
-	if start < 0 {
-		start = 0
-	}
-	end := center + 6
-	if end > len(lines) {
-		end = len(lines)
-	}
-	for i := center; i >= start; i-- {
-		if prompt := extractPromptTextFromLine(lines[i]); prompt != nil {
-			return prompt
-		}
-		if prompt := extractPromptTextFromProblemStatementLine(lines, i); prompt != nil {
-			return prompt
-		}
-	}
-	for i := center + 1; i < end; i++ {
-		if prompt := extractPromptTextFromLine(lines[i]); prompt != nil {
-			return prompt
-		}
-		if prompt := extractPromptTextFromProblemStatementLine(lines, i); prompt != nil {
-			return prompt
-		}
-	}
-	return nil
+	return parsing.ExtractPromptTextNearLine(lines, center)
 }
 
 func extractPromptTextFromLine(line string) *string {
-	if !containsPromptIndicator(line) {
-		return nil
-	}
-	if prompt := extractPromptTextFromJSONLine(line); prompt != nil {
-		return prompt
-	}
-	if strings.Contains(line, `\"`) {
-		unescaped := strings.ReplaceAll(line, `\"`, `"`)
-		return extractPromptTextFromJSONLine(unescaped)
-	}
-	return nil
+	return parsing.ExtractPromptTextFromLine(line)
 }
 
 func containsPromptIndicator(line string) bool {
-	for _, indicator := range []string{
-		`"user"`,
-		`\"user\"`,
-		`"messages"`,
-		`\"messages\"`,
-		`"prompt"`,
-		`"statement"`,
-		`\"statement\"`,
-	} {
-		if strings.Contains(line, indicator) {
-			return true
-		}
-	}
-	return false
+	return parsing.ContainsPromptIndicator(line)
 }
 
 func extractPromptTextFromJSONLine(line string) *string {
@@ -704,69 +436,7 @@ func loadSessionWorkspaces(sessionDir string) map[string]workspaceMeta {
 
 // ─── SQLite DB layer ────────────────────────────────────────────────────────
 
-const schemaSQLGo = `
-CREATE TABLE IF NOT EXISTS api_calls (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    model TEXT NOT NULL,
-    model_normalized TEXT NOT NULL,
-    prompt_tokens INTEGER NOT NULL,
-    completion_tokens INTEGER NOT NULL,
-    prompt_text TEXT,
-    cache_creation_tokens INTEGER DEFAULT 0,
-    cache_read_tokens INTEGER DEFAULT 0,
-    is_user_turn INTEGER DEFAULT 0,
-    timestamp TEXT,
-    session_id TEXT,
-    log_file TEXT,
-    source TEXT DEFAULT 'local',
-    UNIQUE(timestamp, model, prompt_tokens, completion_tokens, log_file, source)
-);
-
-CREATE TABLE IF NOT EXISTS parsed_logs (
-    log_file TEXT NOT NULL,
-    mtime REAL NOT NULL,
-    source TEXT DEFAULT 'local',
-    record_count INTEGER DEFAULT 0,
-    parsed_at TEXT NOT NULL,
-    PRIMARY KEY (log_file, source)
-);
-
-CREATE TABLE IF NOT EXISTS session_workspaces (
-    session_id TEXT NOT NULL,
-    cwd TEXT NOT NULL,
-    source TEXT DEFAULT 'local',
-    branch TEXT,
-    PRIMARY KEY (session_id, source)
-);
-
-CREATE TABLE IF NOT EXISTS codespace_sync_state (
-    codespace_name TEXT PRIMARY KEY,
-    last_used_at TEXT,
-    last_synced_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS codespace_tail_offsets (
-    source TEXT NOT NULL,
-    log_file TEXT NOT NULL,
-    last_offset INTEGER NOT NULL DEFAULT 0,
-    last_size INTEGER NOT NULL DEFAULT 0,
-    last_mtime TEXT,
-    last_hash TEXT,
-    connection_state TEXT NOT NULL DEFAULT 'disconnected',
-    last_error TEXT,
-    last_chunk_at TEXT,
-    last_full_copy_at TEXT,
-    last_defensive_recopy_at TEXT,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (source, log_file)
-);
-
-CREATE INDEX IF NOT EXISTS idx_codespace_tail_offsets_source ON codespace_tail_offsets(source);
-
-CREATE INDEX IF NOT EXISTS idx_api_calls_timestamp ON api_calls(timestamp);
-CREATE INDEX IF NOT EXISTS idx_api_calls_model ON api_calls(model_normalized);
-CREATE INDEX IF NOT EXISTS idx_api_calls_session ON api_calls(session_id);
-`
+const schemaSQLGo = storagelayer.SchemaSQL
 
 func getDBPath() string {
 	xdgStateHome := strings.TrimSpace(os.Getenv("XDG_STATE_HOME"))
@@ -789,182 +459,103 @@ func initDB(dbPath string) *sql.DB {
 		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
 		os.Exit(1)
 	}
-	db.Exec("PRAGMA journal_mode=WAL")
-	db.Exec("PRAGMA synchronous=NORMAL")
-	db.Exec("PRAGMA foreign_keys=ON")
-	_, err = db.Exec(schemaSQLGo)
-	if err != nil {
+	if err := storagelayer.NewService(db).Initialize(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating schema: %v\n", err)
 		os.Exit(1)
 	}
-	migrateAPICallsSchema(db)
-	migrateSessionWorkspacesSchema(db)
 	return db
 }
 
 func migrateAPICallsSchema(db *sql.DB) {
-	cols := apiCallColumns(db, "main")
-	if !cols["prompt_text"] {
-		_, _ = db.Exec("ALTER TABLE api_calls ADD COLUMN prompt_text TEXT")
-	}
-	_, _ = db.Exec("CREATE INDEX IF NOT EXISTS idx_api_calls_prompt_text ON api_calls(prompt_text)")
+	storagelayer.NewService(db).MigrateAPICallsSchema()
 }
 
 func migrateSessionWorkspacesSchema(db *sql.DB) {
-	cols := sessionWorkspaceColumns(db, "main")
-	var pkCols sql.NullString
-	_ = db.QueryRow(
-		"SELECT group_concat(name, ',') FROM (" +
-			"SELECT name FROM pragma_table_info('session_workspaces') WHERE pk > 0 ORDER BY pk" +
-			")",
-	).Scan(&pkCols)
-	if !pkCols.Valid || pkCols.String != "session_id,source" {
-		sourceExpr := "'local'"
-		if cols["source"] {
-			sourceExpr = "COALESCE(source, 'local')"
-		}
-		branchExpr := "NULL"
-		if cols["branch"] {
-			branchExpr = "branch"
-		}
-		_, _ = db.Exec("ALTER TABLE session_workspaces RENAME TO session_workspaces_old")
-		_, _ = db.Exec(`CREATE TABLE session_workspaces (
-    session_id TEXT NOT NULL,
-    cwd TEXT NOT NULL,
-    source TEXT DEFAULT 'local',
-    branch TEXT,
-    PRIMARY KEY (session_id, source)
-)`)
-		_, _ = db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source, branch) SELECT session_id, cwd, " + sourceExpr + ", " + branchExpr + " FROM session_workspaces_old")
-		_, _ = db.Exec("DROP TABLE session_workspaces_old")
-		cols = sessionWorkspaceColumns(db, "main")
-	}
-	if !cols["branch"] {
-		_, _ = db.Exec("ALTER TABLE session_workspaces ADD COLUMN branch TEXT")
-	}
+	storagelayer.NewService(db).MigrateSessionWorkspacesSchema()
 }
 
 func sessionWorkspaceColumns(db *sql.DB, schema string) map[string]bool {
-	cols := make(map[string]bool)
-	pragma := "PRAGMA table_info(session_workspaces)"
-	if schema != "" {
-		pragma = fmt.Sprintf("PRAGMA %s.table_info(session_workspaces)", schema)
-	}
-	rows, err := db.Query(pragma)
-	if err != nil {
-		return cols
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, pk int
-		var name, colType string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err == nil {
-			cols[name] = true
-		}
-	}
-	return cols
+	return storagelayer.NewService(db).SessionWorkspaceColumns(schema)
 }
 
 func apiCallColumns(db *sql.DB, schema string) map[string]bool {
-	cols := make(map[string]bool)
-	pragma := "PRAGMA table_info(api_calls)"
-	if schema != "" {
-		pragma = fmt.Sprintf("PRAGMA %s.table_info(api_calls)", schema)
-	}
-	rows, err := db.Query(pragma)
-	if err != nil {
-		return cols
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, pk int
-		var name, colType string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err == nil {
-			cols[name] = true
-		}
-	}
-	return cols
+	return storagelayer.NewService(db).APICallColumns(schema)
 }
 
 func isLogParsed(db *sql.DB, logFile string, mtime float64, source string) bool {
-	var n int
-	err := db.QueryRow("SELECT 1 FROM parsed_logs WHERE log_file = ? AND source = ? AND mtime = ?",
-		logFile, source, mtime).Scan(&n)
-	return err == nil
+	return storagelayer.NewService(db).IsLogParsed(logFile, mtime, source)
 }
 
 func markLogParsed(db *sql.DB, logFile string, mtime float64, recordCount int, source string) {
-	db.Exec("INSERT OR REPLACE INTO parsed_logs (log_file, mtime, source, record_count, parsed_at) VALUES (?, ?, ?, ?, datetime('now'))",
-		logFile, mtime, source, recordCount)
+	storagelayer.NewService(db).MarkLogParsed(logFile, mtime, recordCount, source)
+}
+
+func toDomainRecord(r Record) domain.Record {
+	return domain.Record{
+		Model:               r.Model,
+		PromptTokens:        r.PromptTokens,
+		CompletionTokens:    r.CompletionTokens,
+		PromptText:          r.PromptText,
+		CacheCreationTokens: r.CacheCreationTokens,
+		CacheReadTokens:     r.CacheReadTokens,
+		IsUserTurn:          r.IsUserTurn,
+		Timestamp:           r.Timestamp,
+		SessionID:           r.SessionID,
+		LogFile:             r.LogFile,
+		Source:              r.Source,
+	}
+}
+
+func toDomainRecords(records []Record) []domain.Record {
+	out := make([]domain.Record, 0, len(records))
+	for _, r := range records {
+		out = append(out, toDomainRecord(r))
+	}
+	return out
+}
+
+func toSyncWorkspaceMeta(workspaces map[string]workspaceMeta) map[string]syncservice.WorkspaceMeta {
+	out := make(map[string]syncservice.WorkspaceMeta, len(workspaces))
+	for sessionID, meta := range workspaces {
+		out[sessionID] = syncservice.WorkspaceMeta{CWD: meta.CWD, Branch: meta.Branch}
+	}
+	return out
+}
+
+func syncServiceForDB(db *sql.DB) *syncservice.Service {
+	service := syncservice.NewService(storagelayer.NewService(db), parsing.NewService())
+	service.SetRuntimeDeps(syncservice.RuntimeDeps{
+		ParseLogFileInRange: func(logPath, minTimestamp, maxTimestamp string) []domain.Record {
+			return toDomainRecords(parseLogFileInRange(logPath, minTimestamp, maxTimestamp))
+		},
+		LoadSessionWorkspaces: func(sessionDir string) map[string]syncservice.WorkspaceMeta {
+			return toSyncWorkspaceMeta(loadSessionWorkspaces(sessionDir))
+		},
+		NormalizeModel:       normalizeModel,
+		PromptTextForStorage: promptTextForStorage,
+		AddCommas:            addCommas,
+	})
+	return service
 }
 
 func insertRecords(db *sql.DB, records []Record, source string) {
-	if len(records) == 0 {
-		return
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return
-	}
-	stmt, err := tx.Prepare(
-		"INSERT OR IGNORE INTO api_calls " +
-			"(model, model_normalized, prompt_tokens, completion_tokens, " +
-			"prompt_text, cache_creation_tokens, cache_read_tokens, is_user_turn, " +
-			"timestamp, session_id, log_file, source) " +
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		tx.Rollback()
-		return
-	}
-	defer stmt.Close()
-	for _, r := range records {
-		isUT := 0
-		if r.IsUserTurn {
-			isUT = 1
-		}
-		promptText := promptTextForStorage(r.PromptText)
-		stmt.Exec(r.Model, normalizeModel(r.Model), r.PromptTokens, r.CompletionTokens,
-			promptText, r.CacheCreationTokens, r.CacheReadTokens, isUT,
-			r.Timestamp, r.SessionID, r.LogFile, source)
-	}
-	tx.Commit()
+	storagelayer.NewService(db).InsertRecords(toDomainRecords(records), source, normalizeModel, promptTextForStorage)
 }
 
 func upsertSessionWorkspace(db *sql.DB, sessionID, cwd, branch, source string) {
-	var branchValue interface{}
-	if strings.TrimSpace(branch) != "" {
-		branchValue = branch
-	}
-	db.Exec("INSERT OR REPLACE INTO session_workspaces (session_id, cwd, source, branch) VALUES (?, ?, ?, ?)",
-		sessionID, cwd, source, branchValue)
+	storagelayer.NewService(db).UpsertSessionWorkspace(sessionID, cwd, branch, source)
 }
 
 func clearSource(db *sql.DB, source string) {
-	db.Exec("DELETE FROM api_calls WHERE source = ?", source)
-	db.Exec("DELETE FROM parsed_logs WHERE source = ?", source)
-	db.Exec("DELETE FROM session_workspaces WHERE source = ?", source)
+	storagelayer.NewService(db).ClearSource(source)
 }
 
 func getCodespaceLastUsed(db *sql.DB, codespaceName string) string {
-	var lastUsed sql.NullString
-	err := db.QueryRow(
-		"SELECT last_used_at FROM codespace_sync_state WHERE codespace_name = ?",
-		codespaceName,
-	).Scan(&lastUsed)
-	if err != nil || !lastUsed.Valid {
-		return ""
-	}
-	return lastUsed.String
+	return storagelayer.NewService(db).GetCodespaceLastUsed(codespaceName)
 }
 
 func upsertCodespaceSyncState(db *sql.DB, codespaceName string, lastUsedAt string) {
-	db.Exec(
-		"INSERT OR REPLACE INTO codespace_sync_state (codespace_name, last_used_at, last_synced_at) VALUES (?, ?, datetime('now'))",
-		codespaceName,
-		lastUsedAt,
-	)
+	storagelayer.NewService(db).UpsertCodespaceSyncState(codespaceName, lastUsedAt)
 }
 
 func buildFilters(dateFrom, dateTo, projectFilter string) (string, []interface{}) {
@@ -1378,143 +969,7 @@ func importSQLiteDB(db *sql.DB, otherDBPath, sourceOverride string) int {
 }
 
 func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source string, minTime, maxTime *time.Time) int {
-	var existing int
-	db.QueryRow("SELECT COUNT(*) FROM api_calls WHERE source = ?", source).Scan(&existing)
-	matches, _ := filepath.Glob(filepath.Join(logsDir, "process-*.log"))
-	sort.Strings(matches)
-	if len(matches) > 0 {
-		fmt.Fprintf(os.Stderr, "  🔎 Scanning %d log files (%s)\n", len(matches), source)
-	}
-
-	if force {
-		// Clear parse tracker so all logs are re-parsed; keep existing api_calls (INSERT OR IGNORE handles dedup)
-		db.Exec("DELETE FROM parsed_logs WHERE source = ?", source)
-		fmt.Fprintf(os.Stderr, "  🔄 Force re-sync (%s): re-parsing %d log files (keeping %s existing records)\n", source, len(matches), addCommas(strconv.Itoa(existing)))
-	}
-
-	totalInserted := 0
-	parsedCount := 0
-	minTimestamp := ""
-	maxTimestamp := ""
-	if minTime != nil {
-		minTimestamp = minTime.Format("2006-01-02T15:04:05")
-	}
-	if maxTime != nil {
-		maxTimestamp = maxTime.Format("2006-01-02T15:04:05")
-	}
-	parsedMtimeByFile := map[string]float64{}
-	if !force {
-		rows, err := db.Query("SELECT log_file, mtime FROM parsed_logs WHERE source = ?", source)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var file string
-				var mtime float64
-				if err := rows.Scan(&file, &mtime); err == nil {
-					parsedMtimeByFile[file] = mtime
-				}
-			}
-		}
-	}
-	var tx *sql.Tx
-	var insertStmt *sql.Stmt
-	var parsedStmt *sql.Stmt
-
-	for _, logPath := range matches {
-		filename := filepath.Base(logPath)
-		info, err := os.Lstat(logPath)
-		if err != nil {
-			continue
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			continue
-		}
-		if !force {
-			modTime := info.ModTime()
-			if minTime != nil && modTime.Before(*minTime) {
-				continue
-			}
-			if maxTime != nil && !modTime.Before(*maxTime) {
-				continue
-			}
-		}
-		mtime := float64(info.ModTime().UnixMilli()) / 1000.0
-		if !force {
-			if parsedMtime, ok := parsedMtimeByFile[filename]; ok && parsedMtime == mtime {
-				continue
-			}
-		}
-		if tx == nil {
-			tx, err = db.Begin()
-			if err != nil {
-				return 0
-			}
-			insertStmt, err = tx.Prepare(
-				"INSERT INTO api_calls " +
-					"(model, model_normalized, prompt_tokens, completion_tokens, " +
-					"prompt_text, cache_creation_tokens, cache_read_tokens, is_user_turn, " +
-					"timestamp, session_id, log_file, source) " +
-					"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
-					"ON CONFLICT(timestamp, model, prompt_tokens, completion_tokens, log_file, source) DO UPDATE SET " +
-					"prompt_text = CASE " +
-					"WHEN COALESCE(api_calls.prompt_text, '') = '' AND COALESCE(excluded.prompt_text, '') <> '' THEN excluded.prompt_text " +
-					"ELSE api_calls.prompt_text END, " +
-					"session_id = CASE " +
-					"WHEN COALESCE(excluded.session_id, '') <> '' THEN excluded.session_id " +
-					"ELSE api_calls.session_id END")
-			if err != nil {
-				_ = tx.Rollback()
-				return 0
-			}
-			parsedStmt, err = tx.Prepare("INSERT OR REPLACE INTO parsed_logs (log_file, mtime, source, record_count, parsed_at) VALUES (?, ?, ?, ?, datetime('now'))")
-			if err != nil {
-				_ = insertStmt.Close()
-				_ = tx.Rollback()
-				return 0
-			}
-		}
-		records := parseLogFileInRange(logPath, minTimestamp, maxTimestamp)
-		for _, r := range records {
-			isUT := 0
-			if r.IsUserTurn {
-				isUT = 1
-			}
-			promptText := promptTextForStorage(r.PromptText)
-			_, _ = insertStmt.Exec(r.Model, normalizeModel(r.Model), r.PromptTokens, r.CompletionTokens,
-				promptText, r.CacheCreationTokens, r.CacheReadTokens, isUT,
-				r.Timestamp, r.SessionID, r.LogFile, source)
-		}
-		_, _ = parsedStmt.Exec(filename, mtime, source, len(records))
-		totalInserted += len(records)
-		parsedCount++
-		if force {
-			fmt.Fprintf(os.Stderr, "  📄 [%d/%d] %s (%d records)\n", parsedCount, len(matches), filename, len(records))
-		}
-	}
-	if tx != nil {
-		_ = insertStmt.Close()
-		_ = parsedStmt.Close()
-		if err := tx.Commit(); err != nil {
-			_ = tx.Rollback()
-			return 0
-		}
-	}
-
-	if parsedCount > 0 {
-		workspaces := loadSessionWorkspaces(sessionDir)
-		for sessionID, meta := range workspaces {
-			upsertSessionWorkspace(db, sessionID, meta.CWD, meta.Branch, source)
-		}
-	}
-
-	if parsedCount > 0 {
-		var totalNow int
-		db.QueryRow("SELECT COUNT(*) FROM api_calls WHERE source = ?", source).Scan(&totalNow)
-		newRecords := totalNow - existing
-		fmt.Fprintf(os.Stderr, "  ✅ Synced %d log files (%s): %s new records (%s total)\n", parsedCount, source, addCommas(strconv.Itoa(newRecords)), addCommas(strconv.Itoa(totalNow)))
-	}
-
-	return totalInserted
+	return syncServiceForDB(db).SyncLogsToDB(logsDir, sessionDir, force, source, minTime, maxTime)
 }
 
 type codespaceInfo struct {
@@ -1532,401 +987,90 @@ type codespaceCopyResult struct {
 	Copied     bool
 }
 
+func toSyncCodespaceInfo(cs codespaceInfo) syncservice.CodespaceInfo {
+	return syncservice.CodespaceInfo{Name: cs.Name, State: cs.State, LastUsedAt: cs.LastUsedAt}
+}
+
+func fromSyncCodespaceInfo(cs syncservice.CodespaceInfo) codespaceInfo {
+	return codespaceInfo{Name: cs.Name, State: cs.State, LastUsedAt: cs.LastUsedAt}
+}
+
+func fromSyncCodespaces(codespaces []syncservice.CodespaceInfo) []codespaceInfo {
+	if codespaces == nil {
+		return nil
+	}
+	out := make([]codespaceInfo, 0, len(codespaces))
+	for _, cs := range codespaces {
+		out = append(out, fromSyncCodespaceInfo(cs))
+	}
+	return out
+}
+
+func fromSyncCodespaceCopyResult(res syncservice.CodespaceCopyResult) codespaceCopyResult {
+	return codespaceCopyResult{
+		Idx:        res.Idx,
+		Codespace:  fromSyncCodespaceInfo(res.Codespace),
+		TmpDir:     res.TmpDir,
+		LogsDir:    res.LogsDir,
+		SessionDir: res.SessionDir,
+		Copied:     res.Copied,
+	}
+}
+
 func listCodespaces(includeStopped bool) []codespaceInfo {
-	fmt.Fprintf(os.Stderr, "  🔄 Codespaces: listing...\n")
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gh", "cs", "list", "--json", "name,state,lastUsedAt", "--limit", "1000")
-	cmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: listing timed out\n")
-			return nil
-		}
-		fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: failed to list codespaces\n")
-		return nil
-	}
-	var all []codespaceInfo
-	if err := json.Unmarshal(out, &all); err != nil {
-		fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: invalid JSON from gh cs list\n")
-		return nil
-	}
-	allowed := map[string]bool{"Available": true}
-	if includeStopped {
-		allowed["Shutdown"] = true
-	}
-	var filtered []codespaceInfo
-	for _, cs := range all {
-		if cs.Name != "" && allowed[cs.State] {
-			filtered = append(filtered, cs)
-		}
-	}
-	fmt.Fprintf(os.Stderr, "  📦 Codespaces: %d to sync\n", len(filtered))
-	return filtered
+	return fromSyncCodespaces(syncservice.NewService(nil, nil).ListCodespaces(includeStopped))
 }
 
 func isCodespaceStartThrottleError(msg string) bool {
-	if msg == "" {
-		return false
-	}
-	lower := strings.ToLower(msg)
-	return strings.Contains(lower, "too many codespaces starting") ||
-		(strings.Contains(lower, "http 400") && strings.Contains(lower, "codespaces"))
+	return syncservice.IsCodespaceStartThrottleError(msg)
 }
 
 func codespaceThrottleBackoff(attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
-	if attempt > 4 {
-		attempt = 4
-	}
-	return time.Duration(1<<attempt) * time.Second
+	return syncservice.CodespaceThrottleBackoff(attempt)
 }
 
 func summarizeSyncCommandStderr(stderr string) string {
-	trimmed := strings.TrimSpace(stderr)
-	if trimmed == "" {
-		return ""
-	}
-	oneLine := strings.Join(strings.Fields(trimmed), " ")
-	if len(oneLine) > 240 {
-		return oneLine[:240] + "..."
-	}
-	return oneLine
+	return syncservice.SummarizeSyncCommandStderr(stderr)
 }
 
 // isTarFileChangedWarning returns true when tar exited with code 1 due to
 // "file changed as we read it" — a benign warning, not a fatal error.
 func isTarFileChangedWarning(err error, stderr string) bool {
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && strings.Contains(stderr, "file changed as we read it") {
-		return true
-	}
-	return false
+	return syncservice.IsTarFileChangedWarning(err, stderr)
 }
 
 func formatSshTarFailure(sshErr, tarErr error, sshStderr, tarStderr string) string {
-	var parts []string
-	if sshErr != nil {
-		parts = append(parts, fmt.Sprintf("ssh error: %v", sshErr))
-	}
-	if tarErr != nil {
-		parts = append(parts, fmt.Sprintf("extract error: %v", tarErr))
-	}
-	if msg := summarizeSyncCommandStderr(sshStderr); msg != "" {
-		parts = append(parts, "ssh stderr: "+msg)
-	}
-	if msg := summarizeSyncCommandStderr(tarStderr); msg != "" {
-		parts = append(parts, "extract stderr: "+msg)
-	}
-	return strings.Join(parts, "; ")
+	return syncservice.FormatSshTarFailure(sshErr, tarErr, sshStderr, tarStderr)
 }
 
 func copyCodespaceData(cs codespaceInfo, idx, total int, stoppedStartLimiter chan struct{}) codespaceCopyResult {
-	res := codespaceCopyResult{
-		Idx:       idx,
-		Codespace: cs,
-	}
-	shouldStop := cs.State == "Shutdown"
-	tmpDir, err := os.MkdirTemp("", "copilot-cs-")
-	if err != nil {
-		return res
-	}
-	res.TmpDir = tmpDir
-
-	if shouldStop && stoppedStartLimiter != nil {
-		stoppedStartLimiter <- struct{}{}
-		defer func() { <-stoppedStartLimiter }()
-	}
-
-	if shouldStop {
-		defer func() {
-			stopStart := time.Now()
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer stopCancel()
-			stopCmd := exec.CommandContext(stopCtx, "gh", "cs", "stop", "-c", cs.Name)
-			stopCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-			_ = stopCmd.Run()
-			fmt.Fprintf(os.Stderr, "  🛑 Stopping %s... (%.1fs)\n", cs.Name, time.Since(stopStart).Seconds())
-		}()
-	}
-
-	stage := filepath.Join(tmpDir, cs.Name)
-	_ = os.MkdirAll(stage, 0755)
-	fmt.Fprintf(os.Stderr, "  📦 [%d/%d] Copying %s...\n", idx+1, total, cs.Name)
-	cpStart := time.Now()
-	cpCtx, cpCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cpCancel()
-
-	// Try ssh+tar first (targeted paths, compressed stream)
-	copied := false
-	sshTarCmd := exec.CommandContext(cpCtx, "gh", "cs", "ssh", "-c", cs.Name, "--",
-		"tar", "czf", "-", "-C", "/home/vscode", ".copilot/logs", ".copilot/session-state")
-	sshTarCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-	var sshErrBuf bytes.Buffer
-	sshTarCmd.Stderr = &sshErrBuf
-	if pipe, pipeErr := sshTarCmd.StdoutPipe(); pipeErr == nil {
-		tarExtract := exec.CommandContext(cpCtx, "tar", "xzf", "-", "-C", stage)
-		tarExtract.Stdin = pipe
-		var tarErrBuf bytes.Buffer
-		tarExtract.Stderr = &tarErrBuf
-		if sshErr := sshTarCmd.Start(); sshErr == nil {
-			if tarErr := tarExtract.Start(); tarErr == nil {
-				tarWaitErr := tarExtract.Wait()
-				sshWaitErr := sshTarCmd.Wait()
-				sshOK := sshWaitErr == nil || isTarFileChangedWarning(sshWaitErr, sshErrBuf.String())
-				if sshOK && tarWaitErr == nil {
-					if sshWaitErr != nil {
-						fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs) (tar warned: file changed as we read it)\n", cs.Name, time.Since(cpStart).Seconds())
-					} else {
-						fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
-					}
-					copied = true
-				} else {
-					detail := formatSshTarFailure(sshWaitErr, tarWaitErr, sshErrBuf.String(), tarErrBuf.String())
-					if detail != "" {
-						fmt.Fprintf(os.Stderr, "  ⚠️ ssh+tar failed for %s (%.1fs): %s; falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds(), detail)
-					} else {
-						fmt.Fprintf(os.Stderr, "  ⚠️ ssh+tar failed for %s (%.1fs), falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds())
-					}
-				}
-			}
-		}
-	}
-
-	// Fallback: gh cs cp (original approach, copies all of .copilot/)
-	if !copied {
-		const maxThrottleRetries = 3
-		for attempt := 1; attempt <= maxThrottleRetries; attempt++ {
-			cpStart = time.Now()
-			cpCmd := exec.CommandContext(cpCtx, "gh", "cs", "cp", "-e", "-r", "-c", cs.Name, "remote:/home/vscode/.copilot", stage)
-			cpCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-			var cpErrBuf bytes.Buffer
-			cpCmd.Stdout = io.Discard
-			cpCmd.Stderr = &cpErrBuf
-			cpErr := cpCmd.Run()
-			if cpErr == nil {
-				fmt.Fprintf(os.Stderr, "  ✅ Copied %s (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
-				copied = true
-				break
-			}
-			if cpCtx.Err() == context.DeadlineExceeded {
-				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out after %.1fs\n", cs.Name, time.Since(cpStart).Seconds())
-				return res
-			}
-			msg := strings.TrimSpace(cpErrBuf.String())
-			if isCodespaceStartThrottleError(msg) && attempt < maxThrottleRetries {
-				wait := codespaceThrottleBackoff(attempt)
-				fmt.Fprintf(os.Stderr, "  ⏳ Start throttled for %s, retrying copy in %.0fs (%d/%d)\n", cs.Name, wait.Seconds(), attempt+1, maxThrottleRetries)
-				select {
-				case <-time.After(wait):
-					continue
-				case <-cpCtx.Done():
-					fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out while waiting to retry\n", cs.Name)
-					return res
-				}
-			}
-			if strings.Contains(msg, "No such file or directory") {
-				fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
-			} else {
-				if msg == "" {
-					msg = "gh cs cp failed"
-				}
-				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s (%.1fs)\n", cs.Name, msg, time.Since(cpStart).Seconds())
-			}
-			return res
-		}
-		if !copied {
-			return res
-		}
-	}
-
-	copilotDir := filepath.Join(stage, ".copilot")
-	if _, err := os.Stat(filepath.Join(copilotDir, "logs")); err != nil {
-		alt := filepath.Join(stage, "home", "vscode", ".copilot")
-		if _, altErr := os.Stat(filepath.Join(alt, "logs")); altErr == nil {
-			copilotDir = alt
-		}
-	}
-	logsDir := filepath.Join(copilotDir, "logs")
-	sessionDir := filepath.Join(copilotDir, "session-state")
-	if _, err := os.Stat(logsDir); err != nil {
-		fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: no .copilot/logs in copied data\n", cs.Name)
-		return res
-	}
-
-	fileCount, totalBytes := dirStats(logsDir)
-	fmt.Fprintf(os.Stderr, "  📊 %s: %d log files, %s copied\n", cs.Name, fileCount, humanSize(totalBytes))
-
-	res.LogsDir = logsDir
-	res.SessionDir = sessionDir
-	res.Copied = true
-	return res
+	return fromSyncCodespaceCopyResult(
+		syncservice.NewService(nil, nil).CopyCodespaceData(toSyncCodespaceInfo(cs), idx, total, stoppedStartLimiter),
+	)
 }
 
 func humanSize(bytes int64) string {
-	switch {
-	case bytes >= 1<<30:
-		return fmt.Sprintf("%.1f GB", float64(bytes)/float64(1<<30))
-	case bytes >= 1<<20:
-		return fmt.Sprintf("%.1f MB", float64(bytes)/float64(1<<20))
-	case bytes >= 1<<10:
-		return fmt.Sprintf("%.1f KB", float64(bytes)/float64(1<<10))
-	default:
-		return fmt.Sprintf("%d B", bytes)
-	}
+	return syncservice.HumanSize(bytes)
 }
 
 func dirStats(root string) (int, int64) {
-	var count int
-	var total int64
-	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		if info, e := d.Info(); e == nil {
-			count++
-			total += info.Size()
-		}
-		return nil
-	})
-	return count, total
+	return syncservice.DirStats(root)
 }
 
 func listRemoteLogFiles(csName string) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "gh", "cs", "ssh", "-c", csName, "--",
-		"ls", "/home/vscode/.copilot/logs/")
-	cmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-	var files []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		f := strings.TrimSpace(line)
-		if f != "" {
-			files = append(files, f)
-		}
-	}
-	return files, nil
+	return syncservice.NewService(nil, nil).ListRemoteLogFiles(csName)
 }
 
 func getKnownLogFiles(db *sql.DB, source string) map[string]bool {
-	known := map[string]bool{}
-	rows, err := db.Query("SELECT log_file FROM parsed_logs WHERE source = ?", source)
-	if err != nil {
-		return known
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var f string
-		if err := rows.Scan(&f); err == nil {
-			known[f] = true
-		}
-	}
-	return known
+	return storagelayer.NewService(db).KnownLogFiles(source)
 }
 
 func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, error) {
-	codespaces := listCodespaces(includeStopped)
-	if codespaces == nil {
-		return 0, fmt.Errorf("failed to list codespaces")
-	}
-	if len(codespaces) == 0 {
-		return 0, nil
-	}
-	var pending []codespaceInfo
-	for _, cs := range codespaces {
-		if cs.State != "Available" && cs.LastUsedAt != "" && getCodespaceLastUsed(db, cs.Name) == cs.LastUsedAt {
-			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (shutdown, unchanged lastUsedAt)\n", cs.Name)
-			continue
-		}
-		if !force && cs.State != "Available" {
-			source := "codespace:" + cs.Name
-			known := getKnownLogFiles(db, source)
-			if len(known) > 0 {
-				remoteFiles, err := listRemoteLogFiles(cs.Name)
-				if err == nil && len(remoteFiles) > 0 {
-					allKnown := true
-					for _, f := range remoteFiles {
-						if !known[f] {
-							allKnown = false
-							break
-						}
-					}
-					if allKnown {
-						fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s copy: all %d log files already synced\n", cs.Name, len(remoteFiles))
-						continue
-					}
-				}
-			}
-		}
-		pending = append(pending, cs)
-	}
-	if len(pending) == 0 {
-		return 0, nil
-	}
-
-	var stoppedPending int
-	for _, cs := range pending {
-		if cs.State == "Shutdown" {
-			stoppedPending++
-		}
-	}
-	var stoppedStartLimiter chan struct{}
-	if stoppedPending > 0 {
-		stoppedStartLimiter = make(chan struct{}, 1)
-		fmt.Fprintf(os.Stderr, "  🧯 Stopped Codespaces startup parallelism: 1 (%d stopped)\n", stoppedPending)
-	}
-
-	workers := 4
-	fmt.Fprintf(os.Stderr, "  🚚 Codespaces copy parallelism: %d workers (%d pending)\n", workers, len(pending))
-	jobs := make(chan int, len(pending))
-	results := make(chan codespaceCopyResult, len(pending))
-	for w := 0; w < workers; w++ {
-		go func() {
-			for idx := range jobs {
-				results <- copyCodespaceData(pending[idx], idx, len(pending), stoppedStartLimiter)
-			}
-		}()
-	}
-	for i := 0; i < len(pending); i++ {
-		jobs <- i
-	}
-	close(jobs)
-
-	ordered := make([]codespaceCopyResult, len(pending))
-	for i := 0; i < len(pending); i++ {
-		res := <-results
-		ordered[res.Idx] = res
-	}
-
-	total := 0
-	failedCopies := 0
-	for _, res := range ordered {
-		if res.Copied {
-			total += syncLogsToDB(db, res.LogsDir, res.SessionDir, force, "codespace:"+res.Codespace.Name, nil, nil)
-			upsertCodespaceSyncState(db, res.Codespace.Name, res.Codespace.LastUsedAt)
-		} else {
-			failedCopies++
-		}
-		if res.TmpDir != "" {
-			_ = os.RemoveAll(res.TmpDir)
-		}
-	}
-	if failedCopies > 0 {
-		return total, fmt.Errorf("codespaces sync incomplete: %d of %d copies failed", failedCopies, len(pending))
-	}
-	return total, nil
+	return syncServiceForDB(db).SyncCodespacesToDBTick(includeStopped, force)
 }
 
 func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
-	total, _ := syncCodespacesToDBTick(db, includeStopped, force)
-	return total
+	return syncServiceForDB(db).SyncCodespacesToDB(includeStopped, force)
 }
 
 func projectName(cwd string) string {
@@ -1939,27 +1083,11 @@ func projectName(cwd string) string {
 // ─── Cost helpers ───────────────────────────────────────────────────────────
 
 func calcCost(model string, s *Stats, timestamp string) float64 {
-	p := getPricing(model, timestamp)
-	if p == nil {
-		return 0.0
-	}
-	netInput := s.PromptTokens - s.CacheReadTokens - s.CacheCreationTokens
-	if netInput < 0 {
-		netInput = 0
-	}
-	return float64(netInput)/1e6*p.Input +
-		float64(s.CompletionTokens)/1e6*p.Output +
-		float64(s.CacheReadTokens)/1e6*p.CacheRead +
-		float64(s.CacheCreationTokens)/1e6*p.CacheWrite
+	return costing.CalcCost(pricingPeriods, model, (*domain.Stats)(s), timestamp)
 }
 
 func calcCostNocache(model string, s *Stats, timestamp string) float64 {
-	p := getPricing(model, timestamp)
-	if p == nil {
-		return 0.0
-	}
-	return float64(s.PromptTokens)/1e6*p.Input +
-		float64(s.CompletionTokens)/1e6*p.Output
+	return costing.CalcCostNoCache(pricingPeriods, model, (*domain.Stats)(s), timestamp)
 }
 
 func sumDailyCost(model string, dailyStats map[string]map[string]*Stats, costFn func(string, *Stats, string) float64) float64 {
@@ -1994,11 +1122,7 @@ func sumDailyPremCostAll(dailyStats map[string]map[string]*Stats) float64 {
 }
 
 func uncachedInput(s *Stats) int {
-	v := s.PromptTokens - s.CacheReadTokens - s.CacheCreationTokens
-	if v < 0 {
-		return 0
-	}
-	return v
+	return costing.UncachedInput((*domain.Stats)(s))
 }
 
 func cacheHitPct(promptTokens, cacheReadTokens int) string {
@@ -2253,7 +1377,7 @@ func parseTS(s string) (time.Time, bool) {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-func main() {
+func runLegacyCLI() {
 	loadPricing()
 
 	allFlag := flag.Bool("all", false, "Process all available logs")
@@ -2902,6 +2026,10 @@ func main() {
 	fmt.Println()
 	fmt.Println("  ⚠  Estimated API-equivalent costs. Copilot subscriptions include token usage.")
 	fmt.Println()
+}
+
+func main() {
+	runLegacyCLI()
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
