@@ -522,7 +522,7 @@ func toSyncWorkspaceMeta(workspaces map[string]workspaceMeta) map[string]syncser
 	return out
 }
 
-func syncServiceForDB(db *sql.DB) *syncservice.Service {
+func syncServiceForDBWithLogf(db *sql.DB, logf func(format string, args ...interface{})) *syncservice.Service {
 	service := syncservice.NewService(storagelayer.NewService(db), parsing.NewService())
 	service.SetRuntimeDeps(syncservice.RuntimeDeps{
 		ParseLogFileInRange: func(logPath, minTimestamp, maxTimestamp string) []domain.Record {
@@ -535,7 +535,12 @@ func syncServiceForDB(db *sql.DB) *syncservice.Service {
 		PromptTextForStorage: promptTextForStorage,
 		AddCommas:            addCommas,
 	})
+	service.SetLogf(logf)
 	return service
+}
+
+func syncServiceForDB(db *sql.DB) *syncservice.Service {
+	return syncServiceForDBWithLogf(db, nil)
 }
 
 func insertRecords(db *sql.DB, records []Record, source string) {
@@ -972,6 +977,10 @@ func syncLogsToDB(db *sql.DB, logsDir, sessionDir string, force bool, source str
 	return syncServiceForDB(db).SyncLogsToDB(logsDir, sessionDir, force, source, minTime, maxTime)
 }
 
+func syncLogsToDBWithLogf(db *sql.DB, logsDir, sessionDir string, force bool, source string, minTime, maxTime *time.Time, logf func(format string, args ...interface{})) int {
+	return syncServiceForDBWithLogf(db, logf).SyncLogsToDB(logsDir, sessionDir, force, source, minTime, maxTime)
+}
+
 type codespaceInfo struct {
 	Name       string `json:"name"`
 	State      string `json:"state"`
@@ -1069,8 +1078,16 @@ func syncCodespacesToDBTick(db *sql.DB, includeStopped bool, force bool) (int, e
 	return syncServiceForDB(db).SyncCodespacesToDBTick(includeStopped, force)
 }
 
+func syncCodespacesToDBTickWithLogf(db *sql.DB, includeStopped bool, force bool, logf func(format string, args ...interface{})) (int, error) {
+	return syncServiceForDBWithLogf(db, logf).SyncCodespacesToDBTick(includeStopped, force)
+}
+
 func syncCodespacesToDB(db *sql.DB, includeStopped bool, force bool) int {
 	return syncServiceForDB(db).SyncCodespacesToDB(includeStopped, force)
+}
+
+func syncCodespacesToDBWithLogf(db *sql.DB, includeStopped bool, force bool, logf func(format string, args ...interface{})) int {
+	return syncServiceForDBWithLogf(db, logf).SyncCodespacesToDB(includeStopped, force)
 }
 
 func projectName(cwd string) string {
@@ -1400,6 +1417,7 @@ func runLegacyCLI() {
 	webCodespacesMode := flag.String("web-codespaces-mode", "auto", "Web mode Codespaces sync mode: manual|auto (default auto: background startup sync + periodic sync)")
 	webCodespacesStreaming := flag.Bool("web-codespaces-streaming", false, "Enable experimental codespaces streaming status from tail checkpoints")
 	webCodespacesInterval := flag.Duration("web-codespaces-interval", 5*time.Minute, "Web mode Codespaces periodic sync interval when mode=auto")
+	webLogMode := flag.String("web-log-mode", "compact", "Web mode stderr logging: compact|verbose|errors")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: copilot-token-cost [days] [--all] [--today] [--yesterday]\n")
@@ -1408,7 +1426,8 @@ func runLegacyCLI() {
 		fmt.Fprintf(os.Stderr, "                         [--codespaces-sync] [--codespaces-include-stopped]\n\n")
 		fmt.Fprintf(os.Stderr, "                         [--web] [--web-listen ADDR] [--web-refresh-interval DURATION]\n")
 		fmt.Fprintf(os.Stderr, "                         [--web-local-streaming] [--web-codespaces-mode manual|auto]\n")
-		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-streaming] [--web-codespaces-interval DURATION]\n\n")
+		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-streaming] [--web-codespaces-interval DURATION]\n")
+		fmt.Fprintf(os.Stderr, "                         [--web-log-mode compact|verbose|errors]\n\n")
 		fmt.Fprintf(os.Stderr, "Copilot CLI Token Cost Calculator\n\n")
 		fmt.Fprintf(os.Stderr, "Prompt text storage is always-on when prompt text is available; unavailable prompt text is stored as NULL.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
@@ -1429,12 +1448,18 @@ func runLegacyCLI() {
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-local-streaming  # enable experimental realtime local streaming\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-interval 15s  # near-continuous codespaces sync\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-streaming  # show experimental live streaming status\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-log-mode verbose  # keep line-by-line sync logs\n")
 	}
 	flag.Parse()
 
 	webCodespacesModeValue := strings.ToLower(strings.TrimSpace(*webCodespacesMode))
 	if webCodespacesModeValue != "manual" && webCodespacesModeValue != "auto" {
 		fmt.Fprintln(os.Stderr, "--web-codespaces-mode must be one of: manual, auto")
+		os.Exit(1)
+	}
+	webLogModeValue := normalizeWebLogMode(*webLogMode)
+	if webLogModeValue == "" {
+		fmt.Fprintln(os.Stderr, "--web-log-mode must be one of: compact, verbose, errors")
 		os.Exit(1)
 	}
 
@@ -1563,6 +1588,7 @@ func runLegacyCLI() {
 			CodespacesMode:           webCodespacesModeValue,
 			CodespacesStreaming:      *webCodespacesStreaming,
 			CodespacesInterval:       *webCodespacesInterval,
+			WebLogMode:               webLogModeValue,
 			CodespacesIncludeStopped: *codespacesIncludeStopped,
 			LogsDir:                  logsDir,
 			SessionDir:               sessionDir,

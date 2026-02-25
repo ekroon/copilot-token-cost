@@ -54,6 +54,7 @@ type Service struct {
 	storage *storage.Service
 	parser  *parsing.Service
 	runtime RuntimeDeps
+	logf    func(format string, args ...interface{})
 }
 
 func NewService(storageService *storage.Service, parser *parsing.Service) *Service {
@@ -67,6 +68,9 @@ func NewService(storageService *storage.Service, parser *parsing.Service) *Servi
 			NormalizeModel:       func(model string) string { return model },
 			PromptTextForStorage: func(*string) sql.NullString { return sql.NullString{} },
 			AddCommas:            func(s string) string { return s },
+		},
+		logf: func(format string, args ...interface{}) {
+			fmt.Fprintf(os.Stderr, format, args...)
 		},
 	}
 }
@@ -89,6 +93,27 @@ func (s *Service) SetRuntimeDeps(deps RuntimeDeps) {
 	}
 }
 
+func (s *Service) SetLogf(logf func(format string, args ...interface{})) {
+	if logf == nil {
+		s.logf = func(format string, args ...interface{}) {
+			fmt.Fprintf(os.Stderr, format, args...)
+		}
+		return
+	}
+	s.logf = logf
+}
+
+func (s *Service) log(format string, args ...interface{}) {
+	if s == nil {
+		return
+	}
+	if s.logf == nil {
+		fmt.Fprintf(os.Stderr, format, args...)
+		return
+	}
+	s.logf(format, args...)
+}
+
 func (s *Service) Refresh(ctx context.Context) error {
 	if s.storage == nil {
 		return nil
@@ -109,12 +134,12 @@ func (s *Service) SyncLogsToDB(logsDir, sessionDir string, force bool, source st
 	matches, _ := filepath.Glob(filepath.Join(logsDir, "process-*.log"))
 	sort.Strings(matches)
 	if len(matches) > 0 {
-		fmt.Fprintf(os.Stderr, "  🔎 Scanning %d log files (%s)\n", len(matches), source)
+		s.log("  🔎 Scanning %d log files (%s)\n", len(matches), source)
 	}
 
 	if force {
 		s.storage.DeleteParsedLogsBySource(source)
-		fmt.Fprintf(os.Stderr, "  🔄 Force re-sync (%s): re-parsing %d log files (keeping %s existing records)\n", source, len(matches), s.runtime.AddCommas(strconv.Itoa(existing)))
+		s.log("  🔄 Force re-sync (%s): re-parsing %d log files (keeping %s existing records)\n", source, len(matches), s.runtime.AddCommas(strconv.Itoa(existing)))
 	}
 
 	totalInserted := 0
@@ -172,7 +197,7 @@ func (s *Service) SyncLogsToDB(logsDir, sessionDir string, force bool, source st
 		totalInserted += len(records)
 		parsedCount++
 		if force {
-			fmt.Fprintf(os.Stderr, "  📄 [%d/%d] %s (%d records)\n", parsedCount, len(matches), filename, len(records))
+			s.log("  📄 [%d/%d] %s (%d records)\n", parsedCount, len(matches), filename, len(records))
 		}
 	}
 
@@ -193,14 +218,14 @@ func (s *Service) SyncLogsToDB(logsDir, sessionDir string, force bool, source st
 	if parsedCount > 0 {
 		totalNow := s.storage.CountAPICallsBySource(source)
 		newRecords := totalNow - existing
-		fmt.Fprintf(os.Stderr, "  ✅ Synced %d log files (%s): %s new records (%s total)\n", parsedCount, source, s.runtime.AddCommas(strconv.Itoa(newRecords)), s.runtime.AddCommas(strconv.Itoa(totalNow)))
+		s.log("  ✅ Synced %d log files (%s): %s new records (%s total)\n", parsedCount, source, s.runtime.AddCommas(strconv.Itoa(newRecords)), s.runtime.AddCommas(strconv.Itoa(totalNow)))
 	}
 
 	return totalInserted
 }
 
 func (s *Service) ListCodespaces(includeStopped bool) []CodespaceInfo {
-	fmt.Fprintf(os.Stderr, "  🔄 Codespaces: listing...\n")
+	s.log("  🔄 Codespaces: listing...\n")
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gh", "cs", "list", "--json", "name,state,lastUsedAt", "--limit", "1000")
@@ -208,15 +233,15 @@ func (s *Service) ListCodespaces(includeStopped bool) []CodespaceInfo {
 	out, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: listing timed out\n")
+			s.log("  ⚠️ Codespaces sync skipped: listing timed out\n")
 			return nil
 		}
-		fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: failed to list codespaces\n")
+		s.log("  ⚠️ Codespaces sync skipped: failed to list codespaces\n")
 		return nil
 	}
 	var all []CodespaceInfo
 	if err := json.Unmarshal(out, &all); err != nil {
-		fmt.Fprintf(os.Stderr, "  ⚠️ Codespaces sync skipped: invalid JSON from gh cs list\n")
+		s.log("  ⚠️ Codespaces sync skipped: invalid JSON from gh cs list\n")
 		return nil
 	}
 	allowed := map[string]bool{"Available": true}
@@ -229,7 +254,7 @@ func (s *Service) ListCodespaces(includeStopped bool) []CodespaceInfo {
 			filtered = append(filtered, cs)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "  📦 Codespaces: %d to sync\n", len(filtered))
+	s.log("  📦 Codespaces: %d to sync\n", len(filtered))
 	return filtered
 }
 
@@ -422,13 +447,13 @@ func (s *Service) CopyCodespaceData(cs CodespaceInfo, idx, total int, stoppedSta
 			stopCmd := exec.CommandContext(stopCtx, "gh", "cs", "stop", "-c", cs.Name)
 			stopCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
 			_ = stopCmd.Run()
-			fmt.Fprintf(os.Stderr, "  🛑 Stopping %s... (%.1fs)\n", cs.Name, time.Since(stopStart).Seconds())
+			s.log("  🛑 Stopping %s... (%.1fs)\n", cs.Name, time.Since(stopStart).Seconds())
 		}()
 	}
 
 	stage := filepath.Join(tmpDir, cs.Name)
 	_ = os.MkdirAll(stage, 0o755)
-	fmt.Fprintf(os.Stderr, "  📦 [%d/%d] Copying %s...\n", idx+1, total, cs.Name)
+	s.log("  📦 [%d/%d] Copying %s...\n", idx+1, total, cs.Name)
 	cpStart := time.Now()
 	cpCtx, cpCancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cpCancel()
@@ -439,12 +464,12 @@ func (s *Service) CopyCodespaceData(cs CodespaceInfo, idx, total int, stoppedSta
 		defer cleanupSSHConfig()
 	}
 	if sshBuildErr != nil {
-		fmt.Fprintf(os.Stderr, "  ℹ️ SSH reuse unavailable for %s: %v; using gh cs ssh directly\n", cs.Name, sshBuildErr)
+		s.log("  ℹ️ SSH reuse unavailable for %s: %v; using gh cs ssh directly\n", cs.Name, sshBuildErr)
 		sshTarCmd = exec.CommandContext(cpCtx, "gh", "cs", "ssh", "-c", cs.Name, "--",
 			"tar", "czf", "-", "-C", "/home/vscode", ".copilot/logs", ".copilot/session-state")
 		sshTarCmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
 	} else {
-		fmt.Fprintf(os.Stderr, "  🔐 SSH reuse enabled for %s (ControlPersist=15m)\n", cs.Name)
+		s.log("  🔐 SSH reuse enabled for %s (ControlPersist=15m)\n", cs.Name)
 	}
 	var sshErrBuf bytes.Buffer
 	sshTarCmd.Stderr = &sshErrBuf
@@ -460,17 +485,17 @@ func (s *Service) CopyCodespaceData(cs CodespaceInfo, idx, total int, stoppedSta
 				sshOK := sshWaitErr == nil || IsTarFileChangedWarning(sshWaitErr, sshErrBuf.String())
 				if sshOK && tarWaitErr == nil {
 					if sshWaitErr != nil {
-						fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs) (tar warned: file changed as we read it)\n", cs.Name, time.Since(cpStart).Seconds())
+						s.log("  ✅ Copied %s via ssh+tar (%.1fs) (tar warned: file changed as we read it)\n", cs.Name, time.Since(cpStart).Seconds())
 					} else {
-						fmt.Fprintf(os.Stderr, "  ✅ Copied %s via ssh+tar (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
+						s.log("  ✅ Copied %s via ssh+tar (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
 					}
 					copied = true
 				} else {
 					detail := FormatSshTarFailure(sshWaitErr, tarWaitErr, sshErrBuf.String(), tarErrBuf.String())
 					if detail != "" {
-						fmt.Fprintf(os.Stderr, "  ⚠️ ssh+tar failed for %s (%.1fs): %s; falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds(), detail)
+						s.log("  ⚠️ ssh+tar failed for %s (%.1fs): %s; falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds(), detail)
 					} else {
-						fmt.Fprintf(os.Stderr, "  ⚠️ ssh+tar failed for %s (%.1fs), falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds())
+						s.log("  ⚠️ ssh+tar failed for %s (%.1fs), falling back to gh cs cp\n", cs.Name, time.Since(cpStart).Seconds())
 					}
 				}
 			}
@@ -488,33 +513,33 @@ func (s *Service) CopyCodespaceData(cs CodespaceInfo, idx, total int, stoppedSta
 			cpCmd.Stderr = &cpErrBuf
 			cpErr := cpCmd.Run()
 			if cpErr == nil {
-				fmt.Fprintf(os.Stderr, "  ✅ Copied %s (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
+				s.log("  ✅ Copied %s (%.1fs)\n", cs.Name, time.Since(cpStart).Seconds())
 				copied = true
 				break
 			}
 			if cpCtx.Err() == context.DeadlineExceeded {
-				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out after %.1fs\n", cs.Name, time.Since(cpStart).Seconds())
+				s.log("  ⚠️ Failed to copy %s: timed out after %.1fs\n", cs.Name, time.Since(cpStart).Seconds())
 				return res
 			}
 			msg := strings.TrimSpace(cpErrBuf.String())
 			if IsCodespaceStartThrottleError(msg) && attempt < maxThrottleRetries {
 				wait := CodespaceThrottleBackoff(attempt)
-				fmt.Fprintf(os.Stderr, "  ⏳ Start throttled for %s, retrying copy in %.0fs (%d/%d)\n", cs.Name, wait.Seconds(), attempt+1, maxThrottleRetries)
+				s.log("  ⏳ Start throttled for %s, retrying copy in %.0fs (%d/%d)\n", cs.Name, wait.Seconds(), attempt+1, maxThrottleRetries)
 				select {
 				case <-time.After(wait):
 					continue
 				case <-cpCtx.Done():
-					fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: timed out while waiting to retry\n", cs.Name)
+					s.log("  ⚠️ Failed to copy %s: timed out while waiting to retry\n", cs.Name)
 					return res
 				}
 			}
 			if strings.Contains(msg, "No such file or directory") {
-				fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
+				s.log("  ⚠️ Skipping %s: /home/vscode/.copilot not found\n", cs.Name)
 			} else {
 				if msg == "" {
 					msg = "gh cs cp failed"
 				}
-				fmt.Fprintf(os.Stderr, "  ⚠️ Failed to copy %s: %s (%.1fs)\n", cs.Name, msg, time.Since(cpStart).Seconds())
+				s.log("  ⚠️ Failed to copy %s: %s (%.1fs)\n", cs.Name, msg, time.Since(cpStart).Seconds())
 			}
 			return res
 		}
@@ -533,12 +558,12 @@ func (s *Service) CopyCodespaceData(cs CodespaceInfo, idx, total int, stoppedSta
 	logsDir := filepath.Join(copilotDir, "logs")
 	sessionDir := filepath.Join(copilotDir, "session-state")
 	if _, err := os.Stat(logsDir); err != nil {
-		fmt.Fprintf(os.Stderr, "  ⚠️ Skipping %s: no .copilot/logs in copied data\n", cs.Name)
+		s.log("  ⚠️ Skipping %s: no .copilot/logs in copied data\n", cs.Name)
 		return res
 	}
 
 	fileCount, totalBytes := DirStats(logsDir)
-	fmt.Fprintf(os.Stderr, "  📊 %s: %d log files, %s copied\n", cs.Name, fileCount, HumanSize(totalBytes))
+	s.log("  📊 %s: %d log files, %s copied\n", cs.Name, fileCount, HumanSize(totalBytes))
 
 	res.LogsDir = logsDir
 	res.SessionDir = sessionDir
@@ -616,7 +641,7 @@ func (s *Service) SyncCodespacesToDBTick(includeStopped bool, force bool) (int, 
 	var pending []CodespaceInfo
 	for _, cs := range codespaces {
 		if cs.State != "Available" && cs.LastUsedAt != "" && s.storage.GetCodespaceLastUsed(cs.Name) == cs.LastUsedAt {
-			fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s (shutdown, unchanged lastUsedAt)\n", cs.Name)
+			s.log("  ⏭️  Skipping %s (shutdown, unchanged lastUsedAt)\n", cs.Name)
 			continue
 		}
 		if !force && cs.State != "Available" {
@@ -633,7 +658,7 @@ func (s *Service) SyncCodespacesToDBTick(includeStopped bool, force bool) (int, 
 						}
 					}
 					if allKnown {
-						fmt.Fprintf(os.Stderr, "  ⏭️  Skipping %s copy: all %d log files already synced\n", cs.Name, len(remoteFiles))
+						s.log("  ⏭️  Skipping %s copy: all %d log files already synced\n", cs.Name, len(remoteFiles))
 						continue
 					}
 				}
@@ -654,11 +679,11 @@ func (s *Service) SyncCodespacesToDBTick(includeStopped bool, force bool) (int, 
 	var stoppedStartLimiter chan struct{}
 	if stoppedPending > 0 {
 		stoppedStartLimiter = make(chan struct{}, 1)
-		fmt.Fprintf(os.Stderr, "  🧯 Stopped Codespaces startup parallelism: 1 (%d stopped)\n", stoppedPending)
+		s.log("  🧯 Stopped Codespaces startup parallelism: 1 (%d stopped)\n", stoppedPending)
 	}
 
 	workers := 4
-	fmt.Fprintf(os.Stderr, "  🚚 Codespaces copy parallelism: %d workers (%d pending)\n", workers, len(pending))
+	s.log("  🚚 Codespaces copy parallelism: %d workers (%d pending)\n", workers, len(pending))
 	jobs := make(chan int, len(pending))
 	results := make(chan CodespaceCopyResult, len(pending))
 	for w := 0; w < workers; w++ {

@@ -2,6 +2,7 @@ package main
 
 import (
 	httplayer "copilot-token-cost/internal/http"
+	"copilot-token-cost/internal/termstatus"
 	webstack "copilot-token-cost/internal/web"
 	"crypto/sha256"
 	"database/sql"
@@ -28,6 +29,7 @@ type webModeConfig struct {
 	ListenAddress            string
 	RefreshInterval          time.Duration
 	CodespacesMode           string
+	WebLogMode               string
 	CodespacesStreaming      bool
 	LocalStreaming           bool
 	CodespacesInterval       time.Duration
@@ -55,6 +57,7 @@ type webState struct {
 	localStreaming           bool
 	codespacesMode           string
 	codespacesStreaming      bool
+	webLogMode               string
 	codespacesIncludeStopped bool
 	localRefreshInterval     time.Duration
 	localNextRefreshAt       time.Time
@@ -78,6 +81,7 @@ type webState struct {
 	stopCh        chan struct{}
 	loopsWG       sync.WaitGroup
 	closeOnce     sync.Once
+	logRenderer   *termstatus.Renderer
 }
 
 type localLogState struct {
@@ -117,6 +121,10 @@ const (
 
 	defaultWebCodespacesInterval = 5 * time.Minute
 	maxWebCodespacesRetryBackoff = 30 * time.Minute
+
+	webLogModeCompact = termstatus.ModeCompact
+	webLogModeVerbose = termstatus.ModeVerbose
+	webLogModeErrors  = termstatus.ModeErrors
 )
 
 var webEventsHeartbeatInterval = 25 * time.Second
@@ -164,6 +172,10 @@ func normalizeCodespacesInterval(interval time.Duration) time.Duration {
 	return interval
 }
 
+func normalizeWebLogMode(mode string) string {
+	return termstatus.NormalizeMode(mode)
+}
+
 func computeCodespacesRetryCap(interval time.Duration) time.Duration {
 	base := normalizeCodespacesInterval(interval)
 	capDuration := base * 6
@@ -194,6 +206,10 @@ func newWebState(cfg webModeConfig) (*webState, error) {
 	if mode == "" {
 		mode = "auto"
 	}
+	logMode := normalizeWebLogMode(cfg.WebLogMode)
+	if logMode == "" {
+		logMode = webLogModeCompact
+	}
 	codespacesInterval := time.Duration(0)
 	codespacesReason := webSyncReasonManualMode
 	if mode == "auto" {
@@ -212,6 +228,7 @@ func newWebState(cfg webModeConfig) (*webState, error) {
 		syncTo:                   cfg.SyncTo,
 		localStreaming:           cfg.LocalStreaming,
 		codespacesMode:           mode,
+		webLogMode:               logMode,
 		codespacesStreaming:      cfg.CodespacesStreaming,
 		codespacesIncludeStopped: cfg.CodespacesIncludeStopped,
 		localRefreshInterval:     cfg.RefreshInterval,
@@ -232,6 +249,9 @@ func (s *webState) close() {
 			close(s.stopCh)
 		}
 		s.loopsWG.Wait()
+		if s.logRenderer != nil {
+			s.logRenderer.Close()
+		}
 		s.closeSubscribers()
 		if s.db != nil {
 			_ = s.db.Close()
@@ -337,6 +357,160 @@ func (s *webState) setCodespacesRefreshSchedule(interval time.Duration, next tim
 	s.snapshotMu.Unlock()
 }
 
+func stderrIsTerminal() bool {
+	info, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func (s *webState) ensureLogRenderer() *termstatus.Renderer {
+	if s == nil {
+		return nil
+	}
+	if s.logRenderer == nil {
+		mode := normalizeWebLogMode(s.webLogMode)
+		if mode == "" {
+			mode = webLogModeCompact
+		}
+		s.logRenderer = termstatus.New(os.Stderr, mode, stderrIsTerminal())
+	}
+	return s.logRenderer
+}
+
+func (s *webState) logProgressf(format string, args ...interface{}) {
+	if renderer := s.ensureLogRenderer(); renderer != nil {
+		renderer.Progressf(format, args...)
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func (s *webState) logInfof(format string, args ...interface{}) {
+	if renderer := s.ensureLogRenderer(); renderer != nil {
+		renderer.Infof(format, args...)
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func (s *webState) logErrorf(format string, args ...interface{}) {
+	if renderer := s.ensureLogRenderer(); renderer != nil {
+		renderer.Errorf(format, args...)
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func isSyncErrorLogLine(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(message, "⚠️") ||
+		strings.Contains(lower, "failed") ||
+		strings.Contains(lower, "error") ||
+		strings.Contains(lower, "timed out")
+}
+
+func (s *webState) syncLogf(format string, args ...interface{}) {
+	message := strings.TrimSpace(fmt.Sprintf(format, args...))
+	if message == "" {
+		return
+	}
+	switch s.webLogMode {
+	case webLogModeVerbose:
+		s.logInfof("%s", message)
+	case webLogModeErrors:
+		if isSyncErrorLogLine(message) {
+			s.logErrorf("%s", message)
+		}
+	default:
+		if isSyncErrorLogLine(message) {
+			s.logErrorf("%s", message)
+			s.repaintCompactStatusLine(time.Now())
+			return
+		}
+		return
+	}
+}
+
+func trimSyncReason(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if len(reason) > 28 {
+		return reason[:28] + "..."
+	}
+	return reason
+}
+
+func isStreamingSyncReason(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	return strings.HasPrefix(reason, webSyncReasonLocalStreaming) ||
+		strings.HasPrefix(reason, webSyncReasonCodespacesStreaming)
+}
+
+func shouldShowNextCountdown(status syncSourceStatus) bool {
+	return !isStreamingSyncReason(status.Reason)
+}
+
+func compactHeartbeat(now time.Time) string {
+	return now.Format("15:04:05")
+}
+
+func (s *webState) repaintCompactStatusLine(now time.Time) {
+	if s.webLogMode != webLogModeCompact {
+		return
+	}
+	s.logProgressf("%s", s.consoleStatusLine(now))
+}
+
+func (s *webState) consoleStatusLine(now time.Time) string {
+	s.snapshotMu.RLock()
+	localStatus := s.syncStatus["local"]
+	codespacesStatus := s.syncStatus["codespaces"]
+	localNext := s.localNextRefreshAt
+	codespacesNext := s.codespacesNextRefreshAt
+	s.snapshotMu.RUnlock()
+	localCountdown := ""
+	if shouldShowNextCountdown(localStatus) && !localNext.IsZero() && localNext.After(now) {
+		localCountdown = formatRefreshCountdown(localNext.Sub(now))
+	}
+	codespacesCountdown := ""
+	if shouldShowNextCountdown(codespacesStatus) && !codespacesNext.IsZero() && codespacesNext.After(now) {
+		codespacesCountdown = formatRefreshCountdown(codespacesNext.Sub(now))
+	}
+	localPart := fmt.Sprintf("local=%s:%s", localStatus.Code, trimSyncReason(localStatus.Reason))
+	if localCountdown != "" {
+		localPart += " next=" + localCountdown
+	}
+	codespacesPart := fmt.Sprintf("codespaces=%s:%s", codespacesStatus.Code, trimSyncReason(codespacesStatus.Reason))
+	if codespacesCountdown != "" {
+		codespacesPart += " next=" + codespacesCountdown
+	}
+	return "web status hb=" + compactHeartbeat(now) + " " + localPart + " | " + codespacesPart
+}
+
+func (s *webState) startConsoleStatusLoop(interval time.Duration) {
+	if s.webLogMode != webLogModeCompact {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	s.loopsWG.Add(1)
+	go func() {
+		defer s.loopsWG.Done()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stopCh:
+				return
+			case tick := <-ticker.C:
+				s.logProgressf("%s", s.consoleStatusLine(tick))
+			}
+		}
+	}()
+}
+
 func (s *webState) setSyncStatus(source, code, reason string) {
 	if strings.TrimSpace(source) == "" {
 		source = "unknown"
@@ -362,7 +536,7 @@ func (s *webState) setSyncStatus(source, code, reason string) {
 	}
 	patch, err := s.buildDashboardPatch(payload, time.Now())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "web sync status patch build failed: %v\n", err)
+		s.logErrorf("web sync status patch build failed: %v", err)
 		return
 	}
 	s.broadcast(patch)
@@ -397,7 +571,7 @@ func (s *webState) rebuildSnapshot() {
 
 	patch, err := s.buildDashboardPatch(payload, time.Now())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "web snapshot patch build failed: %v\n", err)
+		s.logErrorf("web snapshot patch build failed: %v", err)
 		return
 	}
 	s.broadcast(patch)
@@ -452,7 +626,7 @@ func (s *webState) refreshLocalSnapshotWithForce(force bool) error {
 			message: statusReason,
 		}
 	} else {
-		syncLogsToDB(s.db, logsDir, s.sessionDir, force, "local", s.syncFrom, s.syncTo)
+		syncLogsToDBWithLogf(s.db, logsDir, s.sessionDir, force, "local", s.syncFrom, s.syncTo, s.syncLogf)
 		s.setSyncStatus("local", webSyncCodeOK, webSyncReasonLocalSyncCompleted)
 	}
 
@@ -499,7 +673,7 @@ func (s *webState) syncCodespacesSnapshotWithMode(requireManual bool) error {
 			message: statusReason,
 		}
 	}
-	total, err := syncCodespacesToDBTick(s.db, s.codespacesIncludeStopped, false)
+	total, err := syncCodespacesToDBTickWithLogf(s.db, s.codespacesIncludeStopped, false, s.syncLogf)
 	if err != nil {
 		statusCode, statusReason := s.classifyCodespacesSyncFailure(err, !requireManual)
 		s.setSyncStatus("codespaces", statusCode, statusReason)
@@ -931,8 +1105,8 @@ func (s *webState) startCodespacesAutoSyncLoop(interval time.Duration) {
 				return
 			case tick := <-ticker.C:
 				s.setCodespacesRefreshSchedule(cadence, tick.Add(cadence))
-				fmt.Fprintf(os.Stderr, "web codespaces auto sync tick: running scheduled sync (interval=%s)\n", cadence)
-				go runScheduledSync(s.syncCodespacesSnapshotAuto, "web codespaces auto sync failed")
+				s.logProgressf("web codespaces auto sync tick: running scheduled sync (interval=%s)", cadence)
+				go runScheduledSync(s.syncCodespacesSnapshotAuto, s.logErrorf, "web codespaces auto sync failed")
 			}
 		}
 	}()
@@ -940,7 +1114,7 @@ func (s *webState) startCodespacesAutoSyncLoop(interval time.Duration) {
 
 func (s *webState) startCodespacesAutoSync(interval time.Duration) {
 	if err := s.syncCodespacesSnapshotAuto(); err != nil {
-		fmt.Fprintf(os.Stderr, "web codespaces auto sync failed: %v\n", err)
+		s.logErrorf("web codespaces auto sync failed: %v", err)
 	}
 	s.startCodespacesAutoSyncLoop(interval)
 }
@@ -953,14 +1127,18 @@ func isSyncInProgressError(err error) bool {
 	return errors.As(err, &actionErr) && actionErr.reason == webSyncReasonInProgress
 }
 
-func runScheduledSync(syncFn func() error, logPrefix string) {
+func runScheduledSync(syncFn func() error, onError func(format string, args ...interface{}), logPrefix string) {
 	if err := syncFn(); err != nil && !isSyncInProgressError(err) {
+		if onError != nil {
+			onError("%s: %v", logPrefix, err)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "%s: %v\n", logPrefix, err)
 	}
 }
 
 func (s *webState) runStartupSync(source string, syncFn func() error) {
-	fmt.Fprintf(os.Stderr, "web startup %s sync started\n", source)
+	s.logInfof("web startup %s sync started", source)
 	for {
 		err := syncFn()
 		if err == nil {
@@ -968,17 +1146,17 @@ func (s *webState) runStartupSync(source string, syncFn func() error) {
 			status, hasStatus := s.syncStatus[source]
 			s.snapshotMu.RUnlock()
 			if hasStatus && status.Code == webSyncCodeSkipped {
-				fmt.Fprintf(os.Stderr, "web startup %s sync skipped: %s\n", source, status.Reason)
+				s.logInfof("web startup %s sync skipped: %s", source, status.Reason)
 				return
 			}
-			fmt.Fprintf(os.Stderr, "web startup %s sync completed\n", source)
+			s.logInfof("web startup %s sync completed", source)
 			return
 		}
 		if isSyncInProgressError(err) {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		fmt.Fprintf(os.Stderr, "web startup %s sync failed: %v\n", source, err)
+		s.logErrorf("web startup %s sync failed: %v", source, err)
 		return
 	}
 }
@@ -3048,7 +3226,7 @@ func newWebMux(state *webState) *http.ServeMux {
 		HeartbeatInterval: webEventsHeartbeatInterval,
 		IndicatorInterval: webIndicatorRefreshInterval,
 		Logf: func(format string, args ...interface{}) {
-			fmt.Fprintf(os.Stderr, format, args...)
+			state.logErrorf(format, args...)
 		},
 	})
 }
@@ -3062,6 +3240,7 @@ func runWebMode(cfg webModeConfig) error {
 	if err != nil {
 		return err
 	}
+	state.logRenderer = termstatus.New(os.Stderr, state.webLogMode, stderrIsTerminal())
 	defer state.close()
 
 	if cfg.LocalStreaming {
@@ -3079,7 +3258,7 @@ func runWebMode(cfg webModeConfig) error {
 					return
 				case tick := <-ticker.C:
 					state.setLocalRefreshSchedule(cfg.RefreshInterval, tick.Add(cfg.RefreshInterval))
-					go runScheduledSync(state.refreshLocalSnapshot, "web refresh tick failed")
+					go runScheduledSync(state.refreshLocalSnapshot, state.logErrorf, "web refresh tick failed")
 				}
 			}
 		}()
@@ -3103,6 +3282,7 @@ func runWebMode(cfg webModeConfig) error {
 			}
 		}()
 	}
+	state.startConsoleStatusLoop(time.Second)
 	mux := newWebMux(state)
 
 	server := &http.Server{
@@ -3114,10 +3294,10 @@ func runWebMode(cfg webModeConfig) error {
 		return fmt.Errorf("web listen failed: %w", err)
 	}
 	defer func() { _ = listener.Close() }()
-	fmt.Fprintf(os.Stderr, "Web mode listening on http://%s\n", cfg.ListenAddress)
-	fmt.Fprintln(os.Stderr, "Web startup handoff: serving initial snapshot from existing DB state; initial local/codespaces sync running in background")
+	state.logInfof("Web mode listening on http://%s", cfg.ListenAddress)
+	state.logInfof("Web startup handoff: serving initial snapshot from existing DB state; initial local/codespaces sync running in background")
 	if strings.EqualFold(strings.TrimSpace(cfg.CodespacesMode), "auto") {
-		fmt.Fprintln(os.Stderr, "Web codespaces auto-sync runs on a timer and reuses SSH control connections when possible (ControlPersist=15m); if prompts still repeat, increase --web-codespaces-interval or use --web-codespaces-mode manual.")
+		state.logInfof("Web codespaces auto-sync runs on a timer and reuses SSH control connections when possible (ControlPersist=15m); if prompts still repeat, increase --web-codespaces-interval or use --web-codespaces-mode manual.")
 	}
 	state.startStartupSync(cfg.CodespacesInterval)
 	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {

@@ -156,6 +156,103 @@ func TestNewWebStateCodespacesModeDefaultsAndExplicitManual(t *testing.T) {
 	}
 }
 
+func TestNormalizeWebLogMode(t *testing.T) {
+	cases := []struct {
+		mode string
+		want string
+	}{
+		{mode: "", want: webLogModeCompact},
+		{mode: "compact", want: webLogModeCompact},
+		{mode: "verbose", want: webLogModeVerbose},
+		{mode: "errors", want: webLogModeErrors},
+		{mode: "invalid", want: ""},
+	}
+	for _, tc := range cases {
+		if got := normalizeWebLogMode(tc.mode); got != tc.want {
+			t.Fatalf("normalizeWebLogMode(%q)=%q, want=%q", tc.mode, got, tc.want)
+		}
+	}
+}
+
+func TestSyncLogfErrorsModeSuppressesProgress(t *testing.T) {
+	state := &webState{webLogMode: webLogModeErrors}
+	logs := captureStderr(t, func() {
+		state.syncLogf("  🔎 Scanning %d log files (%s)\n", 2, "local")
+		state.syncLogf("  ⚠️ Codespaces sync skipped: failed to list codespaces\n")
+		if state.logRenderer != nil {
+			state.logRenderer.Close()
+		}
+	})
+	if strings.Contains(logs, "Scanning") {
+		t.Fatalf("errors mode should suppress progress logs: %q", logs)
+	}
+	if !strings.Contains(logs, "Codespaces sync skipped: failed to list codespaces") {
+		t.Fatalf("errors mode should keep warning/error logs: %q", logs)
+	}
+}
+
+func TestSyncLogfCompactSuppressesProgressChatter(t *testing.T) {
+	state := &webState{webLogMode: webLogModeCompact}
+	logs := captureStderr(t, func() {
+		state.syncLogf("  ✅ Synced %d log files (%s): %d new records (%d total)\n", 2, "local", 10, 20)
+		if state.logRenderer != nil {
+			state.logRenderer.Close()
+		}
+	})
+	if strings.Contains(logs, "Synced") {
+		t.Fatalf("compact mode should not print success progress chatter: %q", logs)
+	}
+}
+
+func TestConsoleStatusLineHidesNextForStreamingReasons(t *testing.T) {
+	now := time.Date(2026, time.February, 25, 11, 18, 0, 0, time.UTC)
+	state := &webState{
+		syncStatus: map[string]syncSourceStatus{
+			"local": {
+				Code:   webSyncCodeOK,
+				Reason: webSyncReasonLocalStreaming + " watching=3",
+			},
+			"codespaces": {
+				Code:   webSyncCodeOK,
+				Reason: webSyncReasonCodespacesStreaming + " active_streams=2",
+			},
+		},
+		localNextRefreshAt:      now.Add(30 * time.Second),
+		codespacesNextRefreshAt: now.Add(5 * time.Minute),
+	}
+
+	line := state.consoleStatusLine(now)
+	if strings.Contains(line, "next=") {
+		t.Fatalf("streaming status line should hide next countdown, got: %q", line)
+	}
+	if !strings.Contains(line, "hb=11:18:00") {
+		t.Fatalf("status line missing heartbeat marker: %q", line)
+	}
+}
+
+func TestConsoleStatusLineShowsNextForScheduledReasons(t *testing.T) {
+	now := time.Date(2026, time.February, 25, 11, 18, 0, 0, time.UTC)
+	state := &webState{
+		syncStatus: map[string]syncSourceStatus{
+			"local": {
+				Code:   webSyncCodeOK,
+				Reason: webSyncReasonLocalSyncCompleted,
+			},
+			"codespaces": {
+				Code:   webSyncCodeSkipped,
+				Reason: webSyncReasonAutoMode,
+			},
+		},
+		localNextRefreshAt:      now.Add(30 * time.Second),
+		codespacesNextRefreshAt: now.Add(5 * time.Minute),
+	}
+
+	line := state.consoleStatusLine(now)
+	if !strings.Contains(line, "next=") {
+		t.Fatalf("scheduled status line should include next countdown, got: %q", line)
+	}
+}
+
 func TestStartStartupSyncDoesNotBlockAndTriggersImmediateBackgroundSyncs(t *testing.T) {
 	state := &webState{codespacesMode: "auto"}
 
