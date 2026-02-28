@@ -542,12 +542,32 @@ func (s *webState) setSyncStatus(source, code, reason string) {
 	s.broadcast(patch)
 }
 
+func (s *webState) setSyncStatusQuiet(source, code, reason string) {
+	if strings.TrimSpace(source) == "" {
+		source = "unknown"
+	}
+	if strings.TrimSpace(code) == "" {
+		code = webSyncCodeError
+	}
+	status := newSyncSourceStatus(code, reason)
+
+	s.snapshotMu.Lock()
+	if s.syncStatus == nil {
+		s.syncStatus = make(map[string]syncSourceStatus)
+	}
+	s.syncStatus[source] = status
+	if s.hasData {
+		s.snapshot.SyncStatus = cloneSyncStatus(s.syncStatus)
+	}
+	s.snapshotMu.Unlock()
+}
+
 func (s *webState) beginSyncAction(source string) error {
 	if s.refreshMu.TryLock() {
-		s.setSyncStatus(source, webSyncCodeSkipped, webSyncReasonInProgress)
+		s.setSyncStatusQuiet(source, webSyncCodeSkipped, webSyncReasonInProgress)
 		return nil
 	}
-	s.setSyncStatus(source, webSyncCodeSkipped, webSyncReasonInProgress)
+	s.setSyncStatusQuiet(source, webSyncCodeSkipped, webSyncReasonInProgress)
 	return &webActionError{
 		status:  http.StatusConflict,
 		reason:  webSyncReasonInProgress,

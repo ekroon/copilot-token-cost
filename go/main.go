@@ -27,6 +27,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type dbQuerier interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
 // ─── API Pricing (per 1M tokens) ────────────────────────────────────────────
 
 type Pricing = costing.Pricing
@@ -598,14 +603,14 @@ type dbModelStats struct {
 	UserTurns           int
 }
 
-func queryModelStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[string]*dbModelStats {
+func queryModelStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]*dbModelStats {
 	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	q := "SELECT model_normalized, COUNT(*) AS api_calls, " +
+	query := "SELECT model_normalized, COUNT(*) AS api_calls, " +
 		"SUM(prompt_tokens), SUM(completion_tokens), " +
 		"SUM(cache_creation_tokens), SUM(cache_read_tokens), " +
 		"SUM(CASE WHEN is_user_turn = 1 THEN 1 ELSE 0 END) " +
 		"FROM api_calls a" + where + " GROUP BY model_normalized"
-	rows, err := db.Query(q, params...)
+	rows, err := q.Query(query, params...)
 	if err != nil {
 		return nil
 	}
@@ -621,14 +626,14 @@ func queryModelStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[str
 	return result
 }
 
-func queryDailyStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[string]map[string]*dbModelStats {
+func queryDailyStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]map[string]*dbModelStats {
 	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	q := "SELECT substr(a.timestamp, 1, 10) AS day, model_normalized, " +
+	query := "SELECT substr(a.timestamp, 1, 10) AS day, model_normalized, " +
 		"COUNT(*) AS api_calls, SUM(prompt_tokens), SUM(completion_tokens), " +
 		"SUM(cache_creation_tokens), SUM(cache_read_tokens), " +
 		"SUM(CASE WHEN is_user_turn = 1 THEN 1 ELSE 0 END) " +
 		"FROM api_calls a" + where + " GROUP BY day, model_normalized"
-	rows, err := db.Query(q, params...)
+	rows, err := q.Query(query, params...)
 	if err != nil {
 		return nil
 	}
@@ -650,15 +655,15 @@ func queryDailyStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[str
 	return result
 }
 
-func queryProjectStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[string]*dbModelStats {
+func queryProjectStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]*dbModelStats {
 	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	q := "SELECT COALESCE(sw.cwd, '') AS cwd, COUNT(*) AS api_calls, " +
+	query := "SELECT COALESCE(sw.cwd, '') AS cwd, COUNT(*) AS api_calls, " +
 		"SUM(a.prompt_tokens), SUM(a.completion_tokens), " +
 		"SUM(a.cache_creation_tokens), SUM(a.cache_read_tokens), " +
 		"SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) " +
 		"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id AND a.source = sw.source" + where +
 		" GROUP BY cwd"
-	rows, err := db.Query(q, params...)
+	rows, err := q.Query(query, params...)
 	if err != nil {
 		return nil
 	}
@@ -674,15 +679,15 @@ func queryProjectStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[s
 	return result
 }
 
-func queryProjectModelStats(db *sql.DB, dateFrom, dateTo, projectFilter string) map[string]map[string]*dbModelStats {
+func queryProjectModelStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]map[string]*dbModelStats {
 	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	q := "SELECT COALESCE(sw.cwd, '') AS cwd, a.model_normalized, COUNT(*) AS api_calls, " +
+	query := "SELECT COALESCE(sw.cwd, '') AS cwd, a.model_normalized, COUNT(*) AS api_calls, " +
 		"SUM(a.prompt_tokens), SUM(a.completion_tokens), " +
 		"SUM(a.cache_creation_tokens), SUM(a.cache_read_tokens), " +
 		"SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) " +
 		"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id AND a.source = sw.source" + where +
 		" GROUP BY cwd, a.model_normalized"
-	rows, err := db.Query(q, params...)
+	rows, err := q.Query(query, params...)
 	if err != nil {
 		return nil
 	}
@@ -701,12 +706,12 @@ func queryProjectModelStats(db *sql.DB, dateFrom, dateTo, projectFilter string) 
 	return result
 }
 
-func queryRecords(db *sql.DB, dateFrom, dateTo, projectFilter string) []Record {
+func queryRecords(q dbQuerier, dateFrom, dateTo, projectFilter string) []Record {
 	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	q := "SELECT model, model_normalized, prompt_tokens, completion_tokens, " +
+	query := "SELECT model, model_normalized, prompt_tokens, completion_tokens, " +
 		"cache_creation_tokens, cache_read_tokens, is_user_turn, " +
 		"timestamp, session_id, log_file, source FROM api_calls a" + where
-	rows, err := db.Query(q, params...)
+	rows, err := q.Query(query, params...)
 	if err != nil {
 		return nil
 	}
@@ -738,12 +743,12 @@ func queryRecords(db *sql.DB, dateFrom, dateTo, projectFilter string) []Record {
 	return records
 }
 
-func querySessionWorkspaces(db *sql.DB) map[string]workspaceMeta {
+func querySessionWorkspaces(q dbQuerier, hasBranch bool) map[string]workspaceMeta {
 	branchExpr := "NULL"
-	if sessionWorkspaceColumns(db, "")["branch"] {
+	if hasBranch {
 		branchExpr = "branch"
 	}
-	rows, err := db.Query("SELECT session_id, cwd, source, " + branchExpr + " FROM session_workspaces")
+	rows, err := q.Query("SELECT session_id, cwd, source, " + branchExpr + " FROM session_workspaces")
 	if err != nil {
 		return nil
 	}
@@ -762,11 +767,11 @@ func querySessionWorkspaces(db *sql.DB) map[string]workspaceMeta {
 	return result
 }
 
-func queryLogFileCount(db *sql.DB, dateFrom, dateTo, projectFilter string) int {
+func queryLogFileCount(q dbQuerier, dateFrom, dateTo, projectFilter string) int {
 	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	q := "SELECT COUNT(DISTINCT log_file) FROM api_calls a" + where
+	query := "SELECT COUNT(DISTINCT log_file) FROM api_calls a" + where
 	var count int
-	db.QueryRow(q, params...).Scan(&count)
+	q.QueryRow(query, params...).Scan(&count)
 	return count
 }
 

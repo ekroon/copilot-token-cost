@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sort"
@@ -537,16 +538,25 @@ func countTotalRecords(modelStats map[string]*Stats) int {
 }
 
 func loadAggregatedStats(db *sql.DB, dateFrom, dateTo, projectFilter string) aggregatedStats {
-	dailyStats := buildDailyStatsMap(queryDailyStats(db, dateFrom, dateTo, projectFilter))
-	modelStats := buildModelStatsMap(queryModelStats(db, dateFrom, dateTo, projectFilter), dailyStats)
+	hasBranch := sessionWorkspaceColumns(db, "")["branch"]
+
+	var q dbQuerier = db
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err == nil {
+		q = tx
+		defer tx.Rollback()
+	}
+
+	dailyStats := buildDailyStatsMap(queryDailyStats(q, dateFrom, dateTo, projectFilter))
+	modelStats := buildModelStatsMap(queryModelStats(q, dateFrom, dateTo, projectFilter), dailyStats)
 	return aggregatedStats{
 		DailyStats:        dailyStats,
 		ModelStats:        modelStats,
-		ProjectStats:      buildProjectStatsMap(queryProjectStats(db, dateFrom, dateTo, projectFilter)),
-		ProjectModelStats: buildProjectModelStatsMap(queryProjectModelStats(db, dateFrom, dateTo, projectFilter)),
-		Records:           queryRecords(db, dateFrom, dateTo, projectFilter),
-		SessionWorkspaces: querySessionWorkspaces(db),
+		ProjectStats:      buildProjectStatsMap(queryProjectStats(q, dateFrom, dateTo, projectFilter)),
+		ProjectModelStats: buildProjectModelStatsMap(queryProjectModelStats(q, dateFrom, dateTo, projectFilter)),
+		Records:           queryRecords(q, dateFrom, dateTo, projectFilter),
+		SessionWorkspaces: querySessionWorkspaces(q, hasBranch),
 		TotalRecords:      countTotalRecords(modelStats),
-		LogFileCount:      queryLogFileCount(db, dateFrom, dateTo, projectFilter),
+		LogFileCount:      queryLogFileCount(q, dateFrom, dateTo, projectFilter),
 	}
 }

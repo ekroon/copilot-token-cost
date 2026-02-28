@@ -167,7 +167,7 @@ func TestExportImportJSONL(t *testing.T) {
 	if len(records) != 1 || records[0].Source != "local" {
 		t.Fatalf("unexpected imported records: %#v", records)
 	}
-	ws := querySessionWorkspaces(dstDB)
+	ws := querySessionWorkspaces(dstDB, true)
 	if ws["local\x1fsx"].CWD != "/proj/export" || ws["local\x1fsx"].Branch != "feature/export" {
 		t.Fatalf("unexpected workspace map: %#v", ws)
 	}
@@ -187,7 +187,7 @@ func TestExportImportJSONL(t *testing.T) {
 	if len(overrideRecords) != 1 || overrideRecords[0].Source != "codespace:unit" {
 		t.Fatalf("unexpected override records: %#v", overrideRecords)
 	}
-	overrideWS := querySessionWorkspaces(overrideDB)
+	overrideWS := querySessionWorkspaces(overrideDB, true)
 	if overrideWS["codespace:unit\x1fsx"].CWD != "/proj/export" || overrideWS["codespace:unit\x1fsx"].Branch != "feature/export" {
 		t.Fatalf("unexpected override workspaces: %#v", overrideWS)
 	}
@@ -270,7 +270,7 @@ func TestImportSQLiteDBWithOverride(t *testing.T) {
 	if len(records) != 1 || records[0].Source != "remote" {
 		t.Fatalf("unexpected imported records: %#v", records)
 	}
-	ws := querySessionWorkspaces(targetDB)
+	ws := querySessionWorkspaces(targetDB, true)
 	if ws["remote\x1fs-import"].CWD != "/proj/import" || ws["remote\x1fs-import"].Branch != "feature/import" {
 		t.Fatalf("unexpected imported workspaces: %#v", ws)
 	}
@@ -420,7 +420,7 @@ DROP TABLE session_workspaces_with_branch;
 	targetDB, _ := newTempDBForDBQuery(t, "target-no-branch.db")
 	_ = importSQLiteDB(targetDB, importPath, "")
 
-	ws := querySessionWorkspaces(targetDB)
+	ws := querySessionWorkspaces(targetDB, true)
 	if ws["local\x1flegacy-import"].CWD != "/proj/legacy-import" {
 		t.Fatalf("unexpected imported legacy workspace map: %#v", ws)
 	}
