@@ -107,15 +107,8 @@ func GetPricing(periods []PricingPeriod, model string, timestamp string) *Pricin
 		return nil
 	}
 	n := NormalizeModel(model)
-	mp := period.ModelPricing
-	if p, ok := mp[n]; ok {
+	if p, ok := period.ModelPricing[n]; ok {
 		return &p
-	}
-	for key, p := range mp {
-		if strings.HasPrefix(n, key) || strings.HasPrefix(key, n) {
-			cp := p
-			return &cp
-		}
 	}
 	return nil
 }
@@ -126,14 +119,8 @@ func GetPremiumMultiplier(periods []PricingPeriod, model string, timestamp strin
 		return 1
 	}
 	n := NormalizeModel(model)
-	mult := period.PremiumMultiplier
-	if m, ok := mult[n]; ok {
+	if m, ok := period.PremiumMultiplier[n]; ok {
 		return m
-	}
-	for key, m := range mult {
-		if strings.HasPrefix(n, key) || strings.HasPrefix(key, n) {
-			return m
-		}
 	}
 	return 1
 }

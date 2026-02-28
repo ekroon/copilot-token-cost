@@ -96,7 +96,7 @@ func TestGetPricing(t *testing.T) {
 	}{
 		{"exact model match", "claude-sonnet-4.6", "2026-02-17T00:00:00", false, 3.00},
 		{"normalized model match", "capi:claude-sonnet-4.6:defaultReasoningEffort=high", "2026-02-17T00:00:00", false, 3.00},
-		{"prefix model match", "claude-sonnet-4.6-extended", "2026-02-17T00:00:00", false, 3.00},
+		{"unknown variant returns nil", "claude-sonnet-4.6-extended", "2026-02-17T00:00:00", true, 0},
 		{"unknown model", "not-a-real-model", "2026-02-17T00:00:00", true, 0},
 	}
 
@@ -128,7 +128,7 @@ func TestGetPremiumMultiplier(t *testing.T) {
 	}{
 		{"exact model match", "gpt-5-mini", "2026-02-17T00:00:00", 0},
 		{"normalized model match", "capi:gpt-5.1-codex-mini:defaultReasoningEffort=high", "2026-02-17T00:00:00", 0.33},
-		{"prefix model match", "gemini-3-pro-preview-experimental", "2026-02-17T00:00:00", 1},
+		{"unknown variant defaults to one", "gemini-3-pro-preview-experimental", "2026-02-17T00:00:00", 1},
 		{"unknown model defaults to one", "not-a-real-model", "2026-02-17T00:00:00", 1},
 	}
 

@@ -1,56 +1,169 @@
 {
-  "_comment": "Copilot CLI Token Cost Calculator — Pricing Data (historical)",
+  "_comment": "Copilot CLI Token Cost Calculator \u2014 Pricing Data (historical)",
   "_sources": "Anthropic, OpenAI, Google official pricing pages; GitHub Copilot docs",
   "_units": "All token prices are per 1M tokens in USD. premium_request_cost is per premium request.",
   "_format": "pricing_periods is sorted newest-first. Each period has an effective_from date (YYYY-MM-DD). Lookup: find the first period where effective_from <= api_call_timestamp. Each period contains FULL pricing for all models known at that time.",
-
   "pricing_periods": [
     {
       "_label": "Gemini 3.1 Pro added to GitHub Copilot public preview",
       "effective_from": "2026-02-19",
       "premium_request_cost": 0.04,
       "model_pricing": {
-        "claude-opus-4.6":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.6-fast":   { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.5":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4":          { "input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75 },
-        "claude-sonnet-4.6":      { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-sonnet-4.5":      { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-sonnet-4":        { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-haiku-4.5":       { "input": 1.00,  "output": 5.00,  "cache_read": 0.10,  "cache_write": 1.25  },
-        "gpt-5.3-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2":                { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.1-codex-max":      { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex":          { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1":                { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5":                  { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex-mini":     { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-5-mini":             { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-4.1":                { "input": 2.00,  "output": 8.00,  "cache_read": 0.50,  "cache_write": 2.00  },
-        "gemini-3.1-pro-preview": { "input": 2.00,  "output": 12.00, "cache_read": 0.20,  "cache_write": 2.50  },
-        "gemini-3-pro-preview":   { "input": 2.00,  "output": 12.00, "cache_read": 0.20,  "cache_write": 2.50  }
+        "claude-opus-4.6": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.6-fast": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.5": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4": {
+          "input": 15.0,
+          "output": 75.0,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "claude-sonnet-4.6": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-sonnet-4.5": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-sonnet-4": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-haiku-4.5": {
+          "input": 1.0,
+          "output": 5.0,
+          "cache_read": 0.1,
+          "cache_write": 1.25
+        },
+        "gpt-5.3-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.1-codex-max": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-5-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-4.1": {
+          "input": 2.0,
+          "output": 8.0,
+          "cache_read": 0.5,
+          "cache_write": 2.0
+        },
+        "gemini-3.1-pro-preview": {
+          "input": 2.0,
+          "output": 12.0,
+          "cache_read": 0.2,
+          "cache_write": 2.5
+        },
+        "gemini-3-pro-preview": {
+          "input": 2.0,
+          "output": 12.0,
+          "cache_read": 0.2,
+          "cache_write": 2.5
+        },
+        "claude-opus-4.6-1m": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "gpt-5-reasoning": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        }
       },
       "premium_multiplier": {
-        "claude-opus-4.6":        3,
-        "claude-opus-4.6-fast":   30,
-        "claude-opus-4.5":        3,
-        "claude-sonnet-4.6":      1,
-        "claude-sonnet-4.5":      1,
-        "claude-sonnet-4":        1,
-        "claude-haiku-4.5":       0.33,
-        "gpt-5.3-codex":          1,
-        "gpt-5.2-codex":          1,
-        "gpt-5.2":                1,
-        "gpt-5.1-codex-max":      1,
-        "gpt-5.1-codex":          1,
-        "gpt-5.1":                1,
-        "gpt-5":                  1,
-        "gpt-5.1-codex-mini":     0.33,
-        "gpt-5-mini":             0,
-        "gpt-4.1":                0,
+        "claude-opus-4.6": 3,
+        "claude-opus-4.6-fast": 30,
+        "claude-opus-4.5": 3,
+        "claude-sonnet-4.6": 1,
+        "claude-sonnet-4.5": 1,
+        "claude-sonnet-4": 1,
+        "claude-haiku-4.5": 0.33,
+        "gpt-5.3-codex": 1,
+        "gpt-5.2-codex": 1,
+        "gpt-5.2": 1,
+        "gpt-5.1-codex-max": 1,
+        "gpt-5.1-codex": 1,
+        "gpt-5.1": 1,
+        "gpt-5": 1,
+        "gpt-5.1-codex-mini": 0.33,
+        "gpt-5-mini": 0,
+        "gpt-4.1": 0,
         "gemini-3.1-pro-preview": 1,
-        "gemini-3-pro-preview":   1
+        "gemini-3-pro-preview": 1,
+        "claude-opus-4.6-1m": 3,
+        "gpt-5-reasoning": 1
       }
     },
     {
@@ -58,45 +171,154 @@
       "effective_from": "2026-02-17",
       "premium_request_cost": 0.04,
       "model_pricing": {
-        "claude-opus-4.6":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.6-fast":   { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.5":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4":          { "input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75 },
-        "claude-sonnet-4.6":      { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-sonnet-4.5":      { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-sonnet-4":        { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-haiku-4.5":       { "input": 1.00,  "output": 5.00,  "cache_read": 0.10,  "cache_write": 1.25  },
-        "gpt-5.3-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2":                { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.1-codex-max":      { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex":          { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1":                { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5":                  { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex-mini":     { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-5-mini":             { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-4.1":                { "input": 2.00,  "output": 8.00,  "cache_read": 0.50,  "cache_write": 2.00  },
-        "gemini-3-pro-preview":   { "input": 2.00,  "output": 12.00, "cache_read": 0.20,  "cache_write": 2.50  }
+        "claude-opus-4.6": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.6-fast": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.5": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4": {
+          "input": 15.0,
+          "output": 75.0,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "claude-sonnet-4.6": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-sonnet-4.5": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-sonnet-4": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-haiku-4.5": {
+          "input": 1.0,
+          "output": 5.0,
+          "cache_read": 0.1,
+          "cache_write": 1.25
+        },
+        "gpt-5.3-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.1-codex-max": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-5-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-4.1": {
+          "input": 2.0,
+          "output": 8.0,
+          "cache_read": 0.5,
+          "cache_write": 2.0
+        },
+        "gemini-3-pro-preview": {
+          "input": 2.0,
+          "output": 12.0,
+          "cache_read": 0.2,
+          "cache_write": 2.5
+        },
+        "claude-opus-4.6-1m": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "gpt-5-reasoning": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        }
       },
       "premium_multiplier": {
-        "claude-opus-4.6":        3,
-        "claude-opus-4.6-fast":   30,
-        "claude-opus-4.5":        3,
-        "claude-sonnet-4.6":      1,
-        "claude-sonnet-4.5":      1,
-        "claude-sonnet-4":        1,
-        "claude-haiku-4.5":       0.33,
-        "gpt-5.3-codex":          1,
-        "gpt-5.2-codex":          1,
-        "gpt-5.2":                1,
-        "gpt-5.1-codex-max":      1,
-        "gpt-5.1-codex":          1,
-        "gpt-5.1":                1,
-        "gpt-5":                  1,
-        "gpt-5.1-codex-mini":     0.33,
-        "gpt-5-mini":             0,
-        "gpt-4.1":                0,
-        "gemini-3-pro-preview":   1
+        "claude-opus-4.6": 3,
+        "claude-opus-4.6-fast": 30,
+        "claude-opus-4.5": 3,
+        "claude-sonnet-4.6": 1,
+        "claude-sonnet-4.5": 1,
+        "claude-sonnet-4": 1,
+        "claude-haiku-4.5": 0.33,
+        "gpt-5.3-codex": 1,
+        "gpt-5.2-codex": 1,
+        "gpt-5.2": 1,
+        "gpt-5.1-codex-max": 1,
+        "gpt-5.1-codex": 1,
+        "gpt-5.1": 1,
+        "gpt-5": 1,
+        "gpt-5.1-codex-mini": 0.33,
+        "gpt-5-mini": 0,
+        "gpt-4.1": 0,
+        "gemini-3-pro-preview": 1,
+        "claude-opus-4.6-1m": 3,
+        "gpt-5-reasoning": 1
       }
     },
     {
@@ -104,43 +326,147 @@
       "effective_from": "2026-02-17",
       "premium_request_cost": 0.04,
       "model_pricing": {
-        "claude-opus-4.6":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.6-fast":   { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.5":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4":          { "input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75 },
-        "claude-sonnet-4.5":      { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-sonnet-4":        { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-haiku-4.5":       { "input": 1.00,  "output": 5.00,  "cache_read": 0.10,  "cache_write": 1.25  },
-        "gpt-5.3-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2":                { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.1-codex-max":      { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex":          { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1":                { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5":                  { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex-mini":     { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-5-mini":             { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-4.1":                { "input": 2.00,  "output": 8.00,  "cache_read": 0.50,  "cache_write": 2.00  },
-        "gemini-3-pro-preview":   { "input": 2.00,  "output": 12.00, "cache_read": 0.20,  "cache_write": 2.50  }
+        "claude-opus-4.6": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.6-fast": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.5": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4": {
+          "input": 15.0,
+          "output": 75.0,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "claude-sonnet-4.5": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-sonnet-4": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-haiku-4.5": {
+          "input": 1.0,
+          "output": 5.0,
+          "cache_read": 0.1,
+          "cache_write": 1.25
+        },
+        "gpt-5.3-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.1-codex-max": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-5-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-4.1": {
+          "input": 2.0,
+          "output": 8.0,
+          "cache_read": 0.5,
+          "cache_write": 2.0
+        },
+        "gemini-3-pro-preview": {
+          "input": 2.0,
+          "output": 12.0,
+          "cache_read": 0.2,
+          "cache_write": 2.5
+        },
+        "claude-opus-4.6-1m": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "gpt-5-reasoning": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        }
       },
       "premium_multiplier": {
-        "claude-opus-4.6":        3,
-        "claude-opus-4.6-fast":   30,
-        "claude-opus-4.5":        3,
-        "claude-sonnet-4.5":      1,
-        "claude-sonnet-4":        1,
-        "claude-haiku-4.5":       0.33,
-        "gpt-5.3-codex":          1,
-        "gpt-5.2-codex":          1,
-        "gpt-5.2":                1,
-        "gpt-5.1-codex-max":      1,
-        "gpt-5.1-codex":          1,
-        "gpt-5.1":                1,
-        "gpt-5":                  1,
-        "gpt-5.1-codex-mini":     0.33,
-        "gpt-5-mini":             0,
-        "gpt-4.1":                0,
-        "gemini-3-pro-preview":   1
+        "claude-opus-4.6": 3,
+        "claude-opus-4.6-fast": 30,
+        "claude-opus-4.5": 3,
+        "claude-sonnet-4.5": 1,
+        "claude-sonnet-4": 1,
+        "claude-haiku-4.5": 0.33,
+        "gpt-5.3-codex": 1,
+        "gpt-5.2-codex": 1,
+        "gpt-5.2": 1,
+        "gpt-5.1-codex-max": 1,
+        "gpt-5.1-codex": 1,
+        "gpt-5.1": 1,
+        "gpt-5": 1,
+        "gpt-5.1-codex-mini": 0.33,
+        "gpt-5-mini": 0,
+        "gpt-4.1": 0,
+        "gemini-3-pro-preview": 1,
+        "claude-opus-4.6-1m": 3,
+        "gpt-5-reasoning": 1
       }
     },
     {
@@ -148,43 +474,147 @@
       "effective_from": "2026-02-07",
       "premium_request_cost": 0.04,
       "model_pricing": {
-        "claude-opus-4.6":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.6-fast":   { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.5":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4":          { "input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75 },
-        "claude-sonnet-4.5":      { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-sonnet-4":        { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-haiku-4.5":       { "input": 1.00,  "output": 5.00,  "cache_read": 0.10,  "cache_write": 1.25  },
-        "gpt-5.3-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2":                { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.1-codex-max":      { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex":          { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1":                { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5":                  { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex-mini":     { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-5-mini":             { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-4.1":                { "input": 2.00,  "output": 8.00,  "cache_read": 0.50,  "cache_write": 2.00  },
-        "gemini-3-pro-preview":   { "input": 2.00,  "output": 12.00, "cache_read": 0.20,  "cache_write": 2.50  }
+        "claude-opus-4.6": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.6-fast": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.5": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4": {
+          "input": 15.0,
+          "output": 75.0,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "claude-sonnet-4.5": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-sonnet-4": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-haiku-4.5": {
+          "input": 1.0,
+          "output": 5.0,
+          "cache_read": 0.1,
+          "cache_write": 1.25
+        },
+        "gpt-5.3-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.1-codex-max": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-5-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-4.1": {
+          "input": 2.0,
+          "output": 8.0,
+          "cache_read": 0.5,
+          "cache_write": 2.0
+        },
+        "gemini-3-pro-preview": {
+          "input": 2.0,
+          "output": 12.0,
+          "cache_read": 0.2,
+          "cache_write": 2.5
+        },
+        "claude-opus-4.6-1m": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "gpt-5-reasoning": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        }
       },
       "premium_multiplier": {
-        "claude-opus-4.6":        3,
-        "claude-opus-4.6-fast":   9,
-        "claude-opus-4.5":        3,
-        "claude-sonnet-4.5":      1,
-        "claude-sonnet-4":        1,
-        "claude-haiku-4.5":       0.33,
-        "gpt-5.3-codex":          1,
-        "gpt-5.2-codex":          1,
-        "gpt-5.2":                1,
-        "gpt-5.1-codex-max":      1,
-        "gpt-5.1-codex":          1,
-        "gpt-5.1":                1,
-        "gpt-5":                  1,
-        "gpt-5.1-codex-mini":     0.33,
-        "gpt-5-mini":             0,
-        "gpt-4.1":                0,
-        "gemini-3-pro-preview":   1
+        "claude-opus-4.6": 3,
+        "claude-opus-4.6-fast": 9,
+        "claude-opus-4.5": 3,
+        "claude-sonnet-4.5": 1,
+        "claude-sonnet-4": 1,
+        "claude-haiku-4.5": 0.33,
+        "gpt-5.3-codex": 1,
+        "gpt-5.2-codex": 1,
+        "gpt-5.2": 1,
+        "gpt-5.1-codex-max": 1,
+        "gpt-5.1-codex": 1,
+        "gpt-5.1": 1,
+        "gpt-5": 1,
+        "gpt-5.1-codex-mini": 0.33,
+        "gpt-5-mini": 0,
+        "gpt-4.1": 0,
+        "gemini-3-pro-preview": 1,
+        "claude-opus-4.6-1m": 3,
+        "gpt-5-reasoning": 1
       }
     },
     {
@@ -192,41 +622,140 @@
       "effective_from": "2026-02-05",
       "premium_request_cost": 0.04,
       "model_pricing": {
-        "claude-opus-4.6":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4.5":        { "input": 5.00,  "output": 25.00, "cache_read": 0.50,  "cache_write": 6.25  },
-        "claude-opus-4":          { "input": 15.00, "output": 75.00, "cache_read": 1.50,  "cache_write": 18.75 },
-        "claude-sonnet-4.5":      { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-sonnet-4":        { "input": 3.00,  "output": 15.00, "cache_read": 0.30,  "cache_write": 3.75  },
-        "claude-haiku-4.5":       { "input": 1.00,  "output": 5.00,  "cache_read": 0.10,  "cache_write": 1.25  },
-        "gpt-5.3-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2-codex":          { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.2":                { "input": 1.75,  "output": 14.00, "cache_read": 0.175, "cache_write": 1.75  },
-        "gpt-5.1-codex-max":      { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex":          { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1":                { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5":                  { "input": 1.25,  "output": 10.00, "cache_read": 0.125, "cache_write": 1.25  },
-        "gpt-5.1-codex-mini":     { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-5-mini":             { "input": 0.25,  "output": 2.00,  "cache_read": 0.025, "cache_write": 0.25  },
-        "gpt-4.1":                { "input": 2.00,  "output": 8.00,  "cache_read": 0.50,  "cache_write": 2.00  },
-        "gemini-3-pro-preview":   { "input": 2.00,  "output": 12.00, "cache_read": 0.20,  "cache_write": 2.50  }
+        "claude-opus-4.6": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4.5": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "claude-opus-4": {
+          "input": 15.0,
+          "output": 75.0,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "claude-sonnet-4.5": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-sonnet-4": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "claude-haiku-4.5": {
+          "input": 1.0,
+          "output": 5.0,
+          "cache_read": 0.1,
+          "cache_write": 1.25
+        },
+        "gpt-5.3-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2-codex": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.2": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 1.75
+        },
+        "gpt-5.1-codex-max": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        },
+        "gpt-5.1-codex-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-5-mini": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.25
+        },
+        "gpt-4.1": {
+          "input": 2.0,
+          "output": 8.0,
+          "cache_read": 0.5,
+          "cache_write": 2.0
+        },
+        "gemini-3-pro-preview": {
+          "input": 2.0,
+          "output": 12.0,
+          "cache_read": 0.2,
+          "cache_write": 2.5
+        },
+        "claude-opus-4.6-1m": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        },
+        "gpt-5-reasoning": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 1.25
+        }
       },
       "premium_multiplier": {
-        "claude-opus-4.6":        3,
-        "claude-opus-4.5":        3,
-        "claude-sonnet-4.5":      1,
-        "claude-sonnet-4":        1,
-        "claude-haiku-4.5":       0.33,
-        "gpt-5.3-codex":          1,
-        "gpt-5.2-codex":          1,
-        "gpt-5.2":                1,
-        "gpt-5.1-codex-max":      1,
-        "gpt-5.1-codex":          1,
-        "gpt-5.1":                1,
-        "gpt-5":                  1,
-        "gpt-5.1-codex-mini":     0.33,
-        "gpt-5-mini":             0,
-        "gpt-4.1":                0,
-        "gemini-3-pro-preview":   1
+        "claude-opus-4.6": 3,
+        "claude-opus-4.5": 3,
+        "claude-sonnet-4.5": 1,
+        "claude-sonnet-4": 1,
+        "claude-haiku-4.5": 0.33,
+        "gpt-5.3-codex": 1,
+        "gpt-5.2-codex": 1,
+        "gpt-5.2": 1,
+        "gpt-5.1-codex-max": 1,
+        "gpt-5.1-codex": 1,
+        "gpt-5.1": 1,
+        "gpt-5": 1,
+        "gpt-5.1-codex-mini": 0.33,
+        "gpt-5-mini": 0,
+        "gpt-4.1": 0,
+        "gemini-3-pro-preview": 1,
+        "claude-opus-4.6-1m": 3,
+        "gpt-5-reasoning": 1
       }
     }
   ]
