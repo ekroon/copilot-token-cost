@@ -1364,6 +1364,7 @@ func runLegacyCLI() {
 		fmt.Fprintf(os.Stderr, "                         [--web-local-streaming] [--web-codespaces-mode manual|auto]\n")
 		fmt.Fprintf(os.Stderr, "                         [--web-codespaces-streaming] [--web-codespaces-interval DURATION]\n")
 		fmt.Fprintf(os.Stderr, "                         [--web-log-mode compact|verbose|errors]\n\n")
+		fmt.Fprintf(os.Stderr, "       copilot-token-cost sql [--json] \"SQL QUERY\"\n\n")
 		fmt.Fprintf(os.Stderr, "Copilot CLI Token Cost Calculator\n\n")
 		fmt.Fprintf(os.Stderr, "Prompt text storage is always-on when prompt text is available; unavailable prompt text is stored as NULL.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
@@ -1385,6 +1386,8 @@ func runLegacyCLI() {
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-interval 15s  # near-continuous codespaces sync\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-codespaces-streaming  # show experimental live streaming status\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --web --web-log-mode verbose  # keep line-by-line sync logs\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost sql \"SELECT COUNT(*) FROM api_calls\"  # direct SQL query\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost sql --json \"SELECT DISTINCT cwd FROM session_workspaces\"  # SQL with JSON output\n")
 	}
 	flag.Parse()
 
@@ -1991,7 +1994,115 @@ func runLegacyCLI() {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "sql" {
+		runSQL(os.Args[2:])
+		return
+	}
 	runLegacyCLI()
+}
+
+func runSQL(args []string) {
+	fs := flag.NewFlagSet("sql", flag.ExitOnError)
+	jsonOut := fs.Bool("json", false, "Output as JSON array of objects")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: copilot-token-cost sql [--json] \"SQL QUERY\"")
+		fmt.Fprintln(os.Stderr, "       echo \"SQL QUERY\" | copilot-token-cost sql [--json]")
+		fmt.Fprintln(os.Stderr, "\nRun a read-only SQL query against the copilot-tokens database.")
+		fmt.Fprintln(os.Stderr, "\nExamples:")
+		fmt.Fprintln(os.Stderr, "  copilot-token-cost sql \"SELECT COUNT(*) FROM api_calls\"")
+		fmt.Fprintln(os.Stderr, "  copilot-token-cost sql --json \"SELECT model_normalized, COUNT(*) as n FROM api_calls GROUP BY 1\"")
+		fmt.Fprintln(os.Stderr, "  copilot-token-cost sql \"SELECT DISTINCT cwd FROM session_workspaces\"")
+	}
+	fs.Parse(args)
+
+	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if query == "" {
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+			os.Exit(1)
+		}
+		query = strings.TrimSpace(string(b))
+	}
+	if query == "" {
+		fs.Usage()
+		os.Exit(1)
+	}
+
+	dbPath := getDBPath()
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening database: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	db.Exec("PRAGMA query_only = ON")
+
+	rows, err := db.Query(query)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query error: %v\n", err)
+		os.Exit(1)
+	}
+	defer rows.Close()
+
+	cols, _ := rows.Columns()
+	if *jsonOut {
+		printSQLJSON(cols, rows)
+	} else {
+		printSQLTable(cols, rows)
+	}
+}
+
+func printSQLTable(cols []string, rows *sql.Rows) {
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	w.WriteString(strings.Join(cols, "\t") + "\n")
+	vals := make([]sql.NullString, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	for rows.Next() {
+		rows.Scan(ptrs...)
+		for i, v := range vals {
+			if i > 0 {
+				w.WriteByte('\t')
+			}
+			if v.Valid {
+				w.WriteString(v.String)
+			} else {
+				w.WriteString("NULL")
+			}
+		}
+		w.WriteByte('\n')
+	}
+}
+
+func printSQLJSON(cols []string, rows *sql.Rows) {
+	vals := make([]sql.NullString, len(cols))
+	ptrs := make([]interface{}, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	var result []map[string]interface{}
+	for rows.Next() {
+		rows.Scan(ptrs...)
+		row := make(map[string]interface{}, len(cols))
+		for i, c := range cols {
+			if vals[i].Valid {
+				row[c] = vals[i].String
+			} else {
+				row[c] = nil
+			}
+		}
+		result = append(result, row)
+	}
+	if result == nil {
+		result = []map[string]interface{}{}
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	enc.Encode(result)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

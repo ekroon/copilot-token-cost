@@ -146,6 +146,20 @@ Use `--sync` to force a full re-parse of all log files (useful after updates):
 ./go/copilot-token-cost --sync
 ```
 
+### Direct SQL Queries
+
+Run read-only SQL queries directly against the database:
+```bash
+copilot-token-cost sql "SELECT COUNT(*) FROM api_calls"
+copilot-token-cost sql "SELECT DISTINCT cwd FROM session_workspaces"
+copilot-token-cost sql --json "SELECT model_normalized, COUNT(*) as n FROM api_calls GROUP BY 1 ORDER BY n DESC"
+```
+
+Supports piping:
+```bash
+echo "SELECT MAX(timestamp) FROM api_calls" | copilot-token-cost sql
+```
+
 ## Performance Checks
 
 CodSpeed CI benchmark (authoritative performance gate):
