@@ -141,3 +141,166 @@ func TestUncachedInput(t *testing.T) {
 		t.Fatalf("uncachedInput = %d, want 0", got)
 	}
 }
+
+func TestBuildAllDerivedStatsAppliesMultiplier(t *testing.T) {
+	setTestPricing(t)
+
+	raw := map[string]map[string]map[string]*dbModelStats{
+		"2025-01-02": {
+			"/proj/alpha": {
+				"model-a": {
+					APICalls:         3,
+					UserTurns:        2,
+					PromptTokens:     100,
+					CompletionTokens: 50,
+				},
+			},
+		},
+		"2024-06-01": {
+			"/proj/alpha": {
+				"model-a": {
+					APICalls:         1,
+					UserTurns:        1,
+					PromptTokens:     40,
+					CompletionTokens: 10,
+				},
+			},
+		},
+	}
+
+	derived := buildAllDerivedStats(raw)
+
+	// model-a has multiplier 2.5 in 2025 and 1.0 in 2024
+	// 2025-01-02: 2 user turns × 2.5 = 5.0 premium requests
+	// 2024-06-01: 1 user turn  × 1.0 = 1.0 premium requests
+	wantPremiumTotal := 6.0
+
+	// DailyStats
+	if !almostEqual(derived.DailyStats["2025-01-02"]["model-a"].PremiumRequests, 5.0) {
+		t.Fatalf("daily 2025-01-02 premium=%f, want=5.0", derived.DailyStats["2025-01-02"]["model-a"].PremiumRequests)
+	}
+	if !almostEqual(derived.DailyStats["2024-06-01"]["model-a"].PremiumRequests, 1.0) {
+		t.Fatalf("daily 2024-06-01 premium=%f, want=1.0", derived.DailyStats["2024-06-01"]["model-a"].PremiumRequests)
+	}
+
+	// ModelStats
+	if !almostEqual(derived.ModelStats["model-a"].PremiumRequests, wantPremiumTotal) {
+		t.Fatalf("model premium=%f, want=%f", derived.ModelStats["model-a"].PremiumRequests, wantPremiumTotal)
+	}
+
+	// ProjectStats
+	proj := projectName("/proj/alpha")
+	if !almostEqual(derived.ProjectStats[proj].PremiumRequests, wantPremiumTotal) {
+		t.Fatalf("project premium=%f, want=%f", derived.ProjectStats[proj].PremiumRequests, wantPremiumTotal)
+	}
+
+	// ProjectModelStats
+	if !almostEqual(derived.ProjectModelStats[proj]["model-a"].PremiumRequests, wantPremiumTotal) {
+		t.Fatalf("project-model premium=%f, want=%f", derived.ProjectModelStats[proj]["model-a"].PremiumRequests, wantPremiumTotal)
+	}
+
+	// TotalRecords
+	if derived.TotalRecords != 4 {
+		t.Fatalf("total records=%d, want=4", derived.TotalRecords)
+	}
+}
+
+func TestAllViewsPremiumConsistency(t *testing.T) {
+	setTestPricing(t)
+
+	raw := map[string]map[string]map[string]*dbModelStats{
+		"2025-01-02": {
+			"/proj/alpha": {
+				"model-a": {APICalls: 5, UserTurns: 3, PromptTokens: 300, CompletionTokens: 100},
+			},
+			"/proj/beta": {
+				"model-a": {APICalls: 2, UserTurns: 1, PromptTokens: 100, CompletionTokens: 30},
+			},
+		},
+		"2024-06-01": {
+			"/proj/alpha": {
+				"model-a": {APICalls: 1, UserTurns: 1, PromptTokens: 50, CompletionTokens: 10},
+			},
+		},
+	}
+
+	derived := buildAllDerivedStats(raw)
+	payload := buildStatsPayload(aggregatedStats{
+		DailyStats:             derived.DailyStats,
+		ModelStats:             derived.ModelStats,
+		ProjectStats:           derived.ProjectStats,
+		ProjectModelStats:      derived.ProjectModelStats,
+		ProjectDailyModelStats: derived.ProjectDailyModelStats,
+		Records:                []Record{},
+		SessionWorkspaces:      map[string]workspaceMeta{},
+		TotalRecords:           derived.TotalRecords,
+	}, "test", "", 0)
+
+	// Sum premium from all views — they must agree
+	var modelPrem, dailyPrem, projectPrem, projectModelPrem, dailyProjectPrem float64
+
+	for _, s := range payload.Models {
+		modelPrem += s.PremiumRequests
+	}
+	for _, dayMap := range payload.Daily {
+		for k, v := range dayMap {
+			if s, ok := v.(statsPayloadStats); ok && k[0] != '_' {
+				dailyPrem += s.PremiumRequests
+			}
+		}
+	}
+	for _, s := range payload.Projects {
+		projectPrem += s.PremiumRequests
+	}
+	for _, models := range payload.ProjectModels {
+		for _, s := range models {
+			projectModelPrem += s.PremiumRequests
+		}
+	}
+	for _, projects := range payload.DailyProjects {
+		for _, s := range projects {
+			dailyProjectPrem += s.PremiumRequests
+		}
+	}
+
+	// model-a multiplier: 2.5 on 2025-01-02, 1.0 on 2024-06-01
+	// 2025-01-02: (3+1) user turns × 2.5 = 10.0
+	// 2024-06-01: 1 user turn × 1.0 = 1.0
+	wantTotal := 11.0
+
+	if !almostEqual(modelPrem, wantTotal) {
+		t.Fatalf("model premium=%f, want=%f", modelPrem, wantTotal)
+	}
+	if !almostEqual(dailyPrem, wantTotal) {
+		t.Fatalf("daily premium=%f, want=%f", dailyPrem, wantTotal)
+	}
+	if !almostEqual(projectPrem, wantTotal) {
+		t.Fatalf("project premium=%f, want=%f", projectPrem, wantTotal)
+	}
+	if !almostEqual(projectModelPrem, wantTotal) {
+		t.Fatalf("project-model premium=%f, want=%f", projectModelPrem, wantTotal)
+	}
+	if !almostEqual(dailyProjectPrem, wantTotal) {
+		t.Fatalf("daily-project premium=%f, want=%f", dailyProjectPrem, wantTotal)
+	}
+
+	// Premium costs must also be consistent across views
+	var modelPremCost, projectPremCost, projectModelPremCost float64
+	for _, s := range payload.Models {
+		modelPremCost += s.PremiumRequestCost
+	}
+	for _, s := range payload.Projects {
+		projectPremCost += s.PremiumRequestCost
+	}
+	for _, models := range payload.ProjectModels {
+		for _, s := range models {
+			projectModelPremCost += s.PremiumRequestCost
+		}
+	}
+	if !almostEqual(modelPremCost, projectPremCost) {
+		t.Fatalf("model premium cost=%f != project premium cost=%f", modelPremCost, projectPremCost)
+	}
+	if !almostEqual(modelPremCost, projectModelPremCost) {
+		t.Fatalf("model premium cost=%f != project-model premium cost=%f", modelPremCost, projectModelPremCost)
+	}
+}

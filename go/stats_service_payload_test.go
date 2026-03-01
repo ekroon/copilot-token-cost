@@ -57,6 +57,34 @@ func TestBuildStatsPayloadMatchesCurrentJSONMath(t *testing.T) {
 				PremiumRequests:     3,
 			},
 		},
+		ProjectDailyModelStats: map[string]map[string]map[string]*Stats{
+			"2025-01-02": {
+				"(unknown)": {
+					"model-a": {
+						APICalls:            1,
+						UserTurns:           1,
+						PromptTokens:        100,
+						CompletionTokens:    50,
+						CacheCreationTokens: 10,
+						CacheReadTokens:     20,
+						PremiumRequests:     2,
+					},
+				},
+			},
+			"2024-06-01": {
+				"(unknown)": {
+					"model-a": {
+						APICalls:            1,
+						UserTurns:           0,
+						PromptTokens:        40,
+						CompletionTokens:    10,
+						CacheCreationTokens: 5,
+						CacheReadTokens:     5,
+						PremiumRequests:     1,
+					},
+				},
+			},
+		},
 		Records: []Record{
 			{
 				Model:               "model-a",
@@ -136,12 +164,12 @@ func TestBuildStatsPayloadMatchesCurrentJSONMath(t *testing.T) {
 	assertFloatEqual(t, day2["_total_cost_without_cache"].(float64), 0.0006)
 
 	dayProject := payload.DailyProjects["2025-01-02"]["(unknown)"]
-	if dayProject.PromptTokens != 100 || dayProject.CompletionTokens != 50 || dayProject.UserTurns != 0 {
+	if dayProject.PromptTokens != 100 || dayProject.CompletionTokens != 50 || dayProject.UserTurns != 1 {
 		t.Fatalf("daily project day1 mismatch: %+v", dayProject)
 	}
 	assertFloatEqual(t, dayProject.Cost, 0.0017)
 	assertFloatEqual(t, dayProject.CostWithoutCache, 0.0020)
-	assertFloatEqual(t, dayProject.PremiumRequestCost, 0.00)
+	assertFloatEqual(t, dayProject.PremiumRequestCost, 0.10)
 
 	project := payload.Projects["(unknown)"]
 	if project.UserTurns != 1 {
@@ -149,7 +177,8 @@ func TestBuildStatsPayloadMatchesCurrentJSONMath(t *testing.T) {
 	}
 	assertFloatEqual(t, project.Cost, 0.0023)
 	assertFloatEqual(t, project.CostWithoutCache, 0.0026)
-	assertFloatEqual(t, project.PremiumRequestCost, 0.15)
+	// Premium cost now uses per-day pricing (matches model-level)
+	assertFloatEqual(t, project.PremiumRequestCost, 0.12)
 
 	assertFloatEqual(t, payload.TotalCost, 0.0023)
 	assertFloatEqual(t, payload.TotalCostNoCache, 0.0026)
@@ -222,33 +251,41 @@ func TestBuildStatsPayloadHourlyBucketsRespectTimezoneOffset(t *testing.T) {
 	assertFloatEqual(t, payload.Hourly["23"].CostWithoutCache, roundN(expectedNoCache, 4))
 }
 
-func TestBuildProjectStatsMapMergesCodespacesAndLocalWorkspacePaths(t *testing.T) {
+func TestBuildAllDerivedStatsMergesCodespacesAndLocalWorkspacePaths(t *testing.T) {
+	setTestPricing(t)
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatalf("home dir: %v", err)
 	}
 	localPath := filepath.Join(home, "develop", "graph-hopper")
-	projectStats := buildProjectStatsMap(map[string]*dbModelStats{
-		localPath: {
-			APICalls:         2,
-			UserTurns:        1,
-			PromptTokens:     20,
-			CompletionTokens: 4,
+	raw := map[string]map[string]map[string]*dbModelStats{
+		"2025-01-02": {
+			localPath: {
+				"model-a": {
+					APICalls:         2,
+					UserTurns:        1,
+					PromptTokens:     20,
+					CompletionTokens: 4,
+				},
+			},
+			"/workspaces/graph-hopper": {
+				"model-a": {
+					APICalls:         3,
+					UserTurns:        2,
+					PromptTokens:     30,
+					CompletionTokens: 6,
+				},
+			},
 		},
-		"/workspaces/graph-hopper": {
-			APICalls:         3,
-			UserTurns:        2,
-			PromptTokens:     30,
-			CompletionTokens: 6,
-		},
-	})
-	wantProject := projectName(localPath)
-	if len(projectStats) != 1 {
-		t.Fatalf("project count=%d, want=1 (%q)", len(projectStats), wantProject)
 	}
-	got, ok := projectStats[wantProject]
+	derived := buildAllDerivedStats(raw)
+	wantProject := projectName(localPath)
+	if len(derived.ProjectStats) != 1 {
+		t.Fatalf("project count=%d, want=1 (%q)", len(derived.ProjectStats), wantProject)
+	}
+	got, ok := derived.ProjectStats[wantProject]
 	if !ok {
-		t.Fatalf("missing merged project key %q in %#v", wantProject, projectStats)
+		t.Fatalf("missing merged project key %q in %#v", wantProject, derived.ProjectStats)
 	}
 	if got.APICalls != 5 || got.UserTurns != 3 || got.PromptTokens != 50 || got.CompletionTokens != 10 {
 		t.Fatalf("merged project stats=%+v, want calls=5 user_turns=3 prompt=50 completion=10", *got)
@@ -283,6 +320,19 @@ func TestBuildStatsPayloadMergesCodespacesProjectCostsIntoLocalProject(t *testin
 					PromptTokens:     20,
 					CompletionTokens: 4,
 					PremiumRequests:  2,
+				},
+			},
+		},
+		ProjectDailyModelStats: map[string]map[string]map[string]*Stats{
+			"2025-01-02": {
+				project: {
+					"model-a": {
+						APICalls:         2,
+						UserTurns:        2,
+						PromptTokens:     20,
+						CompletionTokens: 4,
+						PremiumRequests:  2,
+					},
 				},
 			},
 		},
@@ -426,6 +476,19 @@ func TestBuildStatsPayloadProjectCostsReconcileWithModelCosts(t *testing.T) {
 				CompletionTokens:    0,
 				CacheCreationTokens: 0,
 				CacheReadTokens:     500_000,
+			},
+		},
+		ProjectDailyModelStats: map[string]map[string]map[string]*Stats{
+			day: {
+				project: {
+					"model-a": {
+						APICalls:            2,
+						PromptTokens:        1_100_000,
+						CompletionTokens:    0,
+						CacheCreationTokens: 0,
+						CacheReadTokens:     500_000,
+					},
+				},
 			},
 		},
 		Records: []Record{

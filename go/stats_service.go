@@ -10,14 +10,15 @@ import (
 )
 
 type aggregatedStats struct {
-	DailyStats        map[string]map[string]*Stats
-	ModelStats        map[string]*Stats
-	ProjectStats      map[string]*Stats
-	ProjectModelStats map[string]map[string]*Stats
-	Records           []Record
-	SessionWorkspaces map[string]workspaceMeta
-	TotalRecords      int
-	LogFileCount      int
+	DailyStats             map[string]map[string]*Stats
+	ModelStats             map[string]*Stats
+	ProjectStats           map[string]*Stats
+	ProjectModelStats      map[string]map[string]*Stats
+	ProjectDailyModelStats map[string]map[string]map[string]*Stats
+	Records                []Record
+	SessionWorkspaces      map[string]workspaceMeta
+	TotalRecords           int
+	LogFileCount           int
 }
 
 type statsPayloadStats struct {
@@ -166,8 +167,9 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 	dailyStats := aggregated.DailyStats
 	modelStats := aggregated.ModelStats
 	projectStats := aggregated.ProjectStats
+	projectModelStats := aggregated.ProjectModelStats
+	projectDailyModelStats := aggregated.ProjectDailyModelStats
 	filtered := aggregated.Records
-	sessionWorkspaces := aggregated.SessionWorkspaces
 	viewerTimezoneOffsetMin = normalizeTimezoneOffsetMinutes(viewerTimezoneOffsetMin)
 
 	out := statsPayload{
@@ -236,45 +238,10 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 		out.Daily[day] = dayMap
 	}
 
-	projectModelDailyStats := make(map[string]map[string]map[string]*Stats)
-	workspacePaths := make([]string, 0, len(filtered))
-	for _, r := range filtered {
-		if r.SessionID == "" {
-			continue
-		}
-		if meta, ok := sessionWorkspaces[r.Source+"\x1f"+r.SessionID]; ok && meta.CWD != "" {
-			workspacePaths = append(workspacePaths, meta.CWD)
-		}
-	}
-	localProjectsByBase := buildLocalProjectByBase(workspacePaths)
-	for _, r := range filtered {
-		cwd := ""
-		if r.SessionID != "" {
-			if meta, ok := sessionWorkspaces[r.Source+"\x1f"+r.SessionID]; ok {
-				cwd = meta.CWD
-			}
-		}
-		proj := canonicalProjectLabel(cwd, localProjectsByBase)
-		model := normalizeModel(r.Model)
-		day := "unknown"
-		if len(r.Timestamp) >= 10 {
-			day = r.Timestamp[:10]
-		}
-		if projectModelDailyStats[day] == nil {
-			projectModelDailyStats[day] = make(map[string]map[string]*Stats)
-		}
-		if projectModelDailyStats[day][proj] == nil {
-			projectModelDailyStats[day][proj] = make(map[string]*Stats)
-		}
-		if projectModelDailyStats[day][proj][model] == nil {
-			projectModelDailyStats[day][proj][model] = newStats()
-		}
-		projectModelDailyStats[day][proj][model].add(r, model)
-	}
-
+	// Compute project and project-model costs from pre-computed daily-project-model stats
 	projectCostTotals := make(map[string][2]float64)
 	projectModelCostTotals := make(map[string]map[string][2]float64)
-	for day, projects := range projectModelDailyStats {
+	for day, projects := range projectDailyModelStats {
 		for project, models := range projects {
 			if _, ok := projectModelCostTotals[project]; !ok {
 				projectModelCostTotals[project] = make(map[string][2]float64)
@@ -296,6 +263,7 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 
 	for project, stats := range projectStats {
 		costs := projectCostTotals[project]
+		premCost := sumProjectDailyPremCost(project, projectDailyModelStats)
 		out.Projects[project] = statsPayloadStats{
 			APICalls:            stats.APICalls,
 			UserTurns:           stats.UserTurns,
@@ -304,20 +272,20 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 			CacheCreationTokens: stats.CacheCreationTokens,
 			CacheReadTokens:     stats.CacheReadTokens,
 			PremiumRequests:     stats.PremiumRequests,
-			PremiumRequestCost:  roundN(stats.PremiumRequests*getPremiumRequestCost(""), 4),
+			PremiumRequestCost:  roundN(premCost, 4),
 			InputUncached:       uncachedInput(stats),
 			Cost:                roundN(costs[0], 4),
 			CostWithoutCache:    roundN(costs[1], 4),
 		}
 	}
 
-	projectModelStats := aggregated.ProjectModelStats
 	if len(projectModelStats) > 0 {
 		out.ProjectModels = make(map[string]map[string]statsPayloadStats)
 		for project, models := range projectModelStats {
 			out.ProjectModels[project] = make(map[string]statsPayloadStats)
 			for model, stats := range models {
 				costs := projectModelCostTotals[project][model]
+				premCost := sumProjectModelDailyPremCost(project, model, projectDailyModelStats)
 				out.ProjectModels[project][model] = statsPayloadStats{
 					APICalls:            stats.APICalls,
 					UserTurns:           stats.UserTurns,
@@ -326,7 +294,7 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 					CacheCreationTokens: stats.CacheCreationTokens,
 					CacheReadTokens:     stats.CacheReadTokens,
 					PremiumRequests:     stats.PremiumRequests,
-					PremiumRequestCost:  roundN(stats.PremiumRequests*getPremiumRequestCost(""), 4),
+					PremiumRequestCost:  roundN(premCost, 4),
 					InputUncached:       uncachedInput(stats),
 					Cost:                roundN(costs[0], 4),
 					CostWithoutCache:    roundN(costs[1], 4),
@@ -334,15 +302,16 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 			}
 		}
 	}
-	if len(projectModelDailyStats) > 0 {
+
+	if len(projectDailyModelStats) > 0 {
 		out.DailyProjects = make(map[string]map[string]statsPayloadStats)
-		dayKeys := make([]string, 0, len(projectModelDailyStats))
-		for day := range projectModelDailyStats {
+		dayKeys := make([]string, 0, len(projectDailyModelStats))
+		for day := range projectDailyModelStats {
 			dayKeys = append(dayKeys, day)
 		}
 		sort.Strings(dayKeys)
 		for _, day := range dayKeys {
-			projects := projectModelDailyStats[day]
+			projects := projectDailyModelStats[day]
 			out.DailyProjects[day] = make(map[string]statsPayloadStats)
 			projectKeys := make([]string, 0, len(projects))
 			for project := range projects {
@@ -382,6 +351,30 @@ func buildStatsPayload(aggregated aggregatedStats, periodLabel, dateRange string
 	return out
 }
 
+func sumProjectDailyPremCost(project string, projectDailyModelStats map[string]map[string]map[string]*Stats) float64 {
+	var total float64
+	for day, projects := range projectDailyModelStats {
+		if models, ok := projects[project]; ok {
+			for _, s := range models {
+				total += s.PremiumRequests * getPremiumRequestCost(day)
+			}
+		}
+	}
+	return total
+}
+
+func sumProjectModelDailyPremCost(project, model string, projectDailyModelStats map[string]map[string]map[string]*Stats) float64 {
+	var total float64
+	for day, projects := range projectDailyModelStats {
+		if models, ok := projects[project]; ok {
+			if s, ok := models[model]; ok {
+				total += s.PremiumRequests * getPremiumRequestCost(day)
+			}
+		}
+	}
+	return total
+}
+
 func dbStatsToStats(dbs *dbModelStats, premiumRequests float64) *Stats {
 	return &Stats{
 		APICalls:            dbs.APICalls,
@@ -402,31 +395,6 @@ func mergeStats(dst, src *Stats) {
 	dst.CacheCreationTokens += src.CacheCreationTokens
 	dst.CacheReadTokens += src.CacheReadTokens
 	dst.PremiumRequests += src.PremiumRequests
-}
-
-func buildDailyStatsMap(dbDailyStats map[string]map[string]*dbModelStats) map[string]map[string]*Stats {
-	dailyStats := make(map[string]map[string]*Stats)
-	for day, models := range dbDailyStats {
-		dailyStats[day] = make(map[string]*Stats)
-		for model, dbs := range models {
-			dailyStats[day][model] = dbStatsToStats(dbs, float64(dbs.UserTurns)*getPremiumMultiplier(model, day))
-		}
-	}
-	return dailyStats
-}
-
-func buildModelStatsMap(dbModelStatsMap map[string]*dbModelStats, dailyStats map[string]map[string]*Stats) map[string]*Stats {
-	modelStats := make(map[string]*Stats)
-	for model, dbs := range dbModelStatsMap {
-		var premReqs float64
-		for _, models := range dailyStats {
-			if s, ok := models[model]; ok {
-				premReqs += s.PremiumRequests
-			}
-		}
-		modelStats[model] = dbStatsToStats(dbs, premReqs)
-	}
-	return modelStats
 }
 
 func normalizeWorkspacePath(cwd string) string {
@@ -486,55 +454,115 @@ func canonicalProjectLabel(cwd string, localByBase map[string]string) string {
 	return projectName(cwd)
 }
 
-func buildProjectStatsMap(dbProjectStats map[string]*dbModelStats) map[string]*Stats {
-	projectStats := make(map[string]*Stats)
-	cwds := make([]string, 0, len(dbProjectStats))
-	for cwd := range dbProjectStats {
-		cwds = append(cwds, cwd)
-	}
-	localByBase := buildLocalProjectByBase(cwds)
-	for cwd, dbs := range dbProjectStats {
-		proj := canonicalProjectLabel(cwd, localByBase)
-		s := dbStatsToStats(dbs, float64(dbs.UserTurns))
-		if existing, ok := projectStats[proj]; ok {
-			mergeStats(existing, s)
-		} else {
-			projectStats[proj] = s
-		}
-	}
-	return projectStats
+type derivedStats struct {
+	DailyStats             map[string]map[string]*Stats
+	ModelStats             map[string]*Stats
+	ProjectStats           map[string]*Stats
+	ProjectModelStats      map[string]map[string]*Stats
+	ProjectDailyModelStats map[string]map[string]map[string]*Stats
+	TotalRecords           int
 }
 
-func buildProjectModelStatsMap(dbProjectModelStats map[string]map[string]*dbModelStats) map[string]map[string]*Stats {
-	result := make(map[string]map[string]*Stats)
-	cwds := make([]string, 0, len(dbProjectModelStats))
-	for cwd := range dbProjectModelStats {
-		cwds = append(cwds, cwd)
-	}
-	localByBase := buildLocalProjectByBase(cwds)
-	for cwd, models := range dbProjectModelStats {
-		proj := canonicalProjectLabel(cwd, localByBase)
-		if result[proj] == nil {
-			result[proj] = make(map[string]*Stats)
+func buildAllDerivedStats(raw map[string]map[string]map[string]*dbModelStats) derivedStats {
+	dailyStats := make(map[string]map[string]*Stats)
+	projectModelDailyStats := make(map[string]map[string]map[string]*Stats)
+	totalRecords := 0
+
+	// Collect all CWDs for codespaces→local mapping
+	cwdSet := make(map[string]struct{})
+	for _, cwds := range raw {
+		for cwd := range cwds {
+			cwdSet[cwd] = struct{}{}
 		}
-		for model, dbs := range models {
-			s := dbStatsToStats(dbs, float64(dbs.UserTurns))
-			if existing, ok := result[proj][model]; ok {
-				mergeStats(existing, s)
-			} else {
-				result[proj][model] = s
+	}
+	cwdList := make([]string, 0, len(cwdSet))
+	for cwd := range cwdSet {
+		cwdList = append(cwdList, cwd)
+	}
+	localByBase := buildLocalProjectByBase(cwdList)
+
+	for day, cwds := range raw {
+		if dailyStats[day] == nil {
+			dailyStats[day] = make(map[string]*Stats)
+		}
+		for cwd, models := range cwds {
+			proj := canonicalProjectLabel(cwd, localByBase)
+			for model, dbs := range models {
+				premReqs := float64(dbs.UserTurns) * getPremiumMultiplier(model, day)
+				s := dbStatsToStats(dbs, premReqs)
+				totalRecords += dbs.APICalls
+
+				// DailyStats [day][model]
+				if existing, ok := dailyStats[day][model]; ok {
+					mergeStats(existing, s)
+				} else {
+					cp := *s
+					dailyStats[day][model] = &cp
+				}
+
+				// ProjectDailyModelStats [day][project][model]
+				if projectModelDailyStats[day] == nil {
+					projectModelDailyStats[day] = make(map[string]map[string]*Stats)
+				}
+				if projectModelDailyStats[day][proj] == nil {
+					projectModelDailyStats[day][proj] = make(map[string]*Stats)
+				}
+				if existing, ok := projectModelDailyStats[day][proj][model]; ok {
+					mergeStats(existing, s)
+				} else {
+					cp := *s
+					projectModelDailyStats[day][proj][model] = &cp
+				}
 			}
 		}
 	}
-	return result
-}
 
-func countTotalRecords(modelStats map[string]*Stats) int {
-	totalRecords := 0
-	for _, s := range modelStats {
-		totalRecords += s.APICalls
+	// Derive ModelStats from DailyStats (sum across days)
+	modelStats := make(map[string]*Stats)
+	for _, models := range dailyStats {
+		for model, s := range models {
+			if existing, ok := modelStats[model]; ok {
+				mergeStats(existing, s)
+			} else {
+				cp := *s
+				modelStats[model] = &cp
+			}
+		}
 	}
-	return totalRecords
+
+	// Derive ProjectModelStats and ProjectStats from ProjectDailyModelStats
+	projectModelStats := make(map[string]map[string]*Stats)
+	projectStats := make(map[string]*Stats)
+	for _, projects := range projectModelDailyStats {
+		for proj, models := range projects {
+			if projectModelStats[proj] == nil {
+				projectModelStats[proj] = make(map[string]*Stats)
+			}
+			for model, s := range models {
+				if existing, ok := projectModelStats[proj][model]; ok {
+					mergeStats(existing, s)
+				} else {
+					cp := *s
+					projectModelStats[proj][model] = &cp
+				}
+				if existing, ok := projectStats[proj]; ok {
+					mergeStats(existing, s)
+				} else {
+					cp := *s
+					projectStats[proj] = &cp
+				}
+			}
+		}
+	}
+
+	return derivedStats{
+		DailyStats:             dailyStats,
+		ModelStats:             modelStats,
+		ProjectStats:           projectStats,
+		ProjectModelStats:      projectModelStats,
+		ProjectDailyModelStats: projectModelDailyStats,
+		TotalRecords:           totalRecords,
+	}
 }
 
 func loadAggregatedStats(db *sql.DB, dateFrom, dateTo, projectFilter string) aggregatedStats {
@@ -547,16 +575,16 @@ func loadAggregatedStats(db *sql.DB, dateFrom, dateTo, projectFilter string) agg
 		defer tx.Rollback()
 	}
 
-	dailyStats := buildDailyStatsMap(queryDailyStats(q, dateFrom, dateTo, projectFilter))
-	modelStats := buildModelStatsMap(queryModelStats(q, dateFrom, dateTo, projectFilter), dailyStats)
+	derived := buildAllDerivedStats(queryDailyProjectModelStats(q, dateFrom, dateTo, projectFilter))
 	return aggregatedStats{
-		DailyStats:        dailyStats,
-		ModelStats:        modelStats,
-		ProjectStats:      buildProjectStatsMap(queryProjectStats(q, dateFrom, dateTo, projectFilter)),
-		ProjectModelStats: buildProjectModelStatsMap(queryProjectModelStats(q, dateFrom, dateTo, projectFilter)),
-		Records:           queryRecords(q, dateFrom, dateTo, projectFilter),
-		SessionWorkspaces: querySessionWorkspaces(q, hasBranch),
-		TotalRecords:      countTotalRecords(modelStats),
-		LogFileCount:      queryLogFileCount(q, dateFrom, dateTo, projectFilter),
+		DailyStats:             derived.DailyStats,
+		ModelStats:             derived.ModelStats,
+		ProjectStats:           derived.ProjectStats,
+		ProjectModelStats:      derived.ProjectModelStats,
+		ProjectDailyModelStats: derived.ProjectDailyModelStats,
+		Records:                queryRecords(q, dateFrom, dateTo, projectFilter),
+		SessionWorkspaces:      querySessionWorkspaces(q, hasBranch),
+		TotalRecords:           derived.TotalRecords,
+		LogFileCount:           queryLogFileCount(q, dateFrom, dateTo, projectFilter),
 	}
 }

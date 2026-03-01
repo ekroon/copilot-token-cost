@@ -96,25 +96,19 @@ func TestQueryFunctionsWithRealSQLite(t *testing.T) {
 	db, _ := newTempDBForDBQuery(t, "query.db")
 	seedQueryData(t, db)
 
-	modelStats := queryModelStats(db, "", "", "")
-	if len(modelStats) != 2 {
-		t.Fatalf("expected 2 models, got %d", len(modelStats))
+	raw := queryDailyProjectModelStats(db, "", "", "")
+	// Verify day/cwd/model structure
+	if raw["2026-01-01"]["/proj/alpha"]["claude-3-5-sonnet"].PromptTokens != 10 {
+		t.Fatalf("unexpected daily project model stats for 2026-01-01 alpha claude")
 	}
-	if modelStats["claude-3-5-sonnet"].APICalls != 1 || modelStats["claude-3-5-sonnet"].UserTurns != 1 {
-		t.Fatalf("unexpected claude stats: %+v", *modelStats["claude-3-5-sonnet"])
+	if raw["2026-01-01"]["/proj/alpha"]["claude-3-5-sonnet"].UserTurns != 1 {
+		t.Fatalf("unexpected user turns for claude: %+v", *raw["2026-01-01"]["/proj/alpha"]["claude-3-5-sonnet"])
 	}
-
-	daily := queryDailyStats(db, "", "", "")
-	if daily["2026-01-01"]["claude-3-5-sonnet"].PromptTokens != 10 {
-		t.Fatalf("unexpected daily stats for 2026-01-01")
+	if raw["2026-01-02"]["/proj/beta"]["gpt-4.1"].CompletionTokens != 7 {
+		t.Fatalf("unexpected daily project model stats for 2026-01-02 beta gpt-4.1")
 	}
-	if daily["2026-01-02"]["gpt-4.1"].CompletionTokens != 7 {
-		t.Fatalf("unexpected daily stats for 2026-01-02")
-	}
-
-	projects := queryProjectStats(db, "", "", "")
-	if projects["/proj/alpha"].APICalls != 1 || projects["/proj/beta"].APICalls != 1 {
-		t.Fatalf("unexpected project stats: %#v", projects)
+	if raw["2026-01-02"]["/proj/beta"]["gpt-4.1"].UserTurns != 0 {
+		t.Fatalf("unexpected user turns for gpt-4.1: %+v", *raw["2026-01-02"]["/proj/beta"]["gpt-4.1"])
 	}
 
 	records := queryRecords(db, "", "", "alpha")

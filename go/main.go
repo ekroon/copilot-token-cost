@@ -603,105 +603,36 @@ type dbModelStats struct {
 	UserTurns           int
 }
 
-func queryModelStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]*dbModelStats {
+func queryDailyProjectModelStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]map[string]map[string]*dbModelStats {
 	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	query := "SELECT model_normalized, COUNT(*) AS api_calls, " +
-		"SUM(prompt_tokens), SUM(completion_tokens), " +
-		"SUM(cache_creation_tokens), SUM(cache_read_tokens), " +
-		"SUM(CASE WHEN is_user_turn = 1 THEN 1 ELSE 0 END) " +
-		"FROM api_calls a" + where + " GROUP BY model_normalized"
+	query := "SELECT substr(a.timestamp, 1, 10) AS day, COALESCE(sw.cwd, '') AS cwd, " +
+		"a.model_normalized, COUNT(*) AS api_calls, " +
+		"SUM(a.prompt_tokens), SUM(a.completion_tokens), " +
+		"SUM(a.cache_creation_tokens), SUM(a.cache_read_tokens), " +
+		"SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) " +
+		"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id AND a.source = sw.source" + where +
+		" GROUP BY day, cwd, a.model_normalized"
 	rows, err := q.Query(query, params...)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
-	result := make(map[string]*dbModelStats)
+	result := make(map[string]map[string]map[string]*dbModelStats)
 	for rows.Next() {
-		var model string
+		var day, cwd, model string
 		var s dbModelStats
-		rows.Scan(&model, &s.APICalls, &s.PromptTokens, &s.CompletionTokens,
-			&s.CacheCreationTokens, &s.CacheReadTokens, &s.UserTurns)
-		result[model] = &s
-	}
-	return result
-}
-
-func queryDailyStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]map[string]*dbModelStats {
-	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	query := "SELECT substr(a.timestamp, 1, 10) AS day, model_normalized, " +
-		"COUNT(*) AS api_calls, SUM(prompt_tokens), SUM(completion_tokens), " +
-		"SUM(cache_creation_tokens), SUM(cache_read_tokens), " +
-		"SUM(CASE WHEN is_user_turn = 1 THEN 1 ELSE 0 END) " +
-		"FROM api_calls a" + where + " GROUP BY day, model_normalized"
-	rows, err := q.Query(query, params...)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	result := make(map[string]map[string]*dbModelStats)
-	for rows.Next() {
-		var day, model string
-		var s dbModelStats
-		rows.Scan(&day, &model, &s.APICalls, &s.PromptTokens, &s.CompletionTokens,
+		rows.Scan(&day, &cwd, &model, &s.APICalls, &s.PromptTokens, &s.CompletionTokens,
 			&s.CacheCreationTokens, &s.CacheReadTokens, &s.UserTurns)
 		if day == "" {
 			day = "unknown"
 		}
 		if result[day] == nil {
-			result[day] = make(map[string]*dbModelStats)
+			result[day] = make(map[string]map[string]*dbModelStats)
 		}
-		result[day][model] = &s
-	}
-	return result
-}
-
-func queryProjectStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]*dbModelStats {
-	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	query := "SELECT COALESCE(sw.cwd, '') AS cwd, COUNT(*) AS api_calls, " +
-		"SUM(a.prompt_tokens), SUM(a.completion_tokens), " +
-		"SUM(a.cache_creation_tokens), SUM(a.cache_read_tokens), " +
-		"SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) " +
-		"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id AND a.source = sw.source" + where +
-		" GROUP BY cwd"
-	rows, err := q.Query(query, params...)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	result := make(map[string]*dbModelStats)
-	for rows.Next() {
-		var cwd string
-		var s dbModelStats
-		rows.Scan(&cwd, &s.APICalls, &s.PromptTokens, &s.CompletionTokens,
-			&s.CacheCreationTokens, &s.CacheReadTokens, &s.UserTurns)
-		result[cwd] = &s
-	}
-	return result
-}
-
-func queryProjectModelStats(q dbQuerier, dateFrom, dateTo, projectFilter string) map[string]map[string]*dbModelStats {
-	where, params := buildFilters(dateFrom, dateTo, projectFilter)
-	query := "SELECT COALESCE(sw.cwd, '') AS cwd, a.model_normalized, COUNT(*) AS api_calls, " +
-		"SUM(a.prompt_tokens), SUM(a.completion_tokens), " +
-		"SUM(a.cache_creation_tokens), SUM(a.cache_read_tokens), " +
-		"SUM(CASE WHEN a.is_user_turn = 1 THEN 1 ELSE 0 END) " +
-		"FROM api_calls a LEFT JOIN session_workspaces sw ON a.session_id = sw.session_id AND a.source = sw.source" + where +
-		" GROUP BY cwd, a.model_normalized"
-	rows, err := q.Query(query, params...)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	result := make(map[string]map[string]*dbModelStats)
-	for rows.Next() {
-		var cwd, model string
-		var s dbModelStats
-		rows.Scan(&cwd, &model, &s.APICalls, &s.PromptTokens, &s.CompletionTokens,
-			&s.CacheCreationTokens, &s.CacheReadTokens, &s.UserTurns)
-		if result[cwd] == nil {
-			result[cwd] = make(map[string]*dbModelStats)
+		if result[day][cwd] == nil {
+			result[day][cwd] = make(map[string]*dbModelStats)
 		}
-		result[cwd][model] = &s
+		result[day][cwd][model] = &s
 	}
 	return result
 }
