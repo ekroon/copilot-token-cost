@@ -373,7 +373,6 @@ func TestWebStateTodayWindowPropagatesToSnapshotAndOutput(t *testing.T) {
 	oldTS := time.Date(2026, time.January, 1, 10, 0, 0, 0, time.Local)
 	todayTS := time.Date(2026, time.January, 2, 10, 0, 0, 0, time.Local)
 
-	todayMidnight := time.Date(2026, time.January, 2, 0, 0, 0, 0, time.Local)
 	dateRange := "2026-01-02 → 2026-01-02"
 	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
 	seedDB := initDB(getDBPath())
@@ -400,16 +399,15 @@ func TestWebStateTodayWindowPropagatesToSnapshotAndOutput(t *testing.T) {
 	_ = seedDB.Close()
 
 	state, err := newWebState(webModeConfig{
-		LogsDir:       logsDir,
-		SessionDir:    sessionDir,
-		PeriodLabel:   "today",
-		DateRange:     dateRange,
-		DateFromQuery: todayMidnight.Format("2006-01-02T15:04:05"),
-		SyncFrom:      &todayMidnight,
+		LogsDir:    logsDir,
+		SessionDir: sessionDir,
+		DateWindow: dateWindowSpec{Mode: "today"},
 	})
 	if err != nil {
 		t.Fatalf("newWebState: %v", err)
 	}
+	state.nowFn = func() time.Time { return todayTS }
+	state.rebuildSnapshot()
 	t.Cleanup(state.close)
 
 	payload, ok := state.getSnapshot()
@@ -827,10 +825,8 @@ func TestStartLocalStreamingLoopWatcherInitFailureFallsBack(t *testing.T) {
 
 func TestRebuildSnapshotUsesConfiguredDateWindow(t *testing.T) {
 	state := newTestWebState(t, t.TempDir())
-	state.periodLabel = "today"
-	state.dateRange = "2026-01-02 → 2026-01-02"
-	state.dateFromQuery = "2026-01-02T00:00:00"
-	state.dateToQuery = "2026-01-03T00:00:00"
+	state.dateWindow = dateWindowSpec{Mode: "today"}
+	state.nowFn = func() time.Time { return time.Date(2026, 1, 2, 10, 0, 0, 0, time.Local) }
 
 	insertRecords(state.db, []Record{
 		{
@@ -861,8 +857,9 @@ func TestRebuildSnapshotUsesConfiguredDateWindow(t *testing.T) {
 	if payload.Period != "today" {
 		t.Fatalf("period=%q, want=%q", payload.Period, "today")
 	}
-	if payload.DateRange == nil || *payload.DateRange != state.dateRange {
-		t.Fatalf("date range=%v, want=%q", payload.DateRange, state.dateRange)
+	expectedRange := "2026-01-02 → 2026-01-02"
+	if payload.DateRange == nil || *payload.DateRange != expectedRange {
+		t.Fatalf("date range=%v, want=%q", payload.DateRange, expectedRange)
 	}
 	if payload.APICalls != 1 {
 		t.Fatalf("api calls=%d, want=1", payload.APICalls)
@@ -2437,5 +2434,165 @@ func TestBuildRefreshPatchPreservesExpandedRows(t *testing.T) {
 	}
 	if strings.Contains(collapsedPatch, `class="detail-table"`) {
 		t.Fatalf("collapsed patch unexpectedly contains detail-table content")
+	}
+}
+
+func TestDateWindowSpecComputeBoundsAllTime(t *testing.T) {
+	spec := dateWindowSpec{AllTime: true}
+	b := spec.computeBounds(time.Date(2026, 3, 4, 10, 30, 0, 0, time.UTC))
+	if b.DateFromQuery != "" || b.DateToQuery != "" || b.DateRange != "" {
+		t.Fatalf("all-time should have empty date bounds, got from=%q to=%q range=%q", b.DateFromQuery, b.DateToQuery, b.DateRange)
+	}
+	if b.PeriodLabel != "all time" {
+		t.Fatalf("expected period label 'all time', got %q", b.PeriodLabel)
+	}
+	if b.SyncFrom != nil || b.SyncTo != nil {
+		t.Fatalf("all-time should have nil sync bounds")
+	}
+}
+
+func TestDateWindowSpecComputeBoundsToday(t *testing.T) {
+	spec := dateWindowSpec{Mode: "today"}
+	now := time.Date(2026, 3, 4, 14, 30, 0, 0, time.UTC)
+	b := spec.computeBounds(now)
+	if b.DateFromQuery != "2026-03-04T00:00:00" {
+		t.Fatalf("expected from 2026-03-04T00:00:00, got %q", b.DateFromQuery)
+	}
+	if b.DateToQuery != "" {
+		t.Fatalf("expected empty to, got %q", b.DateToQuery)
+	}
+	if b.DateRange != "2026-03-04 → 2026-03-04" {
+		t.Fatalf("expected range '2026-03-04 → 2026-03-04', got %q", b.DateRange)
+	}
+	if b.PeriodLabel != "today" {
+		t.Fatalf("expected 'today', got %q", b.PeriodLabel)
+	}
+}
+
+func TestDateWindowSpecComputeBoundsTodayRollsForward(t *testing.T) {
+	spec := dateWindowSpec{Mode: "today"}
+	b1 := spec.computeBounds(time.Date(2026, 3, 3, 23, 59, 0, 0, time.UTC))
+	b2 := spec.computeBounds(time.Date(2026, 3, 4, 0, 1, 0, 0, time.UTC))
+	if b1.DateFromQuery == b2.DateFromQuery {
+		t.Fatalf("today mode should roll forward across midnight, but both got %q", b1.DateFromQuery)
+	}
+	if b2.DateFromQuery != "2026-03-04T00:00:00" {
+		t.Fatalf("expected 2026-03-04T00:00:00 after midnight, got %q", b2.DateFromQuery)
+	}
+	if b2.DateRange != "2026-03-04 → 2026-03-04" {
+		t.Fatalf("expected range to show Mar 4 after midnight, got %q", b2.DateRange)
+	}
+}
+
+func TestDateWindowSpecComputeBoundsYesterday(t *testing.T) {
+	spec := dateWindowSpec{Mode: "yesterday"}
+	b := spec.computeBounds(time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC))
+	if b.DateFromQuery != "2026-03-03T00:00:00" {
+		t.Fatalf("expected from 2026-03-03T00:00:00, got %q", b.DateFromQuery)
+	}
+	if b.DateToQuery != "2026-03-04T00:00:00" {
+		t.Fatalf("expected to 2026-03-04T00:00:00, got %q", b.DateToQuery)
+	}
+	if b.PeriodLabel != "yesterday" {
+		t.Fatalf("expected 'yesterday', got %q", b.PeriodLabel)
+	}
+}
+
+func TestDateWindowSpecComputeBoundsYesterdayRollsForward(t *testing.T) {
+	spec := dateWindowSpec{Mode: "yesterday"}
+	b1 := spec.computeBounds(time.Date(2026, 3, 3, 23, 0, 0, 0, time.UTC))
+	b2 := spec.computeBounds(time.Date(2026, 3, 4, 1, 0, 0, 0, time.UTC))
+	if b1.DateFromQuery == b2.DateFromQuery {
+		t.Fatalf("yesterday mode should roll forward, both got %q", b1.DateFromQuery)
+	}
+	if b2.DateFromQuery != "2026-03-03T00:00:00" {
+		t.Fatalf("expected from 2026-03-03T00:00:00 on Mar 4, got %q", b2.DateFromQuery)
+	}
+}
+
+func TestDateWindowSpecComputeBoundsDefault7Days(t *testing.T) {
+	spec := dateWindowSpec{Mode: "days", Days: 7}
+	b := spec.computeBounds(time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC))
+	if b.DateFromQuery != "2026-02-26T00:00:00" {
+		t.Fatalf("expected from 2026-02-26T00:00:00, got %q", b.DateFromQuery)
+	}
+	if b.DateToQuery != "" {
+		t.Fatalf("expected empty to, got %q", b.DateToQuery)
+	}
+	if b.DateRange != "2026-02-26 → 2026-03-04" {
+		t.Fatalf("expected range '2026-02-26 → 2026-03-04', got %q", b.DateRange)
+	}
+	if b.PeriodLabel != "last 7 days" {
+		t.Fatalf("expected 'last 7 days', got %q", b.PeriodLabel)
+	}
+}
+
+func TestDateWindowSpecComputeBounds7DaysRollsForward(t *testing.T) {
+	spec := dateWindowSpec{Mode: "days", Days: 7}
+	b1 := spec.computeBounds(time.Date(2026, 3, 3, 23, 0, 0, 0, time.UTC))
+	b2 := spec.computeBounds(time.Date(2026, 3, 4, 1, 0, 0, 0, time.UTC))
+	if b1.DateFromQuery == b2.DateFromQuery {
+		t.Fatalf("7-day window should slide forward, both got %q", b1.DateFromQuery)
+	}
+	if b2.DateFromQuery != "2026-02-26T00:00:00" {
+		t.Fatalf("expected from 2026-02-26T00:00:00 on Mar 4, got %q", b2.DateFromQuery)
+	}
+	if b2.DateRange != "2026-02-26 → 2026-03-04" {
+		t.Fatalf("expected range ending Mar 4, got %q", b2.DateRange)
+	}
+}
+
+func TestDateWindowSpecComputeBoundsFromTo(t *testing.T) {
+	spec := dateWindowSpec{Mode: "from-to", FromDays: 3, ToDays: 1}
+	b := spec.computeBounds(time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC))
+	if b.DateFromQuery != "2026-03-01T00:00:00" {
+		t.Fatalf("expected from 2026-03-01T00:00:00, got %q", b.DateFromQuery)
+	}
+	if b.DateToQuery != "2026-03-04T00:00:00" {
+		t.Fatalf("expected to 2026-03-04T00:00:00, got %q", b.DateToQuery)
+	}
+	if b.PeriodLabel != "3d ago → 1d ago" {
+		t.Fatalf("expected '3d ago → 1d ago', got %q", b.PeriodLabel)
+	}
+}
+
+func TestDateWindowSpecComputeBoundsFromOnly(t *testing.T) {
+	spec := dateWindowSpec{Mode: "from-to", FromDays: 5, ToDays: 0}
+	b := spec.computeBounds(time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC))
+	if b.DateFromQuery != "2026-02-27T00:00:00" {
+		t.Fatalf("expected from 2026-02-27T00:00:00, got %q", b.DateFromQuery)
+	}
+	if b.DateToQuery != "" {
+		t.Fatalf("expected empty to, got %q", b.DateToQuery)
+	}
+	if b.PeriodLabel != "5d ago → today" {
+		t.Fatalf("expected '5d ago → today', got %q", b.PeriodLabel)
+	}
+}
+
+func TestDateWindowSpecComputeBoundsSyncBounds(t *testing.T) {
+	spec := dateWindowSpec{Mode: "days", Days: 7}
+	b := spec.computeBounds(time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC))
+	if b.SyncFrom == nil {
+		t.Fatal("expected non-nil SyncFrom")
+	}
+	expected := time.Date(2026, 2, 26, 0, 0, 0, 0, time.UTC)
+	if !b.SyncFrom.Equal(expected) {
+		t.Fatalf("expected SyncFrom %v, got %v", expected, *b.SyncFrom)
+	}
+	if b.SyncTo != nil {
+		t.Fatalf("expected nil SyncTo for open-ended window, got %v", *b.SyncTo)
+	}
+}
+
+func TestDateWindowSpecComputeBoundsSyncBoundsWithEndCap(t *testing.T) {
+	spec := dateWindowSpec{Mode: "yesterday"}
+	b := spec.computeBounds(time.Date(2026, 3, 4, 10, 0, 0, 0, time.UTC))
+	if b.SyncTo == nil {
+		t.Fatal("expected non-nil SyncTo for yesterday mode")
+	}
+	expectedTo := time.Date(2026, 3, 4, 0, 0, 0, 0, time.UTC)
+	if !b.SyncTo.Equal(expectedTo) {
+		t.Fatalf("expected SyncTo %v, got %v", expectedTo, *b.SyncTo)
 	}
 }

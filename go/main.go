@@ -1446,17 +1446,21 @@ func runLegacyCLI() {
 		}
 	}
 
+	var dateWindow dateWindowSpec
 	if *allFlag {
 		useCutoffMin = true
 		periodLabel = "all time"
+		dateWindow = dateWindowSpec{AllTime: true}
 	} else if *todayFlag {
 		cutoff = todayMidnight
 		periodLabel = "today"
+		dateWindow = dateWindowSpec{Mode: "today"}
 	} else if *yesterdayFlag {
 		cutoff = todayMidnight.AddDate(0, 0, -1)
 		end := todayMidnight
 		cutoffEnd = &end
 		periodLabel = "yesterday"
+		dateWindow = dateWindowSpec{Mode: "yesterday"}
 	} else if *fromDays >= 0 {
 		fd := *fromDays
 		td := *toDays
@@ -1480,6 +1484,7 @@ func runLegacyCLI() {
 			}
 			periodLabel = fmt.Sprintf("%dd ago → %s", fd, toStr)
 		}
+		dateWindow = dateWindowSpec{Mode: "from-to", FromDays: fd, ToDays: td}
 	} else {
 		if !daysSet {
 			days = 7
@@ -1490,6 +1495,7 @@ func runLegacyCLI() {
 		} else {
 			periodLabel = fmt.Sprintf("last %d days", days)
 		}
+		dateWindow = dateWindowSpec{Mode: "days", Days: days}
 	}
 
 	// Date range label and DB query params
@@ -1531,12 +1537,7 @@ func runLegacyCLI() {
 			CodespacesIncludeStopped: *codespacesIncludeStopped,
 			LogsDir:                  logsDir,
 			SessionDir:               sessionDir,
-			PeriodLabel:              periodLabel,
-			DateRange:                dateRange,
-			DateFromQuery:            dateFromQuery,
-			DateToQuery:              dateToQuery,
-			SyncFrom:                 syncFrom,
-			SyncTo:                   syncTo,
+			DateWindow:               dateWindow,
 		}
 		if err := runWebMode(cfg); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

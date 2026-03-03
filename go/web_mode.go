@@ -36,24 +36,15 @@ type webModeConfig struct {
 	CodespacesIncludeStopped bool
 	LogsDir                  string
 	SessionDir               string
-	PeriodLabel              string
-	DateRange                string
-	DateFromQuery            string
-	DateToQuery              string
-	SyncFrom                 *time.Time
-	SyncTo                   *time.Time
+	DateWindow               dateWindowSpec
 }
 
 type webState struct {
 	db                       *sql.DB
 	logsDir                  string
 	sessionDir               string
-	periodLabel              string
-	dateRange                string
-	dateFromQuery            string
-	dateToQuery              string
-	syncFrom                 *time.Time
-	syncTo                   *time.Time
+	dateWindow               dateWindowSpec
+	nowFn                    func() time.Time
 	localStreaming           bool
 	codespacesMode           string
 	codespacesStreaming      bool
@@ -87,6 +78,93 @@ type webState struct {
 type localLogState struct {
 	Size  int64
 	MTime time.Time
+}
+
+type dateWindowSpec struct {
+	AllTime  bool
+	Mode     string // "today", "yesterday", "from-to", "days"
+	Days     int    // for "days" mode (default 7)
+	FromDays int    // for "from-to" mode
+	ToDays   int    // for "from-to" mode (0 = no upper bound, >0 = N days ago)
+}
+
+type dateWindowBounds struct {
+	DateFromQuery string
+	DateToQuery   string
+	DateRange     string
+	PeriodLabel   string
+	SyncFrom      *time.Time
+	SyncTo        *time.Time
+}
+
+func (spec dateWindowSpec) computeBounds(now time.Time) dateWindowBounds {
+	if spec.AllTime {
+		return dateWindowBounds{PeriodLabel: "all time"}
+	}
+
+	todayMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	var cutoff time.Time
+	var cutoffEnd *time.Time
+	var periodLabel string
+
+	switch spec.Mode {
+	case "today":
+		cutoff = todayMidnight
+		periodLabel = "today"
+	case "yesterday":
+		cutoff = todayMidnight.AddDate(0, 0, -1)
+		end := todayMidnight
+		cutoffEnd = &end
+		periodLabel = "yesterday"
+	case "from-to":
+		fd := spec.FromDays
+		td := spec.ToDays
+		cutoff = todayMidnight.AddDate(0, 0, -fd)
+		if td > 0 {
+			end := todayMidnight.AddDate(0, 0, -td+1)
+			cutoffEnd = &end
+		}
+		if fd == td {
+			periodLabel = fmt.Sprintf("%s (1 day)", cutoff.Format("2006-01-02"))
+		} else {
+			toStr := "today"
+			if td > 0 {
+				toStr = fmt.Sprintf("%dd ago", td)
+			}
+			periodLabel = fmt.Sprintf("%dd ago → %s", fd, toStr)
+		}
+	default: // "days"
+		days := spec.Days
+		if days <= 0 {
+			days = 7
+		}
+		cutoff = todayMidnight.AddDate(0, 0, -(days - 1))
+		if days == 1 {
+			periodLabel = "last 1 day"
+		} else {
+			periodLabel = fmt.Sprintf("last %d days", days)
+		}
+	}
+
+	var b dateWindowBounds
+	b.PeriodLabel = periodLabel
+	b.DateFromQuery = cutoff.Format("2006-01-02T15:04:05")
+
+	dateFromDisplay := cutoff.Format("2006-01-02")
+	var dateToDisplay string
+	if cutoffEnd != nil {
+		b.DateToQuery = cutoffEnd.Format("2006-01-02T15:04:05")
+		dateToDisplay = cutoffEnd.AddDate(0, 0, -1).Format("2006-01-02")
+		syncTo := *cutoffEnd
+		b.SyncTo = &syncTo
+	} else {
+		dateToDisplay = now.Format("2006-01-02")
+	}
+	b.DateRange = dateFromDisplay + " → " + dateToDisplay
+
+	syncFrom := cutoff
+	b.SyncFrom = &syncFrom
+	return b
 }
 
 type webActionError struct {
@@ -133,6 +211,13 @@ var newFSWatcher = fsnotify.NewWatcher
 
 func (e *webActionError) Error() string {
 	return e.message
+}
+
+func (s *webState) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
 }
 
 func newSyncSourceStatus(code, reason string) syncSourceStatus {
@@ -220,12 +305,7 @@ func newWebState(cfg webModeConfig) (*webState, error) {
 		db:                       db,
 		logsDir:                  cfg.LogsDir,
 		sessionDir:               cfg.SessionDir,
-		periodLabel:              strings.TrimSpace(cfg.PeriodLabel),
-		dateRange:                strings.TrimSpace(cfg.DateRange),
-		dateFromQuery:            strings.TrimSpace(cfg.DateFromQuery),
-		dateToQuery:              strings.TrimSpace(cfg.DateToQuery),
-		syncFrom:                 cfg.SyncFrom,
-		syncTo:                   cfg.SyncTo,
+		dateWindow:               cfg.DateWindow,
 		localStreaming:           cfg.LocalStreaming,
 		codespacesMode:           mode,
 		webLogMode:               logMode,
@@ -576,12 +656,10 @@ func (s *webState) beginSyncAction(source string) error {
 }
 
 func (s *webState) rebuildSnapshot() {
-	periodLabel := strings.TrimSpace(s.periodLabel)
-	if periodLabel == "" {
-		periodLabel = "all time"
-	}
-	aggregated := loadAggregatedStats(s.db, s.dateFromQuery, s.dateToQuery, "")
-	payload := buildStatsPayload(aggregated, periodLabel, s.dateRange, 0)
+	now := s.now()
+	bounds := s.dateWindow.computeBounds(now)
+	aggregated := loadAggregatedStats(s.db, bounds.DateFromQuery, bounds.DateToQuery, "")
+	payload := buildStatsPayload(aggregated, bounds.PeriodLabel, bounds.DateRange, 0)
 
 	s.snapshotMu.Lock()
 	payload.SyncStatus = cloneSyncStatus(s.syncStatus)
@@ -589,7 +667,7 @@ func (s *webState) rebuildSnapshot() {
 	s.hasData = true
 	s.snapshotMu.Unlock()
 
-	patch, err := s.buildDashboardPatch(payload, time.Now())
+	patch, err := s.buildDashboardPatch(payload, now)
 	if err != nil {
 		s.logErrorf("web snapshot patch build failed: %v", err)
 		return
@@ -646,7 +724,8 @@ func (s *webState) refreshLocalSnapshotWithForce(force bool) error {
 			message: statusReason,
 		}
 	} else {
-		syncLogsToDBWithLogf(s.db, logsDir, s.sessionDir, force, "local", s.syncFrom, s.syncTo, s.syncLogf)
+		bounds := s.dateWindow.computeBounds(s.now())
+		syncLogsToDBWithLogf(s.db, logsDir, s.sessionDir, force, "local", bounds.SyncFrom, bounds.SyncTo, s.syncLogf)
 		s.setSyncStatus("local", webSyncCodeOK, webSyncReasonLocalSyncCompleted)
 	}
 
