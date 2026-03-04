@@ -43,11 +43,12 @@ type CodespaceCopyResult struct {
 }
 
 type RuntimeDeps struct {
-	ParseLogFileInRange   func(logPath string, minTimestamp string, maxTimestamp string) []domain.Record
-	LoadSessionWorkspaces func(sessionDir string) map[string]WorkspaceMeta
-	NormalizeModel        func(string) string
-	PromptTextForStorage  func(*string) sql.NullString
-	AddCommas             func(string) string
+	ParseLogFileInRange    func(logPath string, minTimestamp string, maxTimestamp string) []domain.Record
+	LoadSessionWorkspaces  func(sessionDir string) map[string]WorkspaceMeta
+	NormalizeModel         func(string) string
+	PromptTextForStorage   func(*string) sql.NullString
+	AddCommas              func(string) string
+	ReattributeUserTurns   func(records []domain.Record)
 }
 
 type Service struct {
@@ -90,6 +91,9 @@ func (s *Service) SetRuntimeDeps(deps RuntimeDeps) {
 	}
 	if deps.AddCommas != nil {
 		s.runtime.AddCommas = deps.AddCommas
+	}
+	if deps.ReattributeUserTurns != nil {
+		s.runtime.ReattributeUserTurns = deps.ReattributeUserTurns
 	}
 }
 
@@ -190,6 +194,9 @@ func (s *Service) SyncLogsToDB(logsDir, sessionDir string, force bool, source st
 			}
 		}
 		records := s.runtime.ParseLogFileInRange(logPath, minTimestamp, maxTimestamp)
+		if s.runtime.ReattributeUserTurns != nil {
+			s.runtime.ReattributeUserTurns(records)
+		}
 		for _, r := range records {
 			syncTx.InsertRecord(r)
 		}

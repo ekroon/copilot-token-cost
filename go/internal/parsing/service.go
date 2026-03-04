@@ -11,15 +11,16 @@ import (
 )
 
 var (
-	reSession       = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^"]*(?:Workspace initialized|Created ACP session|Flushed \d+ events to session)[: ]+([0-9a-f-]{36})\b`)
-	reInitiator     = regexp.MustCompile(`PremiumRequestProcessor: Setting X-Initiator to '([^']*)'`)
-	reModelJSON     = regexp.MustCompile(`"model"\s*:\s*"([^"]+)"`)
-	rePromptTokens  = regexp.MustCompile(`"prompt_tokens"\s*:\s*(\d+)`)
-	reCompTokens    = regexp.MustCompile(`"completion_tokens"\s*:\s*(\d+)`)
-	reCacheCreation = regexp.MustCompile(`"cache_creation_input_tokens"\s*:\s*(\d+)`)
-	reCacheRead     = regexp.MustCompile(`"cache_read_input_tokens"\s*:\s*(\d+)`)
-	reCachedTokens  = regexp.MustCompile(`"cached_tokens"\s*:\s*(\d+)`)
-	reStatementLine = regexp.MustCompile(`"statement"\s*:\s*("(?:\\.|[^"\\])*")\s*,?\s*$`)
+	reSession            = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^"]*(?:Workspace initialized|Created ACP session|Flushed \d+ events to session)[: ]+([0-9a-f-]{36})\b`)
+	reInitiator          = regexp.MustCompile(`PremiumRequestProcessor: Setting X-Initiator to '([^']*)'`)
+	reInitiatorTelemetry = regexp.MustCompile(`^\s*"initiator"\s*:\s*"([^"]+)"`)
+	reModelJSON          = regexp.MustCompile(`"model"\s*:\s*"([^"]+)"`)
+	rePromptTokens       = regexp.MustCompile(`"prompt_tokens"\s*:\s*(\d+)`)
+	reCompTokens         = regexp.MustCompile(`"completion_tokens"\s*:\s*(\d+)`)
+	reCacheCreation      = regexp.MustCompile(`"cache_creation_input_tokens"\s*:\s*(\d+)`)
+	reCacheRead          = regexp.MustCompile(`"cache_read_input_tokens"\s*:\s*(\d+)`)
+	reCachedTokens       = regexp.MustCompile(`"cached_tokens"\s*:\s*(\d+)`)
+	reStatementLine      = regexp.MustCompile(`"statement"\s*:\s*("(?:\\.|[^"\\])*")\s*,?\s*$`)
 )
 
 type Service struct{}
@@ -52,6 +53,11 @@ func ParseLogContent(content, logPath, minTimestamp, maxTimestamp string) []doma
 		}
 		if strings.Contains(line, "PremiumRequestProcessor: Setting X-Initiator") {
 			if m := reInitiator.FindStringSubmatch(line); m != nil {
+				lastInitiator = strings.TrimSpace(m[1])
+			}
+		}
+		if strings.Contains(line, `"initiator"`) {
+			if m := reInitiatorTelemetry.FindStringSubmatch(line); m != nil {
 				lastInitiator = strings.TrimSpace(m[1])
 			}
 		}

@@ -539,6 +539,11 @@ func syncServiceForDBWithLogf(db *sql.DB, logf func(format string, args ...inter
 		NormalizeModel:       normalizeModel,
 		PromptTextForStorage: promptTextForStorage,
 		AddCommas:            addCommas,
+		ReattributeUserTurns: func(records []domain.Record) {
+			costing.ReattributeUserTurns(records, func(model, timestamp string) float64 {
+				return costing.GetPremiumMultiplier(pricingPeriods, model, timestamp)
+			})
+		},
 	})
 	service.SetLogf(logf)
 	return service

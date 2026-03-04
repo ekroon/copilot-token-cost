@@ -350,7 +350,8 @@ func (s *Service) BeginLogSyncTx(source string, normalizeModel func(string) stri
 			"ELSE api_calls.prompt_text END, " +
 			"session_id = CASE " +
 			"WHEN COALESCE(excluded.session_id, '') <> '' THEN excluded.session_id " +
-			"ELSE api_calls.session_id END")
+			"ELSE api_calls.session_id END, " +
+			"is_user_turn = excluded.is_user_turn")
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, err

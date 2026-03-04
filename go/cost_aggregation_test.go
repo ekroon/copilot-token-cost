@@ -3,6 +3,8 @@ package main
 import (
 	"math"
 	"testing"
+
+	"copilot-token-cost/internal/costing"
 )
 
 func setTestPricing(t *testing.T) {
@@ -303,4 +305,87 @@ func TestAllViewsPremiumConsistency(t *testing.T) {
 	if !almostEqual(modelPremCost, projectModelPremCost) {
 		t.Fatalf("model premium cost=%f != project-model premium cost=%f", modelPremCost, projectModelPremCost)
 	}
+}
+
+func TestReattributeUserTurns(t *testing.T) {
+	original := pricingPeriods
+	pricingPeriods = []PricingPeriod{
+		{
+			EffectiveFrom:      "2025-01-01",
+			PremiumRequestCost: 0.04,
+			ModelPricing: map[string]Pricing{
+				"gpt-5-mini":         {Input: 0.15, Output: 0.60},
+				"claude-opus-4.6-1m": {Input: 5.0, Output: 25.0},
+				"claude-opus-4.6":    {Input: 5.0, Output: 25.0},
+			},
+			PremiumMultiplier: map[string]float64{
+				"gpt-5-mini":         0,
+				"claude-opus-4.6-1m": 3,
+				"claude-opus-4.6":    3,
+			},
+		},
+	}
+	t.Cleanup(func() { pricingPeriods = original })
+
+	t.Run("transfers user turn from zero-multiplier to next non-zero", func(t *testing.T) {
+		records := []Record{
+			{Model: "gpt-5-mini", PromptTokens: 300, CompletionTokens: 200, IsUserTurn: true, Timestamp: "2025-01-01T10:00:00"},
+			{Model: "claude-opus-4.6-1m", PromptTokens: 5000, CompletionTokens: 500, IsUserTurn: false, Timestamp: "2025-01-01T10:00:05"},
+		}
+		costing.ReattributeUserTurns(records, func(model, ts string) float64 {
+			return getPremiumMultiplier(model, ts)
+		})
+		if records[0].IsUserTurn {
+			t.Fatal("expected gpt-5-mini to lose user turn")
+		}
+		if !records[1].IsUserTurn {
+			t.Fatal("expected opus to gain user turn")
+		}
+	})
+
+	t.Run("no-op when user turn already on non-zero multiplier", func(t *testing.T) {
+		records := []Record{
+			{Model: "claude-opus-4.6", PromptTokens: 5000, CompletionTokens: 500, IsUserTurn: true, Timestamp: "2025-01-01T10:00:00"},
+			{Model: "claude-opus-4.6", PromptTokens: 6000, CompletionTokens: 600, IsUserTurn: false, Timestamp: "2025-01-01T10:00:05"},
+		}
+		costing.ReattributeUserTurns(records, func(model, ts string) float64 {
+			return getPremiumMultiplier(model, ts)
+		})
+		if !records[0].IsUserTurn {
+			t.Fatal("expected first record to keep user turn")
+		}
+		if records[1].IsUserTurn {
+			t.Fatal("expected second record to stay non-user-turn")
+		}
+	})
+
+	t.Run("no transfer when no subsequent non-zero model", func(t *testing.T) {
+		records := []Record{
+			{Model: "gpt-5-mini", PromptTokens: 300, CompletionTokens: 200, IsUserTurn: true, Timestamp: "2025-01-01T10:00:00"},
+		}
+		costing.ReattributeUserTurns(records, func(model, ts string) float64 {
+			return getPremiumMultiplier(model, ts)
+		})
+		if !records[0].IsUserTurn {
+			t.Fatal("expected user turn to stay when no non-zero model follows")
+		}
+	})
+
+	t.Run("handles multiple user turns independently", func(t *testing.T) {
+		records := []Record{
+			{Model: "gpt-5-mini", PromptTokens: 300, CompletionTokens: 200, IsUserTurn: true, Timestamp: "2025-01-01T10:00:00"},
+			{Model: "claude-opus-4.6-1m", PromptTokens: 5000, CompletionTokens: 500, IsUserTurn: false, Timestamp: "2025-01-01T10:00:05"},
+			{Model: "gpt-5-mini", PromptTokens: 300, CompletionTokens: 200, IsUserTurn: true, Timestamp: "2025-01-01T11:00:00"},
+			{Model: "claude-opus-4.6", PromptTokens: 6000, CompletionTokens: 600, IsUserTurn: false, Timestamp: "2025-01-01T11:00:05"},
+		}
+		costing.ReattributeUserTurns(records, func(model, ts string) float64 {
+			return getPremiumMultiplier(model, ts)
+		})
+		if records[0].IsUserTurn || !records[1].IsUserTurn {
+			t.Fatal("first turn not transferred correctly")
+		}
+		if records[2].IsUserTurn || !records[3].IsUserTurn {
+			t.Fatal("second turn not transferred correctly")
+		}
+	})
 }

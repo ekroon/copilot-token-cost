@@ -199,6 +199,69 @@ func TestParseLogFileIgnoresNonUserInitiatorVariants(t *testing.T) {
 	}
 }
 
+func TestParseLogFileTelemetryInitiatorOverridesAfterSessionNaming(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "telemetry.log")
+	content := `2025-01-01T10:00:00 PremiumRequestProcessor: Setting X-Initiator to 'user'
+2025-01-01T10:00:01 {"model":"gpt-5-mini"}
+2025-01-01T10:00:02 {"prompt_tokens":300,"completion_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+2025-01-01T10:00:03 Generated session name: "Test Session"
+2025-01-01T10:00:04 [Telemetry] cli.telemetry:
+{
+  "kind": "assistant_usage",
+  "properties": {
+    "model": "claude-opus-4.6-1m",
+    "initiator": "user",
+    "api_call_id": "msg_test"
+  }
+}
+2025-01-01T10:00:05 {"model":"claude-opus-4.6-1m"}
+2025-01-01T10:00:06 {"prompt_tokens":5000,"completion_tokens":500,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(records))
+	}
+	if !records[0].IsUserTurn {
+		t.Fatalf("expected gpt-5-mini record to have IsUserTurn=true (from X-Initiator): %+v", records[0])
+	}
+	if !records[1].IsUserTurn {
+		t.Fatalf("expected opus record to have IsUserTurn=true (from telemetry initiator): %+v", records[1])
+	}
+	if records[1].Model != "claude-opus-4.6-1m" {
+		t.Fatalf("expected opus model, got %s", records[1].Model)
+	}
+}
+
+func TestParseLogFileTelemetryInitiatorAgentDoesNotPromote(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "agent.log")
+	content := `2025-01-01T10:00:00 {"model":"claude-opus-4.6"}
+2025-01-01T10:00:01 {"prompt_tokens":5000,"completion_tokens":500,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+    "initiator": "agent",
+2025-01-01T10:00:03 {"model":"claude-opus-4.6"}
+2025-01-01T10:00:04 {"prompt_tokens":6000,"completion_tokens":600,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(records))
+	}
+	if records[0].IsUserTurn {
+		t.Fatalf("expected first record to be non-user turn: %+v", records[0])
+	}
+	if records[1].IsUserTurn {
+		t.Fatalf("expected second record to be non-user turn (telemetry says agent): %+v", records[1])
+	}
+}
+
 func TestParseLogFileMissingFile(t *testing.T) {
 	records := parseLogFile(filepath.Join(t.TempDir(), "missing.log"))
 	if records != nil {

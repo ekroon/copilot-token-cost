@@ -187,3 +187,27 @@ func UncachedInput(s *domain.Stats) int {
 	}
 	return v
 }
+
+// ReattributeUserTurns fixes user turn attribution for logs without per-call
+// telemetry. When a user turn lands on a model with premium_multiplier == 0
+// (e.g. session-naming gpt-5-mini), transfer it to the next record whose
+// model has a non-zero multiplier.
+func ReattributeUserTurns(records []domain.Record, premiumMultiplier func(model, timestamp string) float64) {
+	for i := range records {
+		if !records[i].IsUserTurn {
+			continue
+		}
+		model := NormalizeModel(records[i].Model)
+		if premiumMultiplier(model, records[i].Timestamp) != 0 {
+			continue
+		}
+		for j := i + 1; j < len(records); j++ {
+			nextModel := NormalizeModel(records[j].Model)
+			if premiumMultiplier(nextModel, records[j].Timestamp) > 0 {
+				records[i].IsUserTurn = false
+				records[j].IsUserTurn = true
+				break
+			}
+		}
+	}
+}

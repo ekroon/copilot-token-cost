@@ -471,3 +471,162 @@ func TestSortedKeyHelpers(t *testing.T) {
 		t.Fatalf("sortedKeysByFunc=%v", byPrompt)
 	}
 }
+
+func TestForceResyncFixesUserTurnWithoutDataLoss(t *testing.T) {
+	original := pricingPeriods
+	pricingPeriods = []PricingPeriod{
+		{
+			EffectiveFrom:      "2025-01-01",
+			PremiumRequestCost: 0.04,
+			ModelPricing: map[string]Pricing{
+				"gpt-5-mini":         {Input: 0.15, Output: 0.60},
+				"claude-opus-4.6-1m": {Input: 5.0, Output: 25.0, CacheRead: 0.5, CacheWrite: 6.25},
+			},
+			PremiumMultiplier: map[string]float64{
+				"gpt-5-mini":         0,
+				"claude-opus-4.6-1m": 3,
+			},
+		},
+	}
+	t.Cleanup(func() { pricingPeriods = original })
+
+	dbPath := tempDBPath(t)
+	db := initDB(dbPath)
+	defer db.Close()
+
+	root := t.TempDir()
+	logsDir := filepath.Join(root, "logs")
+	sessionDir := filepath.Join(root, "session-state")
+	_ = os.MkdirAll(logsDir, 0o755)
+
+	sessionID := "aaa11111-bbbb-cccc-dddd-eeee22222222"
+	workspaceDir := filepath.Join(sessionDir, sessionID)
+	_ = os.MkdirAll(workspaceDir, 0o755)
+	_ = os.WriteFile(filepath.Join(workspaceDir, "workspace.yaml"),
+		[]byte("cwd: /home/user/my-project\nbranch: main\n"), 0o644)
+
+	// Simulate a session-naming call followed by telemetry initiator and real model call.
+	// The telemetry "initiator": "user" line appears between the two completion blocks
+	// (matching real log format where JSON content lines don't have timestamps).
+	ts := time.Date(2025, 3, 1, 10, 0, 0, 0, time.Local)
+	content := "2025-03-01T10:00:00 Workspace initialized: " + sessionID + "\n" +
+		"2025-03-01T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'\n" +
+		"2025-03-01T10:00:02 {\"model\":\"gpt-5-mini\"}\n" +
+		"2025-03-01T10:00:03 {\"prompt_tokens\":300,\"completion_tokens\":200,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}\n" +
+		"2025-03-01T10:00:04 Generated session name: \"My Session\"\n" +
+		"2025-03-01T10:00:05 [Telemetry] cli.telemetry:\n" +
+		"{\n" +
+		"  \"kind\": \"assistant_usage\",\n" +
+		"  \"properties\": {\n" +
+		"    \"model\": \"claude-opus-4.6-1m\",\n" +
+		"    \"initiator\": \"user\"\n" +
+		"  }\n" +
+		"}\n" +
+		"2025-03-01T10:00:10 {\"model\":\"claude-opus-4.6-1m\"}\n" +
+		"2025-03-01T10:00:11 {\"prompt_tokens\":5000,\"completion_tokens\":500,\"cache_creation_input_tokens\":1000,\"cache_read_input_tokens\":0}\n"
+	writeLogFile(t, filepath.Join(logsDir, "process-force-test.log"), ts, content)
+
+	// ─── Initial sync ────────────────────────────────────────────────
+	inserted := syncLogsToDB(db, logsDir, sessionDir, false, "local", nil, nil)
+	if inserted != 2 {
+		t.Fatalf("initial sync: expected 2 records, got %d", inserted)
+	}
+
+	// Verify initial state
+	type row struct {
+		model      string
+		prompt     int
+		completion int
+		isUserTurn int
+		sessionID  string
+		promptText sql.NullString
+	}
+	queryAll := func() []row {
+		t.Helper()
+		rows, err := db.Query(
+			"SELECT model_normalized, prompt_tokens, completion_tokens, is_user_turn, session_id, prompt_text " +
+				"FROM api_calls WHERE source = 'local' AND log_file = 'process-force-test.log' " +
+				"ORDER BY timestamp")
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		defer rows.Close()
+		var result []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.model, &r.prompt, &r.completion, &r.isUserTurn, &r.sessionID, &r.promptText); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			result = append(result, r)
+		}
+		return result
+	}
+
+	initial := queryAll()
+	if len(initial) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(initial))
+	}
+	// gpt-5-mini: user turn transferred away by ReattributeUserTurns (multiplier=0)
+	if initial[0].model != "gpt-5-mini" || initial[0].isUserTurn != 0 {
+		t.Fatalf("initial gpt-5-mini: expected is_user_turn=0 (reattributed), got %+v", initial[0])
+	}
+	// opus: has user turn from both telemetry initiator AND reattribution
+	if initial[1].model != "claude-opus-4.6-1m" || initial[1].isUserTurn != 1 {
+		t.Fatalf("initial opus: expected is_user_turn=1, got %+v", initial[1])
+	}
+	// Both should have session ID
+	if initial[0].sessionID != sessionID || initial[1].sessionID != sessionID {
+		t.Fatalf("initial session IDs: %q, %q", initial[0].sessionID, initial[1].sessionID)
+	}
+
+	// ─── Force re-sync ───────────────────────────────────────────────
+	resynced := syncLogsToDB(db, logsDir, sessionDir, true, "local", nil, nil)
+	if resynced != 2 {
+		t.Fatalf("force re-sync: expected 2 records, got %d", resynced)
+	}
+
+	after := queryAll()
+	if len(after) != 2 {
+		t.Fatalf("after force: expected still 2 records (no duplicates), got %d", len(after))
+	}
+
+	// Data preserved: same models, tokens, session IDs
+	for i := range initial {
+		if after[i].model != initial[i].model {
+			t.Fatalf("record %d model changed: %q → %q", i, initial[i].model, after[i].model)
+		}
+		if after[i].prompt != initial[i].prompt || after[i].completion != initial[i].completion {
+			t.Fatalf("record %d tokens changed: %d/%d → %d/%d", i,
+				initial[i].prompt, initial[i].completion, after[i].prompt, after[i].completion)
+		}
+		if after[i].sessionID != initial[i].sessionID {
+			t.Fatalf("record %d session_id changed: %q → %q", i, initial[i].sessionID, after[i].sessionID)
+		}
+	}
+
+	// User turns still correct after re-sync
+	if after[0].isUserTurn != 0 {
+		t.Fatalf("after force: gpt-5-mini is_user_turn should stay 0, got %d", after[0].isUserTurn)
+	}
+	if after[1].isUserTurn != 1 {
+		t.Fatalf("after force: opus is_user_turn should be 1, got %d", after[1].isUserTurn)
+	}
+
+	// Session workspace preserved
+	var cwd string
+	if err := db.QueryRow("SELECT cwd FROM session_workspaces WHERE session_id = ? AND source = 'local'", sessionID).Scan(&cwd); err != nil {
+		t.Fatalf("workspace query: %v", err)
+	}
+	if cwd != "/home/user/my-project" {
+		t.Fatalf("workspace cwd changed: %q", cwd)
+	}
+
+	// Total record count unchanged
+	var totalCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM api_calls WHERE log_file = 'process-force-test.log'").Scan(&totalCount); err != nil {
+		t.Fatalf("total count: %v", err)
+	}
+	if totalCount != 2 {
+		t.Fatalf("total record count changed: expected 2, got %d (data loss or duplication!)", totalCount)
+	}
+}
