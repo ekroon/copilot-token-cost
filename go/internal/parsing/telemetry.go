@@ -106,7 +106,7 @@ func parseTelemetryRecords(content, logPath, minTimestamp, maxTimestamp string) 
 
 		records = append(records, domain.Record{
 			Model:               model,
-			PromptTokens:        event.Metrics.InputTokens,
+			PromptTokens:        event.Metrics.InputTokens + event.Metrics.CacheReadTokens + event.Metrics.CacheWriteTokens,
 			CompletionTokens:    event.Metrics.OutputTokens,
 			PromptText:          promptText,
 			CacheCreationTokens: event.Metrics.CacheWriteTokens,

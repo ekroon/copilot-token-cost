@@ -302,7 +302,9 @@ func (s *Service) DeleteParsedLogsBySource(source string) {
 
 // CleanupUnknownDuplicates removes api_calls with model_normalized='unknown'
 // when a properly-attributed record exists with the same unique key fields.
+// Also removes records with corrupted token data (prompt_tokens < cache totals).
 func (s *Service) CleanupUnknownDuplicates() int64 {
+	var total int64
 	result, err := s.db.Exec(`DELETE FROM api_calls WHERE model_normalized = 'unknown'
 		AND EXISTS (
 			SELECT 1 FROM api_calls r
@@ -313,11 +315,26 @@ func (s *Service) CleanupUnknownDuplicates() int64 {
 			AND r.source = api_calls.source
 			AND r.model_normalized != 'unknown'
 		)`)
-	if err != nil {
-		return 0
+	if err == nil {
+		n, _ := result.RowsAffected()
+		total += n
 	}
-	n, _ := result.RowsAffected()
-	return n
+	result, err = s.db.Exec(`DELETE FROM api_calls
+		WHERE prompt_tokens < cache_read_tokens + cache_creation_tokens
+		AND EXISTS (
+			SELECT 1 FROM api_calls r
+			WHERE r.timestamp = api_calls.timestamp
+			AND r.completion_tokens = api_calls.completion_tokens
+			AND r.log_file = api_calls.log_file
+			AND r.source = api_calls.source
+			AND r.model_normalized = api_calls.model_normalized
+			AND r.prompt_tokens > api_calls.prompt_tokens
+		)`)
+	if err == nil {
+		n, _ := result.RowsAffected()
+		total += n
+	}
+	return total
 }
 
 func (s *Service) ParsedMtimeByFile(source string) map[string]float64 {

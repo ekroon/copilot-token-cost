@@ -244,6 +244,60 @@ func TestParseLogFileTelemetryInitiatorOverridesAfterSessionNaming(t *testing.T)
 	if records[0].SessionID != "aaa-bbb-ccc" {
 		t.Fatalf("expected session_id from telemetry, got %s", records[0].SessionID)
 	}
+	// PromptTokens must equal input + cache_read + cache_write (total input convention)
+	if records[0].PromptTokens != 4016+0+1000 {
+		t.Fatalf("expected PromptTokens=5016 (input+cache_read+cache_write), got %d", records[0].PromptTokens)
+	}
+	if records[0].CacheReadTokens != 0 || records[0].CacheCreationTokens != 1000 {
+		t.Fatalf("unexpected cache values: read=%d write=%d", records[0].CacheReadTokens, records[0].CacheCreationTokens)
+	}
+}
+
+func TestTelemetryParserPromptTokensIncludesCachedTokens(t *testing.T) {
+	tmpDir := t.TempDir()
+	logPath := filepath.Join(tmpDir, "cached.log")
+	content := `2025-06-01T10:00:00 [Telemetry] cli.telemetry:
+{
+  "kind": "assistant_usage",
+  "properties": {
+    "model": "claude-opus-4.6",
+    "initiator": "agent"
+  },
+  "metrics": {
+    "input_tokens": 200,
+    "output_tokens": 100,
+    "cache_read_tokens": 50000,
+    "cache_write_tokens": 3000
+  },
+  "session_id": "test-session"
+}
+`
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	records := parseLogFile(logPath)
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(records))
+	}
+	r := records[0]
+
+	// Regression test: PromptTokens must be total input (uncached + cache_read + cache_write)
+	expectedPrompt := 200 + 50000 + 3000
+	if r.PromptTokens != expectedPrompt {
+		t.Fatalf("PromptTokens=%d, want %d (input_tokens + cache_read + cache_write)", r.PromptTokens, expectedPrompt)
+	}
+	// UncachedInput must be positive
+	uncached := r.PromptTokens - r.CacheReadTokens - r.CacheCreationTokens
+	if uncached != 200 {
+		t.Fatalf("UncachedInput=%d, want 200 (the input_tokens value)", uncached)
+	}
+	if r.CacheReadTokens != 50000 {
+		t.Fatalf("CacheReadTokens=%d, want 50000", r.CacheReadTokens)
+	}
+	if r.CacheCreationTokens != 3000 {
+		t.Fatalf("CacheCreationTokens=%d, want 3000", r.CacheCreationTokens)
+	}
 }
 
 func TestParseLogFileTelemetryInitiatorAgentDoesNotPromote(t *testing.T) {
