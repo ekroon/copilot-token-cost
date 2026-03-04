@@ -2,7 +2,6 @@ package parsing
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -31,158 +30,16 @@ func (s *Service) ParseLogContent(content, source string) []domain.Record {
 	return ParseLogContent(content, source, "", "")
 }
 
+// ParseLogContent decides up-front which parser to use based on log content.
+// Logs with assistant_usage telemetry (Feb 13 2026+) use the structured
+// telemetry parser. Older logs fall back to the legacy regex parser.
 func ParseLogContent(content, logPath, minTimestamp, maxTimestamp string) []domain.Record {
-	lines := strings.Split(content, "\n")
-	records := make([]domain.Record, 0, strings.Count(content, `"completion_tokens"`))
-
-	lastModel := "unknown"
-	var lastTimestamp, lastSession string
-	lastInitiator := "agent"
-	var lastPromptText *string
-
-	for i, line := range lines {
-		if len(line) >= 19 &&
-			line[4] == '-' && line[7] == '-' &&
-			line[10] == 'T' && line[13] == ':' && line[16] == ':' {
-			lastTimestamp = line[:19]
+	if strings.Contains(content, `"assistant_usage"`) {
+		if records := parseTelemetryRecords(content, logPath, minTimestamp, maxTimestamp); len(records) > 0 {
+			return records
 		}
-		if strings.Contains(line, "Workspace initialized") || strings.Contains(line, "Created ACP session") || strings.Contains(line, "Flushed ") {
-			if m := reSession.FindStringSubmatch(line); m != nil {
-				lastSession = m[1]
-			}
-		}
-		if strings.Contains(line, "PremiumRequestProcessor: Setting X-Initiator") {
-			if m := reInitiator.FindStringSubmatch(line); m != nil {
-				lastInitiator = strings.TrimSpace(m[1])
-			}
-		}
-		if strings.Contains(line, `"initiator"`) {
-			if m := reInitiatorTelemetry.FindStringSubmatch(line); m != nil {
-				lastInitiator = strings.TrimSpace(m[1])
-			}
-		}
-		if strings.Contains(line, `"model"`) {
-			if m := reModelJSON.FindStringSubmatch(line); m != nil {
-				candidate := m[1]
-				if !strings.HasPrefix(candidate, "{") && (strings.Contains(candidate, "claude") || strings.Contains(candidate, "gpt") || strings.Contains(candidate, "gemini")) {
-					lastModel = candidate
-				}
-			}
-		}
-		if prompt := ExtractPromptTextFromLine(line); prompt != nil {
-			lastPromptText = prompt
-		} else if prompt := extractPromptTextFromProblemStatementLine(lines, i); prompt != nil {
-			lastPromptText = prompt
-		}
-
-		if !strings.Contains(line, `"completion_tokens"`) {
-			continue
-		}
-		if lastTimestamp != "" {
-			if minTimestamp != "" && lastTimestamp < minTimestamp {
-				lastInitiator = "agent"
-				continue
-			}
-			if maxTimestamp != "" && lastTimestamp >= maxTimestamp {
-				lastInitiator = "agent"
-				continue
-			}
-		}
-
-		promptMatch := rePromptTokens.FindStringSubmatch(line)
-		compMatch := reCompTokens.FindStringSubmatch(line)
-		var cacheCreation, cacheReadVal int
-		cacheCreationSet := false
-		cacheReadSet := false
-		if m := reCacheCreation.FindStringSubmatch(line); m != nil {
-			cacheCreation, _ = strconv.Atoi(m[1])
-			cacheCreationSet = true
-		}
-		if m := reCacheRead.FindStringSubmatch(line); m != nil {
-			cacheReadVal, _ = strconv.Atoi(m[1])
-			cacheReadSet = true
-		}
-		if !cacheReadSet {
-			if m := reCachedTokens.FindStringSubmatch(line); m != nil {
-				cacheReadVal, _ = strconv.Atoi(m[1])
-				cacheReadSet = true
-			}
-		}
-
-		if promptMatch == nil || compMatch == nil || !cacheCreationSet || !cacheReadSet || lastModel == "unknown" {
-			blockStart := i - 10
-			if blockStart < 0 {
-				blockStart = 0
-			}
-			blockEnd := i + 16
-			if blockEnd > len(lines) {
-				blockEnd = len(lines)
-			}
-			for j := blockStart; j < blockEnd; j++ {
-				if promptMatch == nil {
-					if m := rePromptTokens.FindStringSubmatch(lines[j]); m != nil {
-						promptMatch = m
-					}
-				}
-				if compMatch == nil {
-					if m := reCompTokens.FindStringSubmatch(lines[j]); m != nil {
-						compMatch = m
-					}
-				}
-				if !cacheCreationSet {
-					if m := reCacheCreation.FindStringSubmatch(lines[j]); m != nil {
-						cacheCreation, _ = strconv.Atoi(m[1])
-						cacheCreationSet = true
-					}
-				}
-				if !cacheReadSet {
-					if m := reCacheRead.FindStringSubmatch(lines[j]); m != nil {
-						cacheReadVal, _ = strconv.Atoi(m[1])
-						cacheReadSet = true
-					} else if m := reCachedTokens.FindStringSubmatch(lines[j]); m != nil {
-						cacheReadVal, _ = strconv.Atoi(m[1])
-						cacheReadSet = true
-					}
-				}
-				if lastModel == "unknown" {
-					if m := reModelJSON.FindStringSubmatch(lines[j]); m != nil {
-						candidate := m[1]
-						if strings.Contains(candidate, "claude") || strings.Contains(candidate, "gpt") || strings.Contains(candidate, "gemini") {
-							lastModel = candidate
-						}
-					}
-				}
-				if promptMatch != nil && compMatch != nil && cacheCreationSet && cacheReadSet && lastModel != "unknown" {
-					break
-				}
-			}
-			if promptMatch == nil || compMatch == nil {
-				continue
-			}
-		}
-
-		promptTokens, _ := strconv.Atoi(promptMatch[1])
-		completionTokens, _ := strconv.Atoi(compMatch[1])
-		promptText := ExtractPromptTextNearLine(lines, i)
-		if promptText == nil {
-			promptText = lastPromptText
-		}
-
-		records = append(records, domain.Record{
-			Model:               lastModel,
-			PromptTokens:        promptTokens,
-			CompletionTokens:    completionTokens,
-			PromptText:          promptText,
-			CacheCreationTokens: cacheCreation,
-			CacheReadTokens:     cacheReadVal,
-			IsUserTurn:          IsUserInitiator(lastInitiator),
-			Timestamp:           lastTimestamp,
-			SessionID:           lastSession,
-			LogFile:             filepath.Base(logPath),
-		})
-		lastInitiator = "agent"
 	}
-	return records
+	return parseRegexRecords(content, logPath, minTimestamp, maxTimestamp)
 }
 
 func IsUserInitiator(initiator string) bool {

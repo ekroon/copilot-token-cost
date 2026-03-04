@@ -213,7 +213,14 @@ func TestParseLogFileTelemetryInitiatorOverridesAfterSessionNaming(t *testing.T)
     "model": "claude-opus-4.6-1m",
     "initiator": "user",
     "api_call_id": "msg_test"
-  }
+  },
+  "metrics": {
+    "input_tokens": 4016,
+    "output_tokens": 500,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 1000
+  },
+  "session_id": "aaa-bbb-ccc"
 }
 2025-01-01T10:00:05 {"model":"claude-opus-4.6-1m"}
 2025-01-01T10:00:06 {"prompt_tokens":5000,"completion_tokens":500,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0}
@@ -222,18 +229,20 @@ func TestParseLogFileTelemetryInitiatorOverridesAfterSessionNaming(t *testing.T)
 		t.Fatalf("write log: %v", err)
 	}
 
+	// Telemetry parser: only produces 1 record (the real opus call).
+	// Session-naming gpt-5-mini call is correctly excluded.
 	records := parseLogFile(logPath)
-	if len(records) != 2 {
-		t.Fatalf("expected 2 records, got %d", len(records))
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record (telemetry parser excludes session naming), got %d", len(records))
 	}
 	if !records[0].IsUserTurn {
-		t.Fatalf("expected gpt-5-mini record to have IsUserTurn=true (from X-Initiator): %+v", records[0])
+		t.Fatalf("expected opus record to have IsUserTurn=true (from telemetry initiator): %+v", records[0])
 	}
-	if !records[1].IsUserTurn {
-		t.Fatalf("expected opus record to have IsUserTurn=true (from telemetry initiator): %+v", records[1])
+	if records[0].Model != "claude-opus-4.6-1m" {
+		t.Fatalf("expected opus model, got %s", records[0].Model)
 	}
-	if records[1].Model != "claude-opus-4.6-1m" {
-		t.Fatalf("expected opus model, got %s", records[1].Model)
+	if records[0].SessionID != "aaa-bbb-ccc" {
+		t.Fatalf("expected session_id from telemetry, got %s", records[0].SessionID)
 	}
 }
 

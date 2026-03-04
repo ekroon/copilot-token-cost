@@ -505,9 +505,9 @@ func TestForceResyncFixesUserTurnWithoutDataLoss(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(workspaceDir, "workspace.yaml"),
 		[]byte("cwd: /home/user/my-project\nbranch: main\n"), 0o644)
 
-	// Simulate a session-naming call followed by telemetry initiator and real model call.
-	// The telemetry "initiator": "user" line appears between the two completion blocks
-	// (matching real log format where JSON content lines don't have timestamps).
+	// Simulate a session-naming call followed by telemetry and real model call.
+	// The telemetry parser extracts records from assistant_usage blocks only,
+	// so the session-naming gpt-5-mini call is excluded.
 	ts := time.Date(2025, 3, 1, 10, 0, 0, 0, time.Local)
 	content := "2025-03-01T10:00:00 Workspace initialized: " + sessionID + "\n" +
 		"2025-03-01T10:00:01 PremiumRequestProcessor: Setting X-Initiator to 'user'\n" +
@@ -520,19 +520,26 @@ func TestForceResyncFixesUserTurnWithoutDataLoss(t *testing.T) {
 		"  \"properties\": {\n" +
 		"    \"model\": \"claude-opus-4.6-1m\",\n" +
 		"    \"initiator\": \"user\"\n" +
-		"  }\n" +
+		"  },\n" +
+		"  \"metrics\": {\n" +
+		"    \"input_tokens\": 4016,\n" +
+		"    \"output_tokens\": 500,\n" +
+		"    \"cache_read_tokens\": 0,\n" +
+		"    \"cache_write_tokens\": 1000\n" +
+		"  },\n" +
+		"  \"session_id\": \"" + sessionID + "\"\n" +
 		"}\n" +
 		"2025-03-01T10:00:10 {\"model\":\"claude-opus-4.6-1m\"}\n" +
 		"2025-03-01T10:00:11 {\"prompt_tokens\":5000,\"completion_tokens\":500,\"cache_creation_input_tokens\":1000,\"cache_read_input_tokens\":0}\n"
 	writeLogFile(t, filepath.Join(logsDir, "process-force-test.log"), ts, content)
 
 	// ─── Initial sync ────────────────────────────────────────────────
+	// Telemetry parser produces 1 record (session-naming excluded).
 	inserted := syncLogsToDB(db, logsDir, sessionDir, false, "local", nil, nil)
-	if inserted != 2 {
-		t.Fatalf("initial sync: expected 2 records, got %d", inserted)
+	if inserted != 1 {
+		t.Fatalf("initial sync: expected 1 record (telemetry parser), got %d", inserted)
 	}
 
-	// Verify initial state
 	type row struct {
 		model      string
 		prompt     int
@@ -563,53 +570,32 @@ func TestForceResyncFixesUserTurnWithoutDataLoss(t *testing.T) {
 	}
 
 	initial := queryAll()
-	if len(initial) != 2 {
-		t.Fatalf("expected 2 records, got %d", len(initial))
+	if len(initial) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(initial))
 	}
-	// gpt-5-mini: user turn transferred away by ReattributeUserTurns (multiplier=0)
-	if initial[0].model != "gpt-5-mini" || initial[0].isUserTurn != 0 {
-		t.Fatalf("initial gpt-5-mini: expected is_user_turn=0 (reattributed), got %+v", initial[0])
+	if initial[0].model != "claude-opus-4.6-1m" || initial[0].isUserTurn != 1 {
+		t.Fatalf("initial opus: expected is_user_turn=1, got %+v", initial[0])
 	}
-	// opus: has user turn from both telemetry initiator AND reattribution
-	if initial[1].model != "claude-opus-4.6-1m" || initial[1].isUserTurn != 1 {
-		t.Fatalf("initial opus: expected is_user_turn=1, got %+v", initial[1])
-	}
-	// Both should have session ID
-	if initial[0].sessionID != sessionID || initial[1].sessionID != sessionID {
-		t.Fatalf("initial session IDs: %q, %q", initial[0].sessionID, initial[1].sessionID)
+	if initial[0].sessionID != sessionID {
+		t.Fatalf("initial session ID: %q", initial[0].sessionID)
 	}
 
 	// ─── Force re-sync ───────────────────────────────────────────────
 	resynced := syncLogsToDB(db, logsDir, sessionDir, true, "local", nil, nil)
-	if resynced != 2 {
-		t.Fatalf("force re-sync: expected 2 records, got %d", resynced)
+	if resynced != 1 {
+		t.Fatalf("force re-sync: expected 1 record, got %d", resynced)
 	}
 
 	after := queryAll()
-	if len(after) != 2 {
-		t.Fatalf("after force: expected still 2 records (no duplicates), got %d", len(after))
+	if len(after) != 1 {
+		t.Fatalf("after force: expected still 1 record (no duplicates), got %d", len(after))
 	}
-
-	// Data preserved: same models, tokens, session IDs
-	for i := range initial {
-		if after[i].model != initial[i].model {
-			t.Fatalf("record %d model changed: %q → %q", i, initial[i].model, after[i].model)
-		}
-		if after[i].prompt != initial[i].prompt || after[i].completion != initial[i].completion {
-			t.Fatalf("record %d tokens changed: %d/%d → %d/%d", i,
-				initial[i].prompt, initial[i].completion, after[i].prompt, after[i].completion)
-		}
-		if after[i].sessionID != initial[i].sessionID {
-			t.Fatalf("record %d session_id changed: %q → %q", i, initial[i].sessionID, after[i].sessionID)
-		}
+	if after[0].model != initial[0].model || after[0].prompt != initial[0].prompt ||
+		after[0].completion != initial[0].completion || after[0].sessionID != initial[0].sessionID {
+		t.Fatalf("data changed after force re-sync: %+v -> %+v", initial[0], after[0])
 	}
-
-	// User turns still correct after re-sync
-	if after[0].isUserTurn != 0 {
-		t.Fatalf("after force: gpt-5-mini is_user_turn should stay 0, got %d", after[0].isUserTurn)
-	}
-	if after[1].isUserTurn != 1 {
-		t.Fatalf("after force: opus is_user_turn should be 1, got %d", after[1].isUserTurn)
+	if after[0].isUserTurn != 1 {
+		t.Fatalf("after force: opus is_user_turn should be 1, got %d", after[0].isUserTurn)
 	}
 
 	// Session workspace preserved
@@ -626,7 +612,7 @@ func TestForceResyncFixesUserTurnWithoutDataLoss(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM api_calls WHERE log_file = 'process-force-test.log'").Scan(&totalCount); err != nil {
 		t.Fatalf("total count: %v", err)
 	}
-	if totalCount != 2 {
-		t.Fatalf("total record count changed: expected 2, got %d (data loss or duplication!)", totalCount)
+	if totalCount != 1 {
+		t.Fatalf("total record count changed: expected 1, got %d (data loss or duplication!)", totalCount)
 	}
 }
