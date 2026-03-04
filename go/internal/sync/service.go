@@ -43,12 +43,12 @@ type CodespaceCopyResult struct {
 }
 
 type RuntimeDeps struct {
-	ParseLogFileInRange    func(logPath string, minTimestamp string, maxTimestamp string) []domain.Record
-	LoadSessionWorkspaces  func(sessionDir string) map[string]WorkspaceMeta
-	NormalizeModel         func(string) string
-	PromptTextForStorage   func(*string) sql.NullString
-	AddCommas              func(string) string
-	ReattributeUserTurns   func(records []domain.Record)
+	ParseLogFileInRange   func(logPath string, minTimestamp string, maxTimestamp string) []domain.Record
+	LoadSessionWorkspaces func(sessionDir string) map[string]WorkspaceMeta
+	NormalizeModel        func(string) string
+	PromptTextForStorage  func(*string) sql.NullString
+	AddCommas             func(string) string
+	ReattributeUserTurns  func(records []domain.Record)
 }
 
 type Service struct {
@@ -226,6 +226,10 @@ func (s *Service) SyncLogsToDB(logsDir, sessionDir string, force bool, source st
 		totalNow := s.storage.CountAPICallsBySource(source)
 		newRecords := totalNow - existing
 		s.log("  ✅ Synced %d log files (%s): %s new records (%s total)\n", parsedCount, source, s.runtime.AddCommas(strconv.Itoa(newRecords)), s.runtime.AddCommas(strconv.Itoa(totalNow)))
+	}
+
+	if cleaned := s.storage.CleanupUnknownDuplicates(); cleaned > 0 {
+		s.log("  🧹 Cleaned up %d duplicate 'unknown' model records\n", cleaned)
 	}
 
 	return totalInserted

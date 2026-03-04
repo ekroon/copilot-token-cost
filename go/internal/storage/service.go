@@ -300,6 +300,26 @@ func (s *Service) DeleteParsedLogsBySource(source string) {
 	_, _ = s.db.Exec("DELETE FROM parsed_logs WHERE source = ?", source)
 }
 
+// CleanupUnknownDuplicates removes api_calls with model_normalized='unknown'
+// when a properly-attributed record exists with the same unique key fields.
+func (s *Service) CleanupUnknownDuplicates() int64 {
+	result, err := s.db.Exec(`DELETE FROM api_calls WHERE model_normalized = 'unknown'
+		AND EXISTS (
+			SELECT 1 FROM api_calls r
+			WHERE r.timestamp = api_calls.timestamp
+			AND r.prompt_tokens = api_calls.prompt_tokens
+			AND r.completion_tokens = api_calls.completion_tokens
+			AND r.log_file = api_calls.log_file
+			AND r.source = api_calls.source
+			AND r.model_normalized != 'unknown'
+		)`)
+	if err != nil {
+		return 0
+	}
+	n, _ := result.RowsAffected()
+	return n
+}
+
 func (s *Service) ParsedMtimeByFile(source string) map[string]float64 {
 	parsedMtimeByFile := map[string]float64{}
 	rows, err := s.db.Query("SELECT log_file, mtime FROM parsed_logs WHERE source = ?", source)
