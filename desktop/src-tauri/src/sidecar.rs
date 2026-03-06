@@ -1,4 +1,5 @@
 use crate::settings::Settings;
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -9,18 +10,6 @@ use tauri_plugin_shell::ShellExt;
 pub struct SidecarManager {
     child: Arc<Mutex<Option<CommandChild>>>,
 }
-
-const RESTART_JS: &str = r#"
-document.body.style.cssText = 'margin:0;display:flex;align-items:center;justify-content:center;height:100vh;background:#0d1117;color:#8b949e;font-family:system-ui';
-document.body.innerHTML = '<p>Restarting…</p>';
-const poll = setInterval(async () => {
-    try {
-        const r = await fetch('http://127.0.0.1:7332/healthz', {mode:'no-cors'});
-        clearInterval(poll);
-        window.location.replace('http://127.0.0.1:7332');
-    } catch(e) {}
-}, 300);
-"#;
 
 impl SidecarManager {
     pub fn new() -> Self {
@@ -43,17 +32,49 @@ impl SidecarManager {
     }
 
     pub fn restart(&self, app: &tauri::AppHandle, settings: &Settings) {
-        // Show "Restarting…" immediately, then poll /healthz
-        if let Some(w) = app.get_webview_window("main") {
-            let _ = w.eval(RESTART_JS);
-            let _ = w.show();
-            let _ = w.set_focus();
-        }
-
         self.stop();
-        // Brief pause to let the OS release the port
-        thread::sleep(Duration::from_millis(200));
-        self.spawn(app, settings);
+
+        let app = app.clone();
+        let settings = settings.clone();
+        let child = self.child.clone();
+
+        thread::spawn(move || {
+            // Wait for port to be released
+            thread::sleep(Duration::from_millis(500));
+
+            let args = settings.to_sidecar_args();
+            eprintln!("[desktop] restarting sidecar with args: {:?}", args);
+
+            let sidecar = app
+                .shell()
+                .sidecar("copilot-token-cost")
+                .expect("failed to create sidecar command")
+                .args(&args);
+
+            match sidecar.spawn() {
+                Ok((_rx, new_child)) => {
+                    *child.lock().unwrap() = Some(new_child);
+
+                    // Wait for server to be ready
+                    for _ in 0..30 {
+                        thread::sleep(Duration::from_millis(300));
+                        if TcpStream::connect("127.0.0.1:7332").is_ok() {
+                            eprintln!("[desktop] sidecar ready");
+                            break;
+                        }
+                    }
+
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.eval(
+                            "window.location.replace('http://127.0.0.1:7332')",
+                        );
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+                Err(e) => eprintln!("[desktop] failed to spawn sidecar: {}", e),
+            }
+        });
     }
 
     pub fn stop(&self) {
