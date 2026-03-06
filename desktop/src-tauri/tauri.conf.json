@@ -1,0 +1,39 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
+  "productName": "Copilot Token Cost",
+  "version": "0.1.0",
+  "identifier": "com.ekroon.copilot-token-cost",
+  "build": {
+    "frontendDist": "../src"
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/copilot-token-cost"
+    ]
+  },
+  "plugins": {},
+  "app": {
+    "windows": [
+      {
+        "title": "Copilot Token Cost",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "url": "index.html"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' http://127.0.0.1:7332; script-src 'self' 'unsafe-inline' http://127.0.0.1:7332 https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' http://127.0.0.1:7332; connect-src 'self' http://127.0.0.1:7332; img-src 'self' http://127.0.0.1:7332 data:; font-src 'self' http://127.0.0.1:7332"
+    }
+  }
+}
