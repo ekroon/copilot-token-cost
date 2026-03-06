@@ -5,7 +5,7 @@ use crate::settings::Settings;
 use crate::sidecar::SidecarManager;
 use std::sync::Mutex;
 use tauri::{
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
     Manager,
 };
@@ -13,6 +13,7 @@ use tauri::{
 struct AppState {
     settings: Mutex<Settings>,
     sidecar: SidecarManager,
+    menu: Menu<tauri::Wry>,
 }
 
 const PERIOD_OPTIONS: &[(&str, &str)] = &[
@@ -24,6 +25,31 @@ const PERIOD_OPTIONS: &[(&str, &str)] = &[
     ("all", "All"),
 ];
 
+const PERIOD_IDS: &[&str] = &[
+    "period_today",
+    "period_yesterday",
+    "period_7",
+    "period_14",
+    "period_30",
+    "period_all",
+];
+
+fn get_check_item(
+    menu: &Menu<tauri::Wry>,
+    id: &str,
+) -> Option<CheckMenuItem<tauri::Wry>> {
+    let menu_id = MenuId::new(id);
+    menu.get(&menu_id).and_then(|item| item.as_check_menuitem().cloned())
+}
+
+fn set_radio_group(menu: &Menu<tauri::Wry>, ids: &[&str], selected_id: &str) {
+    for id in ids {
+        if let Some(item) = get_check_item(menu, id) {
+            let _ = item.set_checked(*id == selected_id);
+        }
+    }
+}
+
 fn build_tray_menu(
     app: &tauri::AppHandle,
     settings: &Settings,
@@ -31,7 +57,6 @@ fn build_tray_menu(
     let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
 
-    // Period submenu
     let period_items: Vec<CheckMenuItem<tauri::Wry>> = PERIOD_OPTIONS
         .iter()
         .map(|(value, label)| {
@@ -52,7 +77,6 @@ fn build_tray_menu(
 
     let sep2 = PredefinedMenuItem::separator(app)?;
 
-    // Toggle items
     let local_streaming = CheckMenuItem::with_id(
         app, "toggle_local_streaming", "Local Streaming",
         true, settings.local_streaming, None::<&str>,
@@ -62,7 +86,6 @@ fn build_tray_menu(
         true, settings.codespaces_streaming, None::<&str>,
     )?;
 
-    // Codespaces mode submenu
     let cs_manual = CheckMenuItem::with_id(
         app, "cs_mode_manual", "Manual",
         true, settings.codespaces_mode == "manual", None::<&str>,
@@ -105,6 +128,7 @@ fn build_tray_menu(
 }
 
 fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
+    eprintln!("[desktop] menu event: {}", event_id);
     match event_id {
         "quit" => {
             let state = app.state::<AppState>();
@@ -120,14 +144,13 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
         id if id.starts_with("period_") => {
             let period = id.strip_prefix("period_").unwrap();
             let state = app.state::<AppState>();
-            {
-                let mut s = state.settings.lock().unwrap();
-                s.period = period.to_string();
-                save_and_restart(app, &s, &state.sidecar);
-            }
-            rebuild_tray(app);
+            set_radio_group(&state.menu, PERIOD_IDS, id);
+            let mut s = state.settings.lock().unwrap();
+            s.period = period.to_string();
+            save_and_restart(app, &s, &state.sidecar);
         }
         "toggle_local_streaming" => {
+            // Tauri auto-toggles the checkmark; just sync settings
             toggle_bool(app, |s| &mut s.local_streaming);
         }
         "toggle_codespaces_streaming" => {
@@ -142,29 +165,30 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
         "cs_mode_auto" => {
             set_codespaces_mode(app, "auto");
         }
-        _ => {}
+        _ => {
+            eprintln!("[desktop] unhandled menu event: {}", event_id);
+        }
     }
 }
 
 fn toggle_bool(app: &tauri::AppHandle, field: fn(&mut Settings) -> &mut bool) {
     let state = app.state::<AppState>();
-    {
-        let mut s = state.settings.lock().unwrap();
-        let val = field(&mut s);
-        *val = !*val;
-        save_and_restart(app, &s, &state.sidecar);
-    }
-    rebuild_tray(app);
+    let mut s = state.settings.lock().unwrap();
+    let val = field(&mut s);
+    *val = !*val;
+    save_and_restart(app, &s, &state.sidecar);
 }
 
 fn set_codespaces_mode(app: &tauri::AppHandle, mode: &str) {
     let state = app.state::<AppState>();
-    {
-        let mut s = state.settings.lock().unwrap();
-        s.codespaces_mode = mode.to_string();
-        save_and_restart(app, &s, &state.sidecar);
-    }
-    rebuild_tray(app);
+    set_radio_group(
+        &state.menu,
+        &["cs_mode_manual", "cs_mode_auto"],
+        &format!("cs_mode_{}", mode),
+    );
+    let mut s = state.settings.lock().unwrap();
+    s.codespaces_mode = mode.to_string();
+    save_and_restart(app, &s, &state.sidecar);
 }
 
 fn save_and_restart(
@@ -173,19 +197,11 @@ fn save_and_restart(
     sidecar: &SidecarManager,
 ) {
     if let Some(dir) = app.path().app_data_dir().ok() {
-        let _ = settings.save(&dir);
-    }
-    sidecar.restart(app, settings);
-}
-
-fn rebuild_tray(app: &tauri::AppHandle) {
-    let state = app.state::<AppState>();
-    let settings = state.settings.lock().unwrap().clone();
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        if let Ok(menu) = build_tray_menu(app, &settings) {
-            let _ = tray.set_menu(Some(menu));
+        if let Err(e) = settings.save(&dir) {
+            eprintln!("[desktop] failed to save settings: {}", e);
         }
     }
+    sidecar.restart(app, settings);
 }
 
 fn main() {
@@ -197,6 +213,7 @@ fn main() {
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
             let settings = Settings::load(&data_dir);
+            eprintln!("[desktop] loaded settings: {:?}", settings);
 
             let sidecar = SidecarManager::new();
             sidecar.spawn(&app.handle(), &settings);
@@ -215,6 +232,7 @@ fn main() {
             app.manage(AppState {
                 settings: Mutex::new(settings),
                 sidecar,
+                menu,
             });
 
             Ok(())
