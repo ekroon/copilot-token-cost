@@ -67,6 +67,28 @@ It persists per-file tail checkpoints to SQLite (`codespace_tail_offsets`) and r
 | `--web-codespaces-interval DURATION` | Web Codespaces sync interval when mode is `auto` (default `5m`) |
 | `--web-log-mode MODE` | Web stderr logging mode: `compact` (default, single-line live status), `verbose` (line-by-line logs), or `errors` (warnings/errors + startup lines) |
 
+## Desktop App (macOS)
+
+A native macOS desktop app wrapping the web dashboard, with a system tray icon and in-app settings.
+
+### Install from GitHub Release
+
+1. Download the `.dmg` for your architecture from [Releases](https://github.com/ekroon/copilot-token-cost/releases)
+2. Open the `.dmg` and drag **Copilot Token Cost** to Applications
+3. On first launch, **right-click → Open** (or Control+click → Open) and confirm the dialog — this is required once for unsigned apps
+
+The app runs in the system tray. Settings (period, streaming, codespaces mode) are configurable from the tray menu — changes restart the server automatically.
+
+### Build from source
+
+```bash
+cd desktop
+make install-deps   # npm install
+make build          # builds Go sidecar + Tauri .app and .dmg
+```
+
+Requires: Go, Rust, Node.js, and the [Tauri CLI](https://v2.tauri.app/start/prerequisites/).
+
 ## Web mode
 
 ```bash
