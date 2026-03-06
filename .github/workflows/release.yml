@@ -58,7 +58,7 @@ jobs:
           - runner: macos-latest
             goarch: arm64
             target_triple: aarch64-apple-darwin
-          - runner: macos-13
+          - runner: macos-15-intel
             goarch: amd64
             target_triple: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
@@ -95,8 +95,18 @@ jobs:
       - name: Install desktop dependencies
         run: cd desktop && npm install
 
-      - name: Build Tauri app
-        run: cd desktop && npx tauri build
+      - name: Build Tauri app (.app bundle only)
+        run: cd desktop && npx tauri build --bundles app
+
+      - name: Create DMG
+        run: |
+          APP_NAME="Copilot Token Cost"
+          DMG_DIR="desktop/src-tauri/target/release/bundle/dmg"
+          mkdir -p "$DMG_DIR"
+          hdiutil create -volname "$APP_NAME" \
+            -srcfolder "desktop/src-tauri/target/release/bundle/macos/${APP_NAME}.app" \
+            -ov -format UDZO \
+            "$DMG_DIR/${APP_NAME}_${{ matrix.target_triple }}.dmg"
 
       - name: Upload .dmg artifact
         uses: actions/upload-artifact@v4
