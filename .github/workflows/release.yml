@@ -4,12 +4,28 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.19.0) — required when dispatching manually"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: echo "tag=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
   release:
+    needs: resolve-tag
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -24,6 +40,8 @@ jobs:
             goarch: arm64
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
 
       - uses: actions/setup-go@v5
         with:
@@ -52,6 +70,7 @@ jobs:
           path: copilot-token-cost-${{ matrix.goos }}-${{ matrix.goarch }}
 
   desktop-macos:
+    needs: resolve-tag
     strategy:
       matrix:
         include:
@@ -64,6 +83,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
 
       - uses: actions/setup-go@v5
         with:
@@ -115,7 +136,7 @@ jobs:
           path: desktop/src-tauri/target/release/bundle/dmg/*.dmg
 
   create-release:
-    needs: [release, desktop-macos]
+    needs: [resolve-tag, release, desktop-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -128,8 +149,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           chmod +x artifacts/copilot-token-cost-*
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
+          gh release create "${{ needs.resolve-tag.outputs.tag }}" \
+            --title "${{ needs.resolve-tag.outputs.tag }}" \
             --generate-notes \
             --repo "${{ github.repository }}" \
             artifacts/copilot-token-cost-* \
