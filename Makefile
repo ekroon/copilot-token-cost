@@ -8,7 +8,7 @@ LDFLAGS  := -s -w
 # Cross-compilation matrix (matches release.yml)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
-.PHONY: build release release-all embed-pricing clean test vet fmt
+.PHONY: build release release-all embed-pricing clean test vet fmt desktop desktop-dev desktop-clean
 
 # Dev build — current platform, no pricing embedded
 build:
@@ -50,3 +50,13 @@ vet:
 
 fmt:
 	cd $(GO_DIR) && gofmt -w $$(find . -type f -name '*.go')
+
+# Desktop app (Tauri) — macOS only
+desktop:
+	$(MAKE) -C desktop build
+
+desktop-dev:
+	$(MAKE) -C desktop dev
+
+desktop-clean:
+	$(MAKE) -C desktop clean

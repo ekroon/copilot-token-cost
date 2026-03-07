@@ -1,5 +1,6 @@
 # Go binary
 go/copilot-token-cost
+copilot-token-cost
 
 # SQLite database
 copilot-tokens.db
