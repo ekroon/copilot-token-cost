@@ -57,11 +57,12 @@ type webState struct {
 	codespacesLastSuccessAt  time.Time
 	codespacesHasSuccess     bool
 
-	snapshotMu   sync.RWMutex
-	snapshot     statsPayload
-	hasData      bool
-	syncStatus   map[string]syncSourceStatus
-	expandedRows map[string]map[string]bool // group ("project"/"day") -> rowKey -> expanded
+	snapshotMu             sync.RWMutex
+	snapshot               statsPayload
+	hasData                bool
+	syncStatus             map[string]syncSourceStatus
+	refreshIndicatorStatus map[string]syncSourceStatus
+	expandedRows           map[string]map[string]bool // group ("project"/"day") -> rowKey -> expanded
 
 	refreshMu     sync.Mutex
 	subscribersMu sync.Mutex
@@ -546,6 +547,12 @@ func (s *webState) consoleStatusLine(now time.Time) string {
 	s.snapshotMu.RLock()
 	localStatus := s.syncStatus["local"]
 	codespacesStatus := s.syncStatus["codespaces"]
+	if override, ok := s.refreshIndicatorStatus["local"]; ok {
+		localStatus = override
+	}
+	if override, ok := s.refreshIndicatorStatus["codespaces"]; ok {
+		codespacesStatus = override
+	}
 	localNext := s.localNextRefreshAt
 	codespacesNext := s.codespacesNextRefreshAt
 	s.snapshotMu.RUnlock()
@@ -639,6 +646,23 @@ func (s *webState) setSyncStatusQuiet(source, code, reason string) {
 	if s.hasData {
 		s.snapshot.SyncStatus = cloneSyncStatus(s.syncStatus)
 	}
+	s.snapshotMu.Unlock()
+}
+
+func (s *webState) setRefreshIndicatorStatusQuiet(source, code, reason string) {
+	if strings.TrimSpace(source) == "" {
+		source = "unknown"
+	}
+	if strings.TrimSpace(code) == "" {
+		code = webSyncCodeError
+	}
+	status := newSyncSourceStatus(code, reason)
+
+	s.snapshotMu.Lock()
+	if s.refreshIndicatorStatus == nil {
+		s.refreshIndicatorStatus = make(map[string]syncSourceStatus)
+	}
+	s.refreshIndicatorStatus[source] = status
 	s.snapshotMu.Unlock()
 }
 
@@ -818,7 +842,9 @@ func (s *webState) refreshCodespacesStreamingStatus() {
 		 WHERE source LIKE 'codespace:%'`,
 	)
 	if err != nil {
-		s.setSyncStatus("codespaces", webSyncCodeError, fmt.Sprintf("%s query_failed=%v", webSyncReasonCodespacesStreaming, err))
+		reason := fmt.Sprintf("%s query_failed=%v", webSyncReasonCodespacesStreaming, err)
+		s.setRefreshIndicatorStatusQuiet("codespaces", webSyncCodeError, reason)
+		s.setSyncStatus("codespaces", webSyncCodeError, reason)
 		return
 	}
 	defer rows.Close()
@@ -852,7 +878,9 @@ func (s *webState) refreshCodespacesStreamingStatus() {
 		}
 	}
 	if total == 0 {
-		s.setSyncStatus("codespaces", webSyncCodeSkipped, webSyncReasonCodespacesStreaming+" no_stream_state")
+		reason := webSyncReasonCodespacesStreaming + " no_stream_state"
+		s.setRefreshIndicatorStatusQuiet("codespaces", webSyncCodeSkipped, reason)
+		s.setSyncStatus("codespaces", webSyncCodeSkipped, reason)
 		return
 	}
 	reason := fmt.Sprintf("%s active_streams=%d connected=%d", webSyncReasonCodespacesStreaming, total, connected)
@@ -866,13 +894,16 @@ func (s *webState) refreshCodespacesStreamingStatus() {
 		reason += " last_error=" + lastError
 	}
 	if connected > 0 {
+		s.setRefreshIndicatorStatusQuiet("codespaces", webSyncCodeOK, reason)
 		s.setSyncStatus("codespaces", webSyncCodeOK, reason)
 		return
 	}
 	if connecting > 0 {
+		s.setRefreshIndicatorStatusQuiet("codespaces", webSyncCodeSkipped, reason)
 		s.setSyncStatus("codespaces", webSyncCodeSkipped, reason)
 		return
 	}
+	s.setRefreshIndicatorStatusQuiet("codespaces", webSyncCodeStale, reason)
 	s.setSyncStatus("codespaces", webSyncCodeStale, reason)
 }
 
@@ -1045,6 +1076,7 @@ func (s *webState) refreshLocalStreamingStatus(watched int, lastChunkAt string, 
 	if streamErr != nil {
 		code = webSyncCodeError
 		reason += " last_error=" + streamErr.Error()
+		s.setRefreshIndicatorStatusQuiet("local", code, reason)
 		s.setSyncStatus("local", code, reason)
 		return
 	}
@@ -1057,6 +1089,7 @@ func (s *webState) refreshLocalStreamingStatus(watched int, lastChunkAt string, 
 	if strings.TrimSpace(lastDefensiveRecopyAt) != "" {
 		reason += " last_defensive_recopy_at=" + lastDefensiveRecopyAt
 	}
+	s.setRefreshIndicatorStatusQuiet("local", code, reason)
 	s.setSyncStatus("local", code, reason)
 }
 
@@ -1378,6 +1411,12 @@ func (s *webState) renderRefreshIndicators(now time.Time) string {
 	codespacesNext := s.codespacesNextRefreshAt
 	localStatus := s.syncStatus["local"]
 	codespacesStatus := s.syncStatus["codespaces"]
+	if override, ok := s.refreshIndicatorStatus["local"]; ok {
+		localStatus = override
+	}
+	if override, ok := s.refreshIndicatorStatus["codespaces"]; ok {
+		codespacesStatus = override
+	}
 	s.snapshotMu.RUnlock()
 
 	localState := "Off"

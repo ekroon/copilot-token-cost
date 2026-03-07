@@ -2287,6 +2287,25 @@ func TestRenderRefreshIndicatorsLocalStreamingShowsLive(t *testing.T) {
 	}
 }
 
+func TestRenderRefreshIndicatorsLocalStreamingUsesIndicatorOverride(t *testing.T) {
+	state := newTestWebState(t, t.TempDir())
+	state.localStreaming = true
+	now := time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC)
+	state.setRefreshIndicatorStatusQuiet("local", webSyncCodeOK, webSyncReasonLocalStreaming+" watching=2 last_chunk_at=2026-01-01T00:00:00Z")
+	state.setSyncStatusQuiet("local", webSyncCodeOK, webSyncReasonLocalSyncCompleted)
+
+	body := state.renderRefreshIndicators(now)
+	if !strings.Contains(body, "Local") || !strings.Contains(body, ">Live<") {
+		t.Fatalf("expected local live indicator to ignore sync status overwrite, got %q", body)
+	}
+
+	state.setSyncStatusQuiet("local", webSyncCodeSkipped, webSyncReasonInProgress)
+	body = state.renderRefreshIndicators(now)
+	if !strings.Contains(body, "Local") || !strings.Contains(body, ">Live<") {
+		t.Fatalf("expected local live indicator to stay stable during sync, got %q", body)
+	}
+}
+
 func TestBuildDashboardPatchIncludesRefreshIndicatorsPatch(t *testing.T) {
 	state := newTestWebState(t, t.TempDir())
 	patch, err := state.buildDashboardPatch(sampleWebDashboardPayload(), time.Date(2026, time.February, 19, 12, 0, 0, 0, time.UTC))
