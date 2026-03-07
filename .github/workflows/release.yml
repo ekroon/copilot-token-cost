@@ -117,6 +117,9 @@ jobs:
         run: cd desktop && npm install
 
       - name: Build Tauri app (.app bundle only)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: cd desktop && npx tauri build --bundles app
 
       - name: Create DMG
@@ -129,11 +132,23 @@ jobs:
             -ov -format UDZO \
             "$DMG_DIR/${APP_NAME}_${{ matrix.target_triple }}.dmg"
 
+      - name: Rename updater artifacts with target triple
+        run: |
+          BUNDLE_DIR="desktop/src-tauri/target/release/bundle/macos"
+          for f in "$BUNDLE_DIR"/*.app.tar.gz; do
+            base="$(basename "$f" .app.tar.gz)"
+            mv "$f" "$BUNDLE_DIR/${base}_${{ matrix.target_triple }}.app.tar.gz"
+            mv "$f.sig" "$BUNDLE_DIR/${base}_${{ matrix.target_triple }}.app.tar.gz.sig"
+          done
+
       - name: Upload .dmg artifact
         uses: actions/upload-artifact@v4
         with:
           name: CopilotTokenCost-${{ matrix.target_triple }}
-          path: desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          path: |
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+            desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
 
   create-release:
     needs: [resolve-tag, release, desktop-macos]
@@ -143,6 +158,52 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Generate latest.json for updater
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Read version without the 'v' prefix
+          VERSION="${TAG#v}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+
+          # Read signatures
+          AARCH64_SIG="$(cat artifacts/*_aarch64-apple-darwin.app.tar.gz.sig)"
+          X86_64_SIG="$(cat artifacts/*_x86_64-apple-darwin.app.tar.gz.sig)"
+
+          # Find artifact filenames
+          AARCH64_FILE="$(basename artifacts/*_aarch64-apple-darwin.app.tar.gz)"
+          X86_64_FILE="$(basename artifacts/*_x86_64-apple-darwin.app.tar.gz)"
+
+          cat > artifacts/latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${AARCH64_SIG}",
+                "url": "${BASE_URL}/${AARCH64_FILE}"
+              },
+              "darwin-x86_64": {
+                "signature": "${X86_64_SIG}",
+                "url": "${BASE_URL}/${X86_64_FILE}"
+              }
+            }
+          }
+          EOF
+
+          # Remove leading whitespace from heredoc indentation
+          python3 -c "
+          import json, sys
+          with open('artifacts/latest.json') as f:
+              data = json.load(f)
+          with open('artifacts/latest.json', 'w') as f:
+              json.dump(data, f, indent=2)
+          "
+
+          echo "Generated latest.json:"
+          cat artifacts/latest.json
 
       - name: Create GitHub Release
         env:
@@ -154,4 +215,7 @@ jobs:
             --generate-notes \
             --repo "${{ github.repository }}" \
             artifacts/copilot-token-cost-* \
-            artifacts/*.dmg
+            artifacts/*.dmg \
+            artifacts/*.app.tar.gz \
+            artifacts/*.app.tar.gz.sig \
+            artifacts/latest.json

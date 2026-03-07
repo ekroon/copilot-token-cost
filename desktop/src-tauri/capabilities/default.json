@@ -18,6 +18,9 @@
           "args": true
         }
       ]
-    }
+    },
+    "updater:default",
+    "dialog:default",
+    "process:default"
   ]
 }
