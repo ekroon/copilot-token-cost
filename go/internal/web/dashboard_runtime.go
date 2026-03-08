@@ -70,6 +70,13 @@ func (r *DashboardRuntime) Snapshot() (interface{}, bool) {
 	return r.SnapshotFn()
 }
 
+func (r *DashboardRuntime) DashboardPatch(snapshot interface{}, now time.Time) (string, error) {
+	if r == nil || r.BuildDashboardPatchFn == nil {
+		return "", fmt.Errorf("refresh patch build failed: patch builder unavailable")
+	}
+	return r.BuildDashboardPatchFn(snapshot, now)
+}
+
 func (r *DashboardRuntime) ProjectRowPatch(rowKey string, expand bool) (string, *ActionError) {
 	rowKey = strings.TrimSpace(rowKey)
 	if rowKey == "" {
@@ -165,14 +172,7 @@ func (r *DashboardRuntime) SyncCodespacesPatch(now time.Time) (string, *ActionEr
 			Message: "codespaces sync failed: snapshot unavailable",
 		}
 	}
-	if r.BuildDashboardPatchFn == nil {
-		return "", &ActionError{
-			Status:  http.StatusInternalServerError,
-			Reason:  "refresh_patch_failed",
-			Message: "refresh patch build failed: patch builder unavailable",
-		}
-	}
-	patch, err := r.BuildDashboardPatchFn(snapshot, now)
+	patch, err := r.DashboardPatch(snapshot, now)
 	if err != nil {
 		return "", &ActionError{
 			Status:  http.StatusInternalServerError,

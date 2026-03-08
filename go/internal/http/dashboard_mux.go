@@ -80,6 +80,22 @@ func NewDashboardMux(runtime *web.DashboardRuntime, opts DashboardMuxOptions) *h
 		w.WriteHeader(http.StatusOK)
 		flusher.Flush()
 
+		// Reconnecting clients need the current snapshot immediately after the
+		// stream attaches; otherwise they can sit on stale DOM until the next
+		// background refresh broadcasts a patch.
+		if snapshot, ok := runtime.Snapshot(); ok {
+			patch, err := runtime.DashboardPatch(snapshot, time.Now())
+			if err != nil {
+				logf("failed to build initial /events patch: %v\n", err)
+			} else if patch != "" {
+				if _, err := w.Write([]byte(patch)); err != nil {
+					logf("failed to write initial /events patch: %v\n", err)
+					return
+				}
+				flusher.Flush()
+			}
+		}
+
 		heartbeat := time.NewTicker(heartbeatInterval)
 		defer heartbeat.Stop()
 		indicators := time.NewTicker(indicatorInterval)
