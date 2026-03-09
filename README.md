@@ -83,6 +83,16 @@ A native macOS desktop app wrapping the web dashboard, with a system tray icon a
 
 The app runs in the system tray. Settings (period, streaming, codespaces mode) are configurable from the tray menu — changes restart the server automatically.
 
+Release notarization in GitHub Actions uses the minimum practical Apple secret set:
+
+- `APPLE_CERTIFICATE_P12` — base64-encoded Developer ID Application certificate export (`.p12`)
+- `APPLE_CERTIFICATE_PASSWORD` — password for that `.p12`
+- `APPLE_API_KEY_ID` — App Store Connect API key ID
+- `APPLE_API_ISSUER` — App Store Connect issuer ID
+- `APPLE_API_PRIVATE_KEY` — contents of the `AuthKey_<id>.p8` private key
+
+If none of these are configured, the workflow falls back to ad-hoc signing for test builds. If only some are configured, the release job fails fast rather than publishing a partially signed macOS artifact.
+
 ### Build from source
 
 ```bash
