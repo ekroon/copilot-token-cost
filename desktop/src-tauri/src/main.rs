@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
-    Manager,
+    Manager, RunEvent,
 };
 
 struct AppState {
@@ -70,24 +70,38 @@ fn build_tray(
     let sep2 = PredefinedMenuItem::separator(app)?;
 
     let local_streaming = MenuItem::with_id(
-        app, "toggle_local_streaming",
+        app,
+        "toggle_local_streaming",
         check_label("Local Streaming", settings.local_streaming),
-        true, None::<&str>,
+        true,
+        None::<&str>,
     )?;
     let cs_streaming = MenuItem::with_id(
-        app, "toggle_cs_streaming",
+        app,
+        "toggle_cs_streaming",
         check_label("Codespaces Streaming", settings.codespaces_streaming),
-        true, None::<&str>,
+        true,
+        None::<&str>,
     )?;
     let cs_manual_mode = MenuItem::with_id(
-        app, "toggle_cs_manual",
-        check_label("Manual Codespaces Mode", settings.codespaces_mode == "manual"),
-        true, None::<&str>,
+        app,
+        "toggle_cs_manual",
+        check_label(
+            "Manual Codespaces Mode",
+            settings.codespaces_mode == "manual",
+        ),
+        true,
+        None::<&str>,
     )?;
     let include_stopped = MenuItem::with_id(
-        app, "toggle_include_stopped",
-        check_label("Include Stopped Codespaces", settings.codespaces_include_stopped),
-        true, None::<&str>,
+        app,
+        "toggle_include_stopped",
+        check_label(
+            "Include Stopped Codespaces",
+            settings.codespaces_include_stopped,
+        ),
+        true,
+        None::<&str>,
     )?;
 
     let sep3 = PredefinedMenuItem::separator(app)?;
@@ -152,14 +166,18 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
         "toggle_local_streaming" => {
             let mut s = state.settings.lock().unwrap();
             s.local_streaming = !s.local_streaming;
-            let _ = state.tray_items.local_streaming
+            let _ = state
+                .tray_items
+                .local_streaming
                 .set_text(check_label("Local Streaming", s.local_streaming));
             save_and_restart(app, &s, &state.sidecar);
         }
         "toggle_cs_streaming" => {
             let mut s = state.settings.lock().unwrap();
             s.codespaces_streaming = !s.codespaces_streaming;
-            let _ = state.tray_items.cs_streaming
+            let _ = state
+                .tray_items
+                .cs_streaming
                 .set_text(check_label("Codespaces Streaming", s.codespaces_streaming));
             save_and_restart(app, &s, &state.sidecar);
         }
@@ -170,15 +188,19 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
             } else {
                 "manual".to_string()
             };
-            let _ = state.tray_items.cs_manual_mode
-                .set_text(check_label("Manual Codespaces Mode", s.codespaces_mode == "manual"));
+            let _ = state.tray_items.cs_manual_mode.set_text(check_label(
+                "Manual Codespaces Mode",
+                s.codespaces_mode == "manual",
+            ));
             save_and_restart(app, &s, &state.sidecar);
         }
         "toggle_include_stopped" => {
             let mut s = state.settings.lock().unwrap();
             s.codespaces_include_stopped = !s.codespaces_include_stopped;
-            let _ = state.tray_items.include_stopped
-                .set_text(check_label("Include Stopped Codespaces", s.codespaces_include_stopped));
+            let _ = state.tray_items.include_stopped.set_text(check_label(
+                "Include Stopped Codespaces",
+                s.codespaces_include_stopped,
+            ));
             save_and_restart(app, &s, &state.sidecar);
         }
         _ => {
@@ -187,11 +209,7 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
     }
 }
 
-fn save_and_restart(
-    app: &tauri::AppHandle,
-    settings: &Settings,
-    sidecar: &SidecarManager,
-) {
+fn save_and_restart(app: &tauri::AppHandle, settings: &Settings, sidecar: &SidecarManager) {
     if let Some(dir) = app.path().app_data_dir().ok() {
         if let Err(e) = settings.save(&dir) {
             eprintln!("[desktop] failed to save settings: {}", e);
@@ -200,8 +218,14 @@ fn save_and_restart(
     sidecar.restart(app, settings);
 }
 
+fn stop_sidecar(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.sidecar.stop();
+    }
+}
+
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let data_dir = app
@@ -239,6 +263,12 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app, event| {
+        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+            stop_sidecar(app);
+        }
+    });
 }

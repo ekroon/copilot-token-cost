@@ -65,9 +65,7 @@ impl SidecarManager {
                     }
 
                     if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.eval(
-                            "window.location.replace('http://127.0.0.1:7332')",
-                        );
+                        let _ = w.eval("window.location.replace('http://127.0.0.1:7332')");
                         let _ = w.show();
                         let _ = w.set_focus();
                     }
@@ -81,5 +79,11 @@ impl SidecarManager {
         if let Some(child) = self.child.lock().unwrap().take() {
             let _ = child.kill();
         }
+    }
+}
+
+impl Drop for SidecarManager {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
