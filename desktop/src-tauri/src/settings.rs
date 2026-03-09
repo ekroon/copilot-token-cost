@@ -49,10 +49,8 @@ impl Settings {
 
     pub fn save(&self, app_data_dir: &Path) -> Result<(), String> {
         fs::create_dir_all(app_data_dir).map_err(|e| e.to_string())?;
-        let json =
-            serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(app_data_dir.join("settings.json"), json)
-            .map_err(|e| e.to_string())
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        fs::write(app_data_dir.join("settings.json"), json).map_err(|e| e.to_string())
     }
 
     pub fn to_sidecar_args(&self) -> Vec<String> {
@@ -79,15 +77,34 @@ impl Settings {
             args.push("--codespaces-include-stopped".into());
         }
 
-        // Period as positional arg (must be last for non-flag values)
-        match self.period.as_str() {
-            "today" => args.push("--today".into()),
-            "yesterday" => args.push("--yesterday".into()),
-            "all" => args.push("--all".into()),
-            days => args.push(days.into()),
-        }
+        args.push("--period".into());
+        args.push(self.period.clone());
 
         args
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn to_sidecar_args_uses_explicit_period_for_all_supported_values() {
+        for period in ["today", "yesterday", "7", "14", "30", "all"] {
+            let settings = Settings {
+                period: period.into(),
+                ..Settings::default()
+            };
+            let args = settings.to_sidecar_args();
+
+            assert!(
+                args.windows(2)
+                    .any(|window| { window[0] == "--period" && window[1] == period }),
+                "missing explicit period arg for {period}: {args:?}"
+            );
+            assert!(!args
+                .iter()
+                .any(|arg| arg == "--today" || arg == "--yesterday" || arg == "--all"));
+        }
+    }
 }

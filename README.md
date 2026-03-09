@@ -16,6 +16,7 @@ Go-based CLI for parsing Copilot token usage and estimating API-equivalent costs
 mise use -g github:ekroon/copilot-token-cost
 copilot-token-cost                         # default: last 7 days
 copilot-token-cost 30                      # last 30 days
+copilot-token-cost --period 30             # last 30 days via explicit flag
 copilot-token-cost --json                  # machine-readable output
 ```
 
@@ -25,6 +26,7 @@ copilot-token-cost --json                  # machine-readable output
 cd go && go build -o copilot-token-cost .  # build once
 ./go/copilot-token-cost                    # default: last 7 days
 ./go/copilot-token-cost 30                 # last 30 days
+./go/copilot-token-cost --period 30        # last 30 days via explicit flag
 ./go/copilot-token-cost --all              # all available logs
 ./go/copilot-token-cost --json             # machine-readable output
 ```
@@ -45,6 +47,7 @@ It persists per-file tail checkpoints to SQLite (`codespace_tail_offsets`) and r
 | Flag | Description |
 |------|-------------|
 | `<days>` | Number of days to look back (default: 7) |
+| `--period VALUE` | Explicit date window: `today`, `yesterday`, `all`, or a positive day count |
 | `--all` | Process all available logs |
 | `--today` | Today only |
 | `--yesterday` | Yesterday only |
@@ -94,6 +97,7 @@ Requires: Go, Rust, Node.js, and the [Tauri CLI](https://v2.tauri.app/start/prer
 ```bash
 ./go/copilot-token-cost --web
 ./go/copilot-token-cost --web --today
+./go/copilot-token-cost --web --period 14
 ./go/copilot-token-cost --web --web-local-streaming
 ./go/copilot-token-cost --web --web-codespaces-mode manual
 ./go/copilot-token-cost --web --web-codespaces-streaming

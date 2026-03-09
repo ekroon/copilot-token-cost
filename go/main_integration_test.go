@@ -170,3 +170,69 @@ func TestMainPathsWithoutMocking(t *testing.T) {
 		t.Fatalf("--codespaces-sync output missing summary")
 	}
 }
+
+func TestMainPeriodFlagPathsWithoutMocking(t *testing.T) {
+	root := prepareMainFixture(t)
+	logsDir := filepath.Join(root, "home", ".copilot", "logs")
+
+	testCases := []struct {
+		name       string
+		args       []string
+		wantPeriod string
+	}{
+		{
+			name:       "today",
+			args:       []string{"--period", "today", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "today",
+		},
+		{
+			name:       "yesterday",
+			args:       []string{"--period", "yesterday", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "yesterday",
+		},
+		{
+			name:       "seven days",
+			args:       []string{"--period", "7", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "last 7 days",
+		},
+		{
+			name:       "fourteen days",
+			args:       []string{"--period", "14", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "last 14 days",
+		},
+		{
+			name:       "thirty days",
+			args:       []string{"--period", "30", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "last 30 days",
+		},
+		{
+			name:       "all time",
+			args:       []string{"--period", "all", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "all time",
+		},
+		{
+			name:       "period flag beats positional fallback",
+			args:       []string{"--period", "14", "2", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "last 14 days",
+		},
+		{
+			name:       "today flag beats period flag",
+			args:       []string{"--today", "--period", "14", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "today",
+		},
+		{
+			name:       "all flag beats period flag",
+			args:       []string{"--all", "--period", "14", "--logs-dir", logsDir, "--sync"},
+			wantPeriod: "all time",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _ := runMainWithArgs(t, root, tc.args...)
+			if !strings.Contains(out, tc.wantPeriod) {
+				t.Fatalf("output missing period %q: %s", tc.wantPeriod, out)
+			}
+		})
+	}
+}

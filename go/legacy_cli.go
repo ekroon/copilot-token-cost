@@ -33,12 +33,32 @@ func parseTS(s string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func parseExplicitPeriodValue(raw string) (dateWindowSpec, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "all":
+		return dateWindowSpec{AllTime: true}, nil
+	case "today":
+		return dateWindowSpec{Mode: "today"}, nil
+	case "yesterday":
+		return dateWindowSpec{Mode: "yesterday"}, nil
+	}
+
+	days, err := strconv.Atoi(value)
+	if err != nil || days <= 0 {
+		return dateWindowSpec{}, fmt.Errorf("--period must be one of: today, yesterday, all, or a positive day count")
+	}
+
+	return dateWindowSpec{Mode: "days", Days: days}, nil
+}
+
 func runLegacyCLI() {
 	loadPricing()
 
 	allFlag := flag.Bool("all", false, "Process all available logs")
 	todayFlag := flag.Bool("today", false, "Today only")
 	yesterdayFlag := flag.Bool("yesterday", false, "Yesterday only")
+	periodFlag := flag.String("period", "", "Date window: today|yesterday|all|N (days)")
 	fromDays := flag.Int("from", -1, "Start from N days ago (0=today, 1=yesterday)")
 	toDays := flag.Int("to", -1, "End at N days ago (0=today, 1=yesterday)")
 	logsDirFlag := flag.String("logs-dir", "", "Override logs directory")
@@ -59,7 +79,7 @@ func runLegacyCLI() {
 	webLogMode := flag.String("web-log-mode", "compact", "Web mode stderr logging: compact|verbose|errors")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: copilot-token-cost [days] [--all] [--today] [--yesterday]\n")
+		fmt.Fprintf(os.Stderr, "usage: copilot-token-cost [days] [--period VALUE] [--all] [--today] [--yesterday]\n")
 		fmt.Fprintf(os.Stderr, "                         [--from N] [--to N] [--logs-dir PATH] [--project TEXT] [--json]\n")
 		fmt.Fprintf(os.Stderr, "                         [--sync] [--import-file FILE] [--export-file FILE]\n\n")
 		fmt.Fprintf(os.Stderr, "                         [--codespaces-sync] [--codespaces-include-stopped]\n\n")
@@ -73,9 +93,11 @@ func runLegacyCLI() {
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost              # last 7 days\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost 30           # last 30 days\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --period 30  # last 30 days (explicit flag)\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost 1            # today\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --today      # today\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --yesterday  # yesterday only\n")
+		fmt.Fprintf(os.Stderr, "  copilot-token-cost --period all # all logs\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --from 3     # 3 days ago until now\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --all        # all logs\n")
 		fmt.Fprintf(os.Stderr, "  copilot-token-cost --project graph-hopper  # filter to matching projects\n")
@@ -138,6 +160,10 @@ func runLegacyCLI() {
 	var cutoffEnd *time.Time
 	var periodLabel string
 	useCutoffMin := false
+	explicitPeriodValue := strings.TrimSpace(*periodFlag)
+	var dateFromDisplay, dateToDisplay, dateRange string
+	var dateFromQuery, dateToQuery string // ISO timestamps for DB queries
+	var syncFrom, syncTo *time.Time
 
 	// Parse positional days argument
 	var days int
@@ -188,6 +214,20 @@ func runLegacyCLI() {
 			periodLabel = fmt.Sprintf("%dd ago → %s", fd, toStr)
 		}
 		dateWindow = dateWindowSpec{Mode: "from-to", FromDays: fd, ToDays: td}
+	} else if explicitPeriodValue != "" {
+		spec, err := parseExplicitPeriodValue(explicitPeriodValue)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		dateWindow = spec
+		bounds := dateWindow.computeBounds(now)
+		periodLabel = bounds.PeriodLabel
+		dateRange = bounds.DateRange
+		dateFromQuery = bounds.DateFromQuery
+		dateToQuery = bounds.DateToQuery
+		syncFrom = bounds.SyncFrom
+		syncTo = bounds.SyncTo
 	} else {
 		if !daysSet {
 			days = 7
@@ -202,28 +242,25 @@ func runLegacyCLI() {
 	}
 
 	// Date range label and DB query params
-	var dateFromDisplay, dateToDisplay, dateRange string
-	var dateFromQuery, dateToQuery string // ISO timestamps for DB queries
-	if !useCutoffMin {
+	if explicitPeriodValue == "" && !useCutoffMin {
 		dateFromDisplay = cutoff.Format("2006-01-02")
 		dateFromQuery = cutoff.Format("2006-01-02T15:04:05")
 	}
-	if cutoffEnd != nil {
+	if explicitPeriodValue == "" && cutoffEnd != nil {
 		dateToDisplay = cutoffEnd.AddDate(0, 0, -1).Format("2006-01-02")
 		dateToQuery = cutoffEnd.Format("2006-01-02T15:04:05")
-	} else {
+	} else if explicitPeriodValue == "" {
 		dateToDisplay = now.Format("2006-01-02")
 	}
-	if dateFromDisplay != "" {
+	if explicitPeriodValue == "" && dateFromDisplay != "" {
 		dateRange = dateFromDisplay + " → " + dateToDisplay
 	}
 
-	var syncFrom, syncTo *time.Time
-	if !useCutoffMin {
+	if explicitPeriodValue == "" && !useCutoffMin {
 		c := cutoff
 		syncFrom = &c
 	}
-	if cutoffEnd != nil {
+	if explicitPeriodValue == "" && cutoffEnd != nil {
 		c := *cutoffEnd
 		syncTo = &c
 	}
