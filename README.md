@@ -78,7 +78,8 @@ A native macOS desktop app wrapping the web dashboard, with a system tray icon a
 
 1. Download the `.dmg` for your architecture from [Releases](https://github.com/ekroon/copilot-token-cost/releases)
 2. Open the `.dmg` and drag **Copilot Token Cost** to Applications
-3. On first launch, **right-click → Open** (or Control+click → Open) and confirm the dialog — this is required once for unsigned apps
+3. Signed and notarized release builds should open normally.
+4. If you're testing a locally built or ad-hoc-signed app, use **right-click → Open** (or Control+click → Open) once and confirm the dialog
 
 The app runs in the system tray. Settings (period, streaming, codespaces mode) are configurable from the tray menu — changes restart the server automatically.
 
