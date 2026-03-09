@@ -129,9 +129,14 @@ jobs:
         run: |
           APP_NAME="Copilot Token Cost"
           DMG_DIR="desktop/src-tauri/target/release/bundle/dmg"
+          STAGING_DIR="desktop/src-tauri/target/release/bundle/dmg-root"
+          rm -rf "$STAGING_DIR"
           mkdir -p "$DMG_DIR"
+          mkdir -p "$STAGING_DIR"
+          cp -R "desktop/src-tauri/target/release/bundle/macos/${APP_NAME}.app" "$STAGING_DIR/"
+          ln -s /Applications "$STAGING_DIR/Applications"
           hdiutil create -volname "$APP_NAME" \
-            -srcfolder "desktop/src-tauri/target/release/bundle/macos/${APP_NAME}.app" \
+            -srcfolder "$STAGING_DIR" \
             -ov -format UDZO \
             "$DMG_DIR/${APP_NAME}_${{ matrix.target_triple }}.dmg"
 
