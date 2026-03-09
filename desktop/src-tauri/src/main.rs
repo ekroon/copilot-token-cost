@@ -1,5 +1,6 @@
 mod settings;
 mod sidecar;
+mod updater;
 
 use crate::settings::Settings;
 use crate::sidecar::SidecarManager;
@@ -91,6 +92,7 @@ fn build_tray(
     )?;
 
     let sep3 = PredefinedMenuItem::separator(app)?;
+    let check_update = MenuItem::with_id(app, "check_update", "Check for Updates…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
     let menu = Menu::with_items(
@@ -105,6 +107,7 @@ fn build_tray(
             &cs_manual_mode,
             &include_stopped,
             &sep3,
+            &check_update,
             &quit,
         ],
     )?;
@@ -134,6 +137,9 @@ fn handle_menu_event(app: &tauri::AppHandle, event_id: &str) {
                 let _ = w.show();
                 let _ = w.set_focus();
             }
+        }
+        "check_update" => {
+            updater::check_for_update(app, false);
         }
         id if id.starts_with("period_") => {
             let period = id.strip_prefix("period_").unwrap();
@@ -203,6 +209,9 @@ fn save_and_restart(
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -230,6 +239,9 @@ fn main() {
                 sidecar,
                 tray_items,
             });
+
+            // Check for updates in the background
+            updater::check_for_update(&app.handle(), true);
 
             Ok(())
         })

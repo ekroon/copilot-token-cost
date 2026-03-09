@@ -9,6 +9,7 @@
   "bundle": {
     "active": true,
     "targets": ["dmg", "app"],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -20,7 +21,14 @@
       "binaries/copilot-token-cost"
     ]
   },
-  "plugins": {},
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/ekroon/copilot-token-cost/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYyMkQ5RDMxMzlENDFFNDEKUldSQkh0UTVNWjB0WWliRG9MbktUNEk0d3pEU2VZV1d4OUJ0OUZkRnZqTGtHc1hFVy9lZEdITk4K"
+    }
+  },
   "app": {
     "windows": [
       {
